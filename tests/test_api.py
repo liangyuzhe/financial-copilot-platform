@@ -244,3 +244,13 @@ class TestStaticFiles:
         resp = client.get("/")
         assert resp.status_code == 200
         assert "Financial Copilot" in resp.text
+        assert "sendAgent()" in resp.text
+        assert "/api/query/invoke" in resp.text
+        assert "intent === 'sql_query'" not in resp.text
+        assert "route === 'data'" in resp.text
+        assert "route === 'chat'" in resp.text
+        assert "route === 'clarify'" in resp.text
+        assert "Data Error" in resp.text
+        assert "data.status === 'error'" in resp.text
+        assert 'id="agentScopeBtn"' not in resp.text
+        assert "sendAgentScopeComplex" not in resp.text

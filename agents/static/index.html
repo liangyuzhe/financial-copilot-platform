@@ -203,7 +203,9 @@
             margin-bottom: 8px;
         }
         .intent-tag.sql { background: var(--warning-bg); color: var(--warning-text); }
+        .intent-tag.data { background: var(--warning-bg); color: var(--warning-text); }
         .intent-tag.chat { background: #eef6ff; color: #175cd3; }
+        .intent-tag.clarify { background: #f4f3ff; color: #5925dc; }
         .intent-tag.result { background: #ecfdf3; color: #067647; }
         .answer-text {
             display: block;
@@ -342,11 +344,11 @@
         <aside class="sidebar">
             <div class="brand">
                 <div class="brand-title">Financial Copilot</div>
-                <div class="brand-subtitle">NL2SQL and RAG workspace</div>
+                <div class="brand-subtitle">Data analysis and RAG workspace</div>
             </div>
             <nav class="tabs">
                 <button class="active" onclick="switchTab('chat')">Chat</button>
-                <button onclick="switchTab('agent')">SQL Agent</button>
+                <button onclick="switchTab('agent')">Data Agent</button>
                 <button onclick="switchTab('upload')">Upload Document</button>
                 <button onclick="switchTab('eval')">Evaluation</button>
                 <button onclick="switchTab('admin')">Admin</button>
@@ -375,7 +377,7 @@
             </section>
         </div>
 
-        <!-- SQL Agent Tab -->
+        <!-- Data Agent Tab -->
         <div id="tab-agent" class="tab-content">
             <section class="workspace">
                 <div class="sql-box">
@@ -465,24 +467,20 @@
               <div class="upload-box">
                 <div class="admin-note">
                     <strong>管理面板</strong><br>
-                    意图识别默认由 LLM 判断。这里维护的是可选规则信号，适合把高频、确定性强的路由策略沉淀到数据库；规则与 LLM 并行执行，最终由仲裁器给出意图。
+                    入口路由默认由 LLM 判断。这里维护的是可选规则信号，适合把高频、确定性强的路由策略沉淀到数据库；规则与 LLM 并行执行，最终由仲裁器给出 data、chat 或 clarify。
                 </div>
-                <h3 style="margin-top:18px;">意图规则</h3>
+                <h3 style="margin-top:18px;">入口路由规则</h3>
                 <div class="admin-grid" style="margin-top:16px;">
                     <form class="admin-form" onsubmit="saveIntentRule(event)">
                         <input type="hidden" id="intentRuleId">
                         <label>规则名称
                             <input id="intentRuleName" placeholder="例如：公开公司知识问答">
                         </label>
-                        <label>目标意图
+                        <label>目标路由
                             <select id="intentRuleIntent">
+                                <option value="data">data</option>
                                 <option value="chat">chat</option>
-                                <option value="sql_query">sql_query</option>
-                                <option value="knowledge">knowledge</option>
-                                <option value="anomaly_detect">anomaly_detect</option>
-                                <option value="reconciliation">reconciliation</option>
-                                <option value="report">report</option>
-                                <option value="audit">audit</option>
+                                <option value="clarify">clarify</option>
                             </select>
                         </label>
                         <label>匹配方式
@@ -523,7 +521,7 @@
                 </div>
                 <h3 style="margin-top:24px;">复杂查询路由规则</h3>
                 <div class="admin-note">
-                    这些规则为可行性评估提供任务类型证据，系统再结合关系图连通性和 JOIN 风险判断进入单 SQL、复杂计划或澄清。规则内容维护在数据库中，运行时代码不写业务关键词。
+                    这些规则为历史 SQLReact 可行性评估提供任务类型证据；新数据入口由 AgentScope Planner 在 data 路由内决定单步或多步计划。规则内容维护在数据库中，运行时代码不写业务关键词。
                 </div>
                 <div class="admin-grid" style="margin-top:16px;">
                     <form class="admin-form" onsubmit="saveQueryRouteRule(event)">
@@ -598,7 +596,7 @@
             const tabs = ['chat', 'agent', 'upload', 'eval', 'admin'];
             const titles = {
                 chat: ['Chat', '知识库问答和通用对话'],
-                agent: ['SQL Agent', '自然语言查数、SQL 审批和结果反思'],
+                agent: ['Data Agent', '数据查询、分析规划、审批和结果反思'],
                 upload: ['Upload Document', '上传文档并写入检索索引'],
                 eval: ['Evaluation', '准确率、召回率、延迟和可回溯评测明细'],
                 admin: ['Admin', '语义模型和业务知识管理入口'],
@@ -680,7 +678,7 @@
             btn.disabled = false;
         }
 
-        // --- SQL Agent ---
+        // --- Data Agent ---
         const sqlMessages = document.getElementById('sqlMessages');
         const sqlQuery = document.getElementById('sqlQuery');
         const agentBtn = document.getElementById('agentBtn');
@@ -704,32 +702,34 @@
             const bubble = div.querySelector('.bubble');
             bubble.textContent = '思考中...';
             try {
-                // Step 1: Classify intent
+                // Step 1: Classify route
                 const clsResp = await fetch('/api/query/classify', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({query, session_id: sessionId}),
                 });
                 if (!clsResp.ok) {
-                    bubble.textContent = '意图分类失败: HTTP ' + clsResp.status;
+                    bubble.textContent = '路由分类失败: HTTP ' + clsResp.status;
                     agentBtn.disabled = false;
                     return;
                 }
-                const {intent, rewritten_query} = await clsResp.json();
+                const classification = await clsResp.json();
+                const route = classification.route || classification.intent || 'chat';
+                const rewritten_query = classification.rewritten_query || '';
                 const effectiveQuery = rewritten_query || query;
 
-                if (intent === 'sql_query') {
-                    // SQL path: non-streaming (needs approval flow)
+                if (route === 'data') {
+                    // Data path: non-streaming because it can enter approval flow.
                     let dots = 0;
                     const loading = setInterval(() => {
                         dots = (dots + 1) % 4;
-                        bubble.innerHTML = '<span class="intent-tag sql">SQL Query</span>'
-                            + '<div class="answer-text">意图识别：结构化数据查询。正在生成 SQL' + '.'.repeat(dots) + '</div>';
+                        bubble.innerHTML = '<span class="intent-tag data">Data</span>'
+                            + '<div class="answer-text">路由识别：数据处理。正在规划分析' + '.'.repeat(dots) + '</div>';
                     }, 500);
                     const resp = await fetch('/api/query/invoke', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query, session_id: sessionId, intent, rewritten_query: effectiveQuery}),
+                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery}),
                     });
                     clearInterval(loading);
                     if (!resp.ok) {
@@ -738,10 +738,24 @@
                         const data = await resp.json();
                         renderAgentResponse(div, data);
                     }
-                } else {
-                    // Chat/Knowledge path: streaming (用重写后的查询)
+                } else if (route === 'clarify') {
+                    bubble.innerHTML = '<span class="intent-tag clarify">Clarify</span>'
+                        + '<div class="answer-text">路由识别：需要补充信息。正在整理澄清问题...</div>';
+                    const resp = await fetch('/api/query/invoke', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery}),
+                    });
+                    if (!resp.ok) {
+                        bubble.textContent = '请求失败: HTTP ' + resp.status;
+                    } else {
+                        const data = await resp.json();
+                        renderAgentResponse(div, data);
+                    }
+                } else if (route === 'chat') {
+                    // Chat/Knowledge path: streaming with the rewritten standalone query.
                     bubble.innerHTML = '<span class="intent-tag chat">Chat</span>'
-                        + '<div class="answer-text">意图识别：知识问答 / 普通对话。正在检索知识...</div>';
+                        + '<div class="answer-text">路由识别：知识问答 / 普通对话。正在检索知识...</div>';
                     const answerBox = bubble.querySelector('.answer-text');
                     const resp = await fetch('/api/rag/chat/stream', {
                         method: 'POST',
@@ -774,6 +788,9 @@
                         }
                         answerBox.textContent = fullContent || '(无响应)';
                     }
+                } else {
+                    bubble.innerHTML = '<span class="intent-tag clarify">Route</span>'
+                        + '<div class="answer-text">无法识别的入口路由：' + escHtml(route) + '</div>';
                 }
             } catch (e) {
                 bubble.textContent = '请求失败: ' + e.message;
@@ -803,7 +820,11 @@
             } else {
                 // Normal response
                 const isSqlResult = !!data.sql;
-                html += `<span class="intent-tag ${isSqlResult ? 'result' : 'chat'}">${isSqlResult ? 'SQL Result' : 'Chat'}</span>`;
+                const isClarifyResult = data.status === 'clarify' || data.status === 'needs_clarification';
+                const isErrorResult = data.status === 'error';
+                const tagClass = isSqlResult ? 'result' : (isClarifyResult ? 'clarify' : (isErrorResult ? 'data' : 'chat'));
+                const tagText = isSqlResult ? 'Data Result' : (isClarifyResult ? 'Clarify' : (isErrorResult ? 'Data Error' : 'Chat'));
+                html += `<span class="intent-tag ${tagClass}">${tagText}</span>`;
                 const answerHtml = '<div class="answer-text">' + escHtml(data.answer || '(无响应)') + '</div>';
                 html += isSqlResult ? '<div class="result-card">' + answerHtml + '</div>' : answerHtml;
                 if (isSqlResult) {

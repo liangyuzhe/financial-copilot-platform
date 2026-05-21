@@ -1,80 +1,87 @@
-"""意图调度图：意图分类 + 上下文重写 -> 子图分发。
+"""Route dispatcher: classify -> data/chat/clarify -> subgraphs."""
 
-/classify 端点同时完成意图识别和查询重写，返回 intent + rewritten_query。
-invoke 端点接收预分类结果，跳过重复 LLM 调用。
-"""
+from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
 
-from langgraph.graph import StateGraph, START, END
 from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import interrupt
 
+from agents.config.settings import settings
+from agents.flow.complex_query import validate_complex_plan
 from agents.flow.state import FinalGraphState
+from agents.flow.rag_chat import build_rag_chat_graph
+from agents.flow.sql_react import execute_complex_plan_step
 from agents.model.chat_model import get_chat_model
+from agents.runtime.agentscope_adapter import create_agentscope_runner
+from agents.runtime.agentscope_adapter import LocalAgentScopeCompatibleRunner
+from agents.runtime.agentscope_runtime import AgentScopeRuntime
+from agents.runtime.result import AgentRunResult
+from agents.tool.security.policies import authorize_tables
 from agents.tool.storage.checkpoint import get_checkpointer
 from agents.tool.storage.domain_summary import get_domain_summary
-from agents.config.settings import settings
-from agents.tool.trace.tracing import child_trace_config, traced_async_tool_call, callbacks_from_config
 from agents.tool.storage.intent_rules import evaluate_intent_rules
+from agents.tool.trace.tracing import callbacks_from_config, child_trace_config, traced_async_tool_call
 
 logger = logging.getLogger(__name__)
 
-# 意图类别
-_INTENT_SQL = "sql_query"
-_INTENT_ANOMALY = "anomaly_detect"
-_INTENT_RECONCILIATION = "reconciliation"
-_INTENT_REPORT = "report"
-_INTENT_AUDIT = "audit"
-_INTENT_KNOWLEDGE = "knowledge"
-_INTENT_CHAT = "chat"
+_ROUTE_DATA = "data"
+_ROUTE_CHAT = "chat"
+_ROUTE_CLARIFY = "clarify"
+_ROUTES = {_ROUTE_DATA, _ROUTE_CHAT, _ROUTE_CLARIFY}
 
-_INTENTS = [
-    _INTENT_SQL, _INTENT_ANOMALY, _INTENT_RECONCILIATION,
-    _INTENT_REPORT, _INTENT_AUDIT, _INTENT_KNOWLEDGE, _INTENT_CHAT,
-]
+_CLASSIFY_SYSTEM_PROMPT = """你是一个路由分类器，同时完成两个任务：
 
+1. 判断用户问题应该走哪个入口路由：data、chat、clarify
+2. 将省略主体或代词化的问题重写成独立完整的问题
 
-_CLASSIFY_SYSTEM_PROMPT = """你是一个智能助手，同时完成两个任务：
+路由定义：
+- data：用户要处理当前系统数据、统计、分析、关系、对比、报表、预算、回款、费用、异常归因等
+- chat：闲聊、通用问答、外部公开信息、与当前数据域无关的问题
+- clarify：问题目标、时间范围、主体、口径或范围不够明确，需要用户补充
 
-1. **意图分类**：根据数据库领域摘要和用户问题，判断意图类别
-2. **查询重写**：结合对话历史，将代词化/省略的查询重写为独立完整的查询
-
-意图类别说明：
-- sql_query：用户想查询数据库中存储的结构化数据（必须与数据库领域摘要中的表/字段相关）
-- anomaly_detect：分析数据异常波动、异常归因
-- reconciliation：多表/多系统资金明细核对
-- report：生成报告，如日报、周报、月报、季报
-- audit：审计追踪、凭证查询
-- knowledge：财务制度、会计准则、合规规则等知识查询
-- chat：闲聊、通用问答、或问题与数据库领域无关
-
-重要判断原则：
-- 只有当问题明确指向数据库中的数据时，才归类为 sql_query
-- 如果问题涉及外部主体、公开信息、通用知识、股市行情等非数据库内容，应归类为 chat
-- 不要仅因为问题包含财务词或时间词就归类为 sql_query；必须判断它是否在问当前数据库内的业务数据
-- 如果问题未出现外部主体，且询问数据库领域摘要支持的指标、统计、金额或经营数据，可按当前公司/当前企业的本地业务数据理解
-- 对省略主体的本地业务数据问题，rewritten_query 应补齐当前公司/当前企业主体，使其成为独立完整查询
-- 结合对话历史重写查询时，只补充对话中明确提到的上下文，不要添加对话中没有的信息
-
-请严格按以下 JSON 格式返回，不要有其他内容：
-{{"intent": "意图类别", "rewritten_query": "重写后的独立查询"}}"""
+请只返回 JSON，不要输出其他内容：
+{{"route": "data|chat|clarify", "rewritten_query": "...", "confidence": 0.0, "reason": "..."}}"""
 
 
-def _arbitrate_intent(llm_intent: str, rule_decision) -> str:
-    """Merge LLM intent with optional database-backed rule signal."""
-    if rule_decision and getattr(rule_decision, "intent", "") in _INTENTS:
-        return rule_decision.intent
-    return llm_intent if llm_intent in _INTENTS else _INTENT_CHAT
+def _normalize_route(value: str) -> str:
+    route = (value or "").strip().lower()
+    if route in _ROUTES:
+        return route
+    if route in {
+        "sql_query",
+        "analysis",
+        "anomaly_detect",
+        "reconciliation",
+        "report",
+        "audit",
+        "knowledge",
+        "complex_analysis",
+        "data_task",
+    }:
+        return _ROUTE_DATA
+    if route in {"need_clarify", "needs_clarification", "ambiguous", "clarification"}:
+        return _ROUTE_CLARIFY
+    if route == "chat":
+        return _ROUTE_CHAT
+    return _ROUTE_CHAT
+
+
+def _route_from_rule_decision(rule_decision) -> str | None:
+    if not rule_decision:
+        return None
+    raw = str(getattr(rule_decision, "intent", "") or getattr(rule_decision, "route_signal", "") or "")
+    route = _normalize_route(raw)
+    return route if route in _ROUTES else None
 
 
 def _apply_rule_rewrite_template(query: str, rewritten_query: str, rule_decision) -> str:
-    """Apply an optional data-managed rewrite template from an intent rule."""
     template = str(getattr(rule_decision, "rewrite_template", "") or "").strip()
     if not template:
         return rewritten_query
-
     rendered = (
         template
         .replace("{query}", query or "")
@@ -84,50 +91,87 @@ def _apply_rule_rewrite_template(query: str, rewritten_query: str, rule_decision
     return rendered or rewritten_query
 
 
-async def classify_intent(state: FinalGraphState, config=None) -> dict:
-    """意图分类 + 上下文重写：返回 intent 和 rewritten_query。
+def _arbitrate_route(llm_route: str, rule_decision) -> str:
+    rule_route = _route_from_rule_decision(rule_decision)
+    if rule_route in _ROUTES:
+        return rule_route
+    return _normalize_route(llm_route)
 
-    如果 state 中已有 intent 和 rewritten_query（外部预分类），直接返回。
-    """
-    # 外部已传入 intent 且有 rewritten_query，跳过 LLM
-    existing_intent = state.get("intent", "")
-    existing_rewrite = state.get("rewritten_query", "")
-    if existing_intent and existing_intent in _INTENTS and existing_rewrite:
-        return {"intent": existing_intent, "rewritten_query": existing_rewrite}
+
+def _rule_confidence(rule_decision) -> float:
+    try:
+        return float(getattr(rule_decision, "confidence", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _rule_reason(rule_decision) -> str:
+    return str(getattr(rule_decision, "rule_name", "") or "").strip()
+
+
+async def classify_intent(state: FinalGraphState, config=None) -> dict:
+    """Classify the request into data/chat/clarify and rewrite the query."""
+    existing_route = str(state.get("route", "") or state.get("intent", "") or "").strip()
+    existing_rewrite = str(state.get("rewritten_query", "") or "").strip()
+    if existing_route and existing_route in _ROUTES and existing_rewrite:
+        return {
+            "route": existing_route,
+            "rewritten_query": existing_rewrite,
+            "route_confidence": float(state.get("route_confidence", 1.0) or 1.0),
+            "route_reason": str(state.get("route_reason", "") or ""),
+        }
 
     callbacks = callbacks_from_config(config)
-    query = state.get("query", "")
+    query = str(state.get("query", "") or "").strip()
 
     async def _evaluate_rules():
-        return await evaluate_intent_rules(query, valid_intents=set(_INTENTS))
-
-    rule_task = asyncio.create_task(
-        traced_async_tool_call(
-            "intent_rules.evaluate",
+        return await evaluate_intent_rules(
             query,
-            callbacks,
-            _evaluate_rules,
-            metadata={"storage": "mysql", "node": "classify_intent"},
+            valid_intents={"data", "chat", "clarify", "sql_query"},
         )
+
+    rule_decision = await traced_async_tool_call(
+        "intent_rules.evaluate",
+        query,
+        callbacks,
+        _evaluate_rules,
+        metadata={"storage": "mysql", "node": "classify_route"},
     )
+
+    chat_history = state.get("chat_history", [])
+    rule_route = _route_from_rule_decision(rule_decision)
+    if rule_route in _ROUTES and not chat_history:
+        rewritten_query = _apply_rule_rewrite_template(query, query, rule_decision)
+        logger.info(
+            "classify_route: rule_short_circuit route=%s, query='%s' -> '%s', rule=%s",
+            rule_route,
+            query,
+            rewritten_query,
+            rule_decision.to_dict() if rule_decision else None,
+        )
+        return {
+            "route": rule_route,
+            "rewritten_query": rewritten_query,
+            "route_confidence": _rule_confidence(rule_decision),
+            "route_reason": _rule_reason(rule_decision),
+        }
+
     domain_task = asyncio.create_task(
         traced_async_tool_call(
             "domain_summary.load",
             query,
             callbacks,
             get_domain_summary,
-            metadata={"storage": "mysql", "node": "classify_intent"},
+            metadata={"storage": "mysql", "node": "classify_route"},
         )
     )
     model = get_chat_model(settings.chat_model_type)
     domain = await domain_task
 
-    # 构建对话历史上下文
-    chat_history = state.get("chat_history", [])
     history_context = ""
     if chat_history:
-        recent = chat_history[-6:]  # 最近 3 轮
-        lines = [f"[{h['role']}]: {h['content']}" for h in recent]
+        recent = chat_history[-6:]
+        lines = [f"[{item['role']}]: {item['content']}" for item in recent]
         history_context = "\n\n最近对话历史:\n" + "\n".join(lines)
 
     user_msg = f"""数据库领域摘要：
@@ -136,26 +180,34 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
 
 用户问题: {query}"""
 
-    response = await model.ainvoke(
-        [
-            SystemMessage(content=_CLASSIFY_SYSTEM_PROMPT),
-            HumanMessage(content=user_msg),
-        ],
-        config=child_trace_config(
-            config,
-            "dispatcher.classify_intent.llm",
-            tags=["llm", "intent"],
-        ),
-    )
+    try:
+        response = await model.ainvoke(
+            [
+                SystemMessage(content=_CLASSIFY_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ],
+            config=child_trace_config(
+                config,
+                "dispatcher.classify_route.llm",
+                tags=["llm", "route"],
+            ),
+        )
+    except Exception as exc:
+        logger.warning("classify_route llm failed, falling back to data route: %s", exc)
+        return {
+            "route": _ROUTE_DATA,
+            "rewritten_query": query,
+            "route_confidence": 0.0,
+            "route_reason": "classify_llm_unavailable_domain_fallback" if domain else "classify_llm_unavailable",
+        }
 
-    raw = response.content.strip()
-
-    # 解析 JSON 响应
-    intent = _INTENT_CHAT
-    rewritten_query = state.get("query", "")
+    raw = str(response.content or "").strip()
+    route = _ROUTE_CHAT
+    rewritten_query = query
+    route_confidence = 0.0
+    route_reason = ""
 
     try:
-        # 处理可能的 markdown 代码块包裹
         clean = raw
         if clean.startswith("```"):
             lines = clean.split("\n")
@@ -165,67 +217,363 @@ async def classify_intent(state: FinalGraphState, config=None) -> dict:
                 if line.strip().startswith("```") and not in_block:
                     in_block = True
                     continue
-                elif line.strip() == "```" and in_block:
+                if line.strip() == "```" and in_block:
                     break
-                elif in_block:
+                if in_block:
                     json_lines.append(line)
             clean = "\n".join(json_lines)
 
         data = json.loads(clean)
-        raw_intent = data.get("intent", "").strip().lower()
-        rewritten_query = data.get("rewritten_query", "").strip() or state.get("query", "")
-
-        # 匹配意图
-        for valid_intent in _INTENTS:
-            if valid_intent in raw_intent:
-                intent = valid_intent
-                break
-    except (json.JSONDecodeError, AttributeError):
-        # JSON 解析失败，尝试旧版纯文本匹配
-        for valid_intent in _INTENTS:
-            if valid_intent in raw.lower():
-                intent = valid_intent
+        raw_route = str(data.get("route") or data.get("intent") or "").strip()
+        rewritten_query = str(data.get("rewritten_query") or query).strip() or query
+        route_confidence = float(data.get("confidence") or data.get("route_confidence") or 0.0)
+        route_reason = str(data.get("reason") or data.get("route_reason") or "").strip()
+        route = _normalize_route(raw_route)
+    except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        for candidate in raw.lower().split():
+            if candidate in _ROUTES:
+                route = candidate
                 break
 
-    rule_decision = await rule_task
-    intent = _arbitrate_intent(intent, rule_decision)
+    route = _arbitrate_route(route, rule_decision)
     rewritten_query = _apply_rule_rewrite_template(query, rewritten_query, rule_decision)
+    if not route_reason and rule_decision:
+        route_reason = _rule_reason(rule_decision)
 
     logger.info(
-        "classify_intent: intent=%s, query='%s' -> '%s', rule=%s",
-        intent,
+        "classify_route: route=%s, query='%s' -> '%s', rule=%s",
+        route,
         query,
         rewritten_query,
         rule_decision.to_dict() if rule_decision else None,
     )
-    return {"intent": intent, "rewritten_query": rewritten_query}
+    return {
+        "route": route,
+        "rewritten_query": rewritten_query,
+        "route_confidence": route_confidence,
+        "route_reason": route_reason,
+    }
 
 
-async def sql_react(state: FinalGraphState, config=None) -> dict:
-    """SQL React 子图。"""
-    from agents.flow.sql_react import build_sql_react_graph
-    sql_graph = build_sql_react_graph()
-    query = state.get("query", "")
-    result = await sql_graph.ainvoke(
-        {
-            "query": query,
-            "rewritten_query": state.get("rewritten_query", ""),
-            "chat_history": state.get("chat_history", []),
-            "security_context": state.get("security_context", {}),
-        },
-        config=config,
+async def agentscope_data_planner(state: FinalGraphState, config=None) -> dict:
+    """Run AgentScope as the primary data planner."""
+    query = str(state.get("rewritten_query", "") or state.get("query", "") or "").strip()
+    callbacks = _agentscope_callbacks_for_runtime(config)
+    runtime = AgentScopeRuntime(runner=create_agentscope_runner(), callbacks=callbacks)
+
+    async def _run_primary_agentscope():
+        return await runtime.run(
+            task_type="data_analysis",
+            query=query,
+            session_id=str(state.get("session_id", "") or ""),
+            security_context=state.get("security_context", {}),
+            workflow_state=_agentscope_workflow_state(state),
+        )
+
+    try:
+        result = await traced_async_tool_call(
+            "agentscope.data_planner.primary",
+            query,
+            callbacks,
+            _run_primary_agentscope,
+            metadata={
+                "node": "agentscope_data_planner",
+                "backend": "auto",
+                "task_type": "data_analysis",
+                "session_id": str(state.get("session_id", "") or ""),
+            },
+        )
+    except Exception as exc:
+        logger.error("agentscope_data_planner failed: %s", exc, exc_info=True)
+        return {
+            "answer": f"系统错误: {exc}",
+            "status": "error",
+            "agentscope_result": {},
+            "agentscope_observation": {"error": str(exc)},
+        }
+
+    result, observation = await _ensure_agentscope_analysis_plan(result, state, query, callbacks)
+    if observation is None:
+        observation = {
+            "backend": result.state_patch.get("agentscope_backend", ""),
+            "task_type": "data_analysis",
+            "tool_trace_count": len(result.tool_trace),
+            "risk_flags": list(result.risk_flags),
+        }
+    presentation = result.state_patch.get("presentation", {})
+    analysis_plan = result.state_patch.get("analysis_plan", {})
+    if not (isinstance(analysis_plan, dict) and analysis_plan.get("steps")):
+        logger.error(
+            "agentscope_data_planner returned no analysis_plan: backend=%s risks=%s answer=%s",
+            observation["backend"],
+            observation["risk_flags"],
+            result.answer[:500],
+        )
+        return {
+            "answer": "数据分析计划生成失败：AgentScope 未提交可执行的 analysis_plan，请查看 trace 中的 agentscope_observation 和工具调用日志。",
+            "status": "error",
+            "analysis_plan": {},
+            "agentscope_result": result.to_dict(),
+            "agentscope_observation": observation,
+        }
+
+    status = str(presentation.get("status") or "")
+    if not status:
+        status = "needs_harness" if result.state_patch.get("requires_harness") else "completed"
+    selected_tables = (
+        result.state_patch.get("selected_tables")
+        or result.state_patch.get("candidate_tables")
+        or []
     )
     return {
-        "sql": result.get("sql", ""),
-        "result": result.get("result", ""),
-        "answer": result.get("answer", ""),
-        "status": "completed",
+        "answer": result.answer,
+        "status": status,
+        "analysis_plan": analysis_plan,
+        "selected_tables": selected_tables,
+        "table_relationships": result.state_patch.get("table_relationships", state.get("table_relationships", [])),
+        "table_metadata": result.state_patch.get("table_metadata", state.get("table_metadata", {})),
+        "semantic_model": result.state_patch.get("semantic_model", state.get("semantic_model", {})),
+        "evidence": result.state_patch.get("evidence", state.get("evidence", [])),
+        "few_shot_examples": result.state_patch.get("few_shot_examples", state.get("few_shot_examples", [])),
+        "recall_context": result.state_patch.get("recall_context", state.get("recall_context", {})),
+        "enhanced_query": result.state_patch.get("enhanced_query", state.get("enhanced_query", "")),
+        "agentscope_result": result.to_dict(),
+        "agentscope_observation": observation,
+    }
+
+
+async def _ensure_agentscope_analysis_plan(
+    result: AgentRunResult,
+    state: FinalGraphState,
+    query: str,
+    callbacks: list,
+) -> tuple[AgentRunResult, dict | None]:
+    analysis_plan = result.state_patch.get("analysis_plan", {})
+    if isinstance(analysis_plan, dict) and analysis_plan.get("steps"):
+        return result, None
+
+    original_observation = {
+        "backend": result.state_patch.get("agentscope_backend", ""),
+        "task_type": "data_analysis",
+        "tool_trace_count": len(result.tool_trace),
+        "risk_flags": list(result.risk_flags),
+    }
+    logger.error(
+        "agentscope_data_planner returned no analysis_plan: backend=%s risks=%s answer=%s",
+        original_observation["backend"],
+        original_observation["risk_flags"],
+        result.answer[:500],
+    )
+
+    fallback_runtime = AgentScopeRuntime(
+        runner=LocalAgentScopeCompatibleRunner(),
+        callbacks=callbacks,
+    )
+
+    async def _run_fallback_agentscope():
+        return await fallback_runtime.run(
+            task_type="data_analysis",
+            query=query,
+            session_id=str(state.get("session_id", "") or ""),
+            security_context=state.get("security_context", {}),
+            workflow_state=_agentscope_workflow_state(state),
+        )
+
+    try:
+        fallback = await traced_async_tool_call(
+            "agentscope.data_planner.fallback.local_compatible",
+            query,
+            callbacks,
+            _run_fallback_agentscope,
+            metadata={
+                "node": "agentscope_data_planner",
+                "backend": "local_compatible",
+                "fallback_from_backend": original_observation["backend"],
+                "task_type": "data_analysis",
+                "session_id": str(state.get("session_id", "") or ""),
+            },
+        )
+    except Exception as exc:
+        logger.error("agentscope_data_planner fallback failed: %s", exc, exc_info=True)
+        return result, original_observation
+
+    fallback_plan = fallback.state_patch.get("analysis_plan", {})
+    if not (isinstance(fallback_plan, dict) and fallback_plan.get("steps")):
+        return result, original_observation
+
+    observation = {
+        "backend": fallback.state_patch.get("agentscope_backend", ""),
+        "fallback_from_backend": original_observation["backend"],
+        "task_type": "data_analysis",
+        "tool_trace_count": len(fallback.tool_trace),
+        "risk_flags": original_observation["risk_flags"],
+        "fallback_risk_flags": list(fallback.risk_flags),
+    }
+    return fallback, observation
+
+
+def _agentscope_callbacks_for_runtime(config) -> list:
+    callbacks = callbacks_from_config(config)
+    if not callbacks:
+        return []
+    if isinstance(callbacks, (list, tuple)):
+        return list(callbacks)
+    return [callbacks]
+
+
+def _agentscope_workflow_state(state: FinalGraphState) -> dict:
+    workflow_state = {
+        "query": state.get("query", ""),
+        "rewritten_query": state.get("rewritten_query", ""),
+        "chat_history": state.get("chat_history", []),
+        "route": state.get("route", ""),
+        "route_reason": state.get("route_reason", ""),
+        "route_confidence": state.get("route_confidence", 0.0),
+        "security_context": state.get("security_context", {}),
+    }
+    for key in (
+        "enhanced_query",
+        "selected_tables",
+        "table_metadata",
+        "table_relationships",
+        "semantic_model",
+        "evidence",
+        "few_shot_examples",
+        "recall_context",
+        "feasibility_decision",
+        "complexity_report",
+    ):
+        value = state.get(key)
+        if value:
+            workflow_state[key] = value
+    return workflow_state
+
+
+def _tables_from_analysis_plan(plan: dict) -> list[str]:
+    tables: list[str] = []
+    for step in plan.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
+        for table in step.get("tables") or []:
+            table_name = str(table).strip()
+            if table_name and table_name not in tables:
+                tables.append(table_name)
+    return tables
+
+
+def _analysis_plan_to_complex_plan(plan: dict) -> dict:
+    normalized = dict(plan or {})
+    normalized["mode"] = "complex_plan"
+    return normalized
+
+
+def route_after_agentscope_data_planner(state: FinalGraphState) -> str:
+    """Plans submitted by AgentScope must go through Harness approval/execution."""
+    plan = state.get("analysis_plan") or {}
+    if isinstance(plan, dict) and plan.get("steps"):
+        return "approve_analysis_plan"
+    return END
+
+
+def _format_analysis_plan_preview(plan: dict) -> str:
+    steps = plan.get("steps") or []
+    lines = ["AgentScope 已生成数据分析计划，请确认是否交由 SQL Harness 审批执行："]
+    reason = str(plan.get("reason") or "").strip()
+    if reason:
+        lines.append(f"原因：{reason}")
+    for item in steps:
+        if not isinstance(item, dict):
+            continue
+        step_no = item.get("step")
+        step_type = item.get("type", "")
+        goal = item.get("goal", "")
+        tables = [str(table) for table in item.get("tables") or [] if str(table)]
+        suffix = f"（{step_type}"
+        if tables:
+            suffix += f": {', '.join(tables)}"
+        suffix += "）"
+        lines.append(f"{step_no}. {goal}{suffix}")
+    return "\n".join(lines)
+
+
+async def approve_analysis_plan(state: FinalGraphState, config=None) -> dict:
+    """Validate and ask user approval for an AgentScope-submitted analysis plan."""
+    raw_plan = state.get("analysis_plan") or {}
+    if not isinstance(raw_plan, dict):
+        return {
+            "answer": "AgentScope 未提交有效分析计划。",
+            "status": "error",
+        }
+    plan = _analysis_plan_to_complex_plan(raw_plan)
+    referenced_tables = _tables_from_analysis_plan(plan)
+    auth = authorize_tables(
+        referenced_tables,
+        state.get("security_context", {}),
+        stage="analysis_plan.approve",
+    )
+    if not auth.allowed:
+        return {
+            "answer": auth.message or "分析计划引用了无权限的数据表。",
+            "status": "error",
+        }
+    ok, error = validate_complex_plan(plan, allowed_tables=set(auth.allowed_tables or referenced_tables))
+    if not ok:
+        return {
+            "answer": f"AgentScope 分析计划校验失败：{error}",
+            "status": "error",
+        }
+    approved = interrupt({
+        "complex_plan": plan,
+        "analysis_plan": raw_plan,
+        "message": _format_analysis_plan_preview(plan),
+        "approval_type": "complex_plan",
+    })
+    if approved.get("approved"):
+        return {
+            "complex_plan": plan,
+            "plan_approved": True,
+            "analysis_plan": raw_plan,
+            "answer": "AgentScope 数据分析计划已确认，准备进入 SQL Harness 分步执行。",
+            "status": "approved",
+        }
+    return {
+        "complex_plan": plan,
+        "plan_approved": False,
+        "analysis_plan": raw_plan,
+        "answer": "已取消 AgentScope 数据分析计划执行。",
+        "status": "rejected",
+    }
+
+
+async def execute_analysis_plan(state: FinalGraphState, config=None) -> dict:
+    """Execute an approved AgentScope analysis plan through the existing SQL Harness."""
+    selected_tables = state.get("selected_tables") or _tables_from_analysis_plan(state.get("complex_plan") or state.get("analysis_plan") or {})
+    complex_state = {
+        **state,
+        "complex_plan": state.get("complex_plan") or _analysis_plan_to_complex_plan(state.get("analysis_plan") or {}),
+        "plan_approved": bool(state.get("plan_approved")),
+        "selected_tables": selected_tables,
+        "table_relationships": state.get("table_relationships", []),
+        "table_metadata": state.get("table_metadata", {}),
+        "semantic_model": state.get("semantic_model", {}),
+        "evidence": state.get("evidence", []),
+        "few_shot_examples": state.get("few_shot_examples", []),
+        "recall_context": state.get("recall_context", {}),
+        "enhanced_query": state.get("enhanced_query", ""),
+        "execution_history": state.get("execution_history", []),
+        "retry_count": state.get("retry_count", 0),
+    }
+    result = await execute_complex_plan_step(complex_state, config=config)
+    return {
+        **result,
+        "complex_plan": complex_state.get("complex_plan", {}),
+        "plan_approved": bool(complex_state.get("plan_approved")),
+        "status": "completed" if not result.get("error") else "error",
     }
 
 
 async def chat_direct(state: FinalGraphState, config=None) -> dict:
-    """普通对话，接入 RAG Chat 子图。"""
-    from agents.flow.rag_chat import build_rag_chat_graph
+    """Normal chat path."""
     rag_graph = build_rag_chat_graph()
     rewritten = state.get("rewritten_query", "")
     result = await rag_graph.ainvoke(
@@ -244,26 +592,49 @@ async def chat_direct(state: FinalGraphState, config=None) -> dict:
     }
 
 
-def route_intent(state: FinalGraphState) -> str:
-    """条件路由：根据意图分发。"""
-    intent = state.get("intent", _INTENT_CHAT)
-    if intent == _INTENT_SQL:
-        return "sql_react"
+async def clarify_direct(state: FinalGraphState, config=None) -> dict:
+    """Ask for missing information."""
+    reason = str(state.get("route_reason", "") or "").strip()
+    answer = reason or "请补充查询对象、时间范围或口径后再问。"
+    return {
+        "answer": answer,
+        "status": "completed",
+    }
+
+
+def route_target(state: FinalGraphState) -> str:
+    route = str(state.get("route", "") or _ROUTE_CHAT).strip().lower()
+    if route == _ROUTE_DATA:
+        return "agentscope_data_planner"
+    if route == _ROUTE_CLARIFY:
+        return "clarify_direct"
     return "chat_direct"
 
 
+def route_after_analysis_plan_approval(state: FinalGraphState) -> str:
+    if state.get("plan_approved"):
+        return "execute_analysis_plan"
+    return END
+
+
 def build_final_graph():
-    """构建意图调度图。"""
+    """Build the final router graph."""
     graph = StateGraph(FinalGraphState)
 
     graph.add_node("classify_intent", classify_intent)
-    graph.add_node("sql_react", sql_react)
+    graph.add_node("agentscope_data_planner", agentscope_data_planner)
+    graph.add_node("approve_analysis_plan", approve_analysis_plan)
+    graph.add_node("execute_analysis_plan", execute_analysis_plan)
     graph.add_node("chat_direct", chat_direct)
+    graph.add_node("clarify_direct", clarify_direct)
 
     graph.add_edge(START, "classify_intent")
-    graph.add_conditional_edges("classify_intent", route_intent)
-    graph.add_edge("sql_react", END)
+    graph.add_conditional_edges("classify_intent", route_target)
+    graph.add_conditional_edges("agentscope_data_planner", route_after_agentscope_data_planner)
+    graph.add_conditional_edges("approve_analysis_plan", route_after_analysis_plan_approval)
+    graph.add_edge("execute_analysis_plan", END)
     graph.add_edge("chat_direct", END)
+    graph.add_edge("clarify_direct", END)
 
     checkpointer = get_checkpointer()
     return graph.compile(checkpointer=checkpointer)

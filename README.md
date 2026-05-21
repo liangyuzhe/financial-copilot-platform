@@ -20,10 +20,28 @@
 - **复杂查询模式切换**：`assess_feasibility` 不调用 LLM，基于规则引擎任务类型、关系图连通性和 JOIN 风险产出 `execution_mode`；复杂计划经用户确认后串行执行 SQL step，逐步安全检查、执行并把本地 merge/report step 写入可审计结果，避免超大 JOIN 幻觉和 token 膨胀。
 - **数据权限与合规审计**：API 注入用户、角色、部门和表级权限上下文；SQL 链路在选表后、补表前、审批前和复杂计划 SQL step 中执行权限门禁，拒绝时只展示业务数据域名称，并写入 no-throw 审计事件，避免越权查询和物理表名泄露。
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）按 `session_id` 隔离；SQL 场景单独保存上一轮 SQL 口径，支持“亏损多少”这类多轮追问。
+- **AgentScope 运行区边界**：开放式分析运行区已进入最小 runtime 迭代，但不替换 `Final Graph -> SQL React` 主链路；权限、审批、执行、审计和评测继续由 SQL Harness 负责。
+- **AgentScopeRuntime 基础层**：`agents/runtime` 提供只读工具合同、任务 allowlist、权限过滤、工具调用 trace、`AgentRunResult` 结构化输出、开放探索 prompt、报告生成 prompt 和 SkillRegistry；当前不提供 SQL 执行工具。
 - **链路追踪与评测闭环**：LangSmith/CozeLoop 记录 LLM、Milvus、ES、MySQL fallback、SQL 执行和审批节点；Evaluation 页面展示 Accuracy@K、Precision@K、Recall@K、MRR、NDCG、P50/P95、首字延迟和 per-query 明细。
 - **安全、熔断与 Fallback**：只允许安全 `SELECT/WITH`；支持 SQLState 错误分类、可配置重试、超时控制、Redis -> MySQL fallback、检索失败降级为空 evidence。
 - **SFT 扩展预留**：保留 prompt/completion 采集、教师标注、JSONL 导出模块，默认未接入在线链路，避免在样本不足时把错误 SQL 和错误口径固化进模型。
 - **多模型支持**：Ark（豆包）、OpenAI、DeepSeek、通义千问、Gemini。
+
+## AgentScope 调研边界与运行区
+
+当前仓库的运行时仍以 `Final Graph -> SQL React` 为默认链路。AgentScope 的定位是 `Agentic Analysis Workspace`：用于开放式数据探索、复杂分析辅助规划、报告生成和 skill 扩展。
+
+Phase 2 已新增 `AgentScopeRuntime` 最小适配层，开放 `exploratory_analysis`，通过 `ToolCatalog` 暴露只读 schema、semantic model、business knowledge 和 current time 工具。Phase 3 已新增 `report_generation`，只允许读取已有 result/artifact，并通过 `report.render` 输出 Markdown 报告和可选 ECharts 配置。
+
+Phase 4 已新增 `SkillRegistry`，内置 `budget_variance_analysis` 和 `revenue_cost_relation` 两个 skill，支持按 task/query 自动匹配或显式启用。Skill 只能注入 prompt 和在 ToolCatalog 已允许工具内做安全交集，不能引入 SQL execution 或绕过 SQL Harness。
+
+Phase 5 已新增 `complex_analysis` 桥接能力和 `sql_draft.submit` 工具。AgentScopeRuntime 可以生成复杂分析计划和 SQL 草稿，但草稿只会返回 `draft_only` handoff 元数据，后续必须进入 SQL Harness 的 `safety_check -> authorize_sql -> approve -> execute_sql`。
+
+Phase 6 已新增 `ShadowBenchmark` 离线汇总组件，用于对比普通 NL2SQL、开放探索、复杂分析和报告生成的 P50/P95 延迟、LLM 调用、token、草稿通过率、审批通过率、工具失败率和最终回答可用率。严格 SQL 查询默认继续走 SQL Harness，AgentScope 只有在 shadow 指标达标时才建议启用。
+
+真实 `agentscope` 包保持懒加载；未安装或未配置实际 runner 时返回结构化风险，不影响现有 SQL 链路。
+
+AgentScope 不接管平台控制面：权限门禁、SQL 安全检查、人工审批、SQL 执行、审计日志和 Evaluation 回归评测继续由 SQL Harness 负责。SQL 只能作为草稿输出，并必须回到 SQL Harness 完成安全检查、授权、审批和执行。具体技术边界见 [docs/agentscope_runtime_research_plan.md](docs/agentscope_runtime_research_plan.md)。
 
 ## 功能演示（7 个端到端案例）
 
@@ -73,7 +91,7 @@
 
 ## 最新节点调用流程图
 
-当前主链路由 `Final Graph` 做意图分类与路由，SQL 查询进入 `SQL React` 子图。`recall_evidence` 每轮只召回一次，并把业务知识/few-shot 整理成 `recall_context`，后续查询增强、选表和 SQL 生成复用同一份状态。
+当前主链路由 `Final Graph` 做意图分类与路由，SQL 查询进入 `SQL React` 子图。`recall_evidence` 每轮只召回一次，并把业务知识/few-shot 整理成 `recall_context`，后续查询增强、选表和 SQL 生成复用同一份状态。AgentScope 运行区不属于当前主执行图。
 
 ```mermaid
 flowchart TD
@@ -179,6 +197,14 @@ financial-copilot-platform/
 │   │
 │   ├── init/                       # 系统初始化
 │   │   └── schema_sync.py          # t_semantic_model 自动同步（binlog + 轮询）
+│   │
+│   ├── runtime/                    # AgentScope 运行区基础层（runtime / ToolCatalog / contracts）
+│   │   ├── agentscope_runtime.py   # Phase 2 最小 AgentScopeRuntime + common_analysis_agent prompt
+│   │   ├── result.py               # AgentRunResult 结构化输出 + SSE 事件适配
+│   │   ├── shadow_benchmark.py     # AgentScope shadow 指标汇总和启用阈值判断
+│   │   ├── skill_registry.py       # Skill manifest 加载、内置 skill 和安全工具边界
+│   │   ├── tool_catalog.py         # 受控只读工具注册表 + allowlist + 权限过滤
+│   │   └── tool_contracts.py       # 工具合同、调用结果和 trace 结构
 │   │
 │   ├── model/                      # 模型抽象层
 │   │   ├── chat_model.py           # Chat Model 工厂

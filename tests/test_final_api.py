@@ -165,6 +165,26 @@ class TestQueryInvoke:
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
     @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_returns_execution_result_payload(self, mock_build_graph, mock_callbacks):
+        """Execution result payload should be exposed to the frontend response."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={
+            "answer": "查询已执行完成。\n亏损金额：0.00",
+            "status": "completed",
+            "sql": "SELECT 0 AS loss_amount;",
+            "result": '[{"loss_amount":"0.00"}]',
+        })
+        mock_build_graph.return_value = mock_graph
+
+        result = await query_invoke(QueryRequest(query="去年亏损", session_id="s1"))
+
+        assert result.result == '[{"loss_amount":"0.00"}]'
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_invoke_returns_pending_approval(self, mock_build_graph, mock_callbacks):
         """When graph returns interrupt, should return pending_approval."""
         from agents.api.routers.query import query_invoke, QueryRequest
@@ -253,6 +273,30 @@ class TestQueryInvoke:
         initial_state = call_args[0][0]
         assert initial_state["intent"] == "sql_query"
         assert initial_state["rewritten_query"] == ""
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_passes_route_to_graph_without_old_sql_intent(self, mock_build_graph, mock_callbacks):
+        """Route-prefilled requests should enter the graph as data/chat/clarify routes."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={"answer": "ok", "status": "completed"})
+        mock_build_graph.return_value = mock_graph
+
+        req = QueryRequest(
+            query="分析今年收入、成本和预算关系",
+            session_id="s1",
+            route="data",
+            rewritten_query="分析公司今年收入、成本和预算关系",
+        )
+        await query_invoke(req)
+
+        initial_state = mock_graph.ainvoke.call_args[0][0]
+        assert initial_state["route"] == "data"
+        assert initial_state["intent"] == "data"
+        assert initial_state["rewritten_query"] == "分析公司今年收入、成本和预算关系"
 
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])

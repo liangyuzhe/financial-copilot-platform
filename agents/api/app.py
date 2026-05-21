@@ -8,7 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from agents.api.routers import chat, rag, query, document, admin, eval
+from agents.api.routers import agentscope, chat, rag, query, document, admin, eval
 from agents.config.settings import settings
 
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -193,6 +193,7 @@ app.add_middleware(
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(rag.router, prefix="/api/rag", tags=["rag"])
 app.include_router(query.router, prefix="/api/query", tags=["query"])
+app.include_router(agentscope.router, prefix="/api/agentscope", tags=["agentscope"])
 app.include_router(document.router, prefix="/api/document", tags=["document"])
 app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
 app.include_router(eval.router, prefix="/api/eval", tags=["eval"])

@@ -150,6 +150,25 @@ def child_trace_config(
     return child
 
 
+def _callback_handlers_for_manager(callbacks: Any | None) -> list[Any]:
+    """Return callback handlers suitable for LangChain CallbackManager.configure."""
+    if not callbacks:
+        return []
+    items = list(callbacks) if isinstance(callbacks, (list, tuple)) else [callbacks]
+    handlers: list[Any] = []
+    for item in items:
+        manager_handlers = [
+            *list(getattr(item, "inheritable_handlers", []) or []),
+            *list(getattr(item, "handlers", []) or []),
+        ]
+        if manager_handlers:
+            handlers.extend(manager_handlers)
+            continue
+        if hasattr(item, "run_inline"):
+            handlers.append(item)
+    return handlers
+
+
 def traced_retriever_call(
     name: str,
     query: str,
@@ -158,13 +177,14 @@ def traced_retriever_call(
     metadata: dict[str, Any] | None = None,
 ):
     """Trace a non-Runnable retriever operation as a retriever span."""
-    if not callbacks:
+    handlers = _callback_handlers_for_manager(callbacks)
+    if not handlers:
         return func()
 
     from langchain_core.callbacks import CallbackManager
 
     manager = CallbackManager.configure(
-        inheritable_callbacks=callbacks,
+        inheritable_callbacks=handlers,
         inheritable_tags=["retriever", name],
         inheritable_metadata=metadata or {},
     )
@@ -189,13 +209,14 @@ def traced_tool_call(
     metadata: dict[str, Any] | None = None,
 ):
     """Trace non-Runnable IO work such as Redis/MySQL metadata loading."""
-    if not callbacks:
+    handlers = _callback_handlers_for_manager(callbacks)
+    if not handlers:
         return func()
 
     from langchain_core.callbacks import CallbackManager
 
     manager = CallbackManager.configure(
-        inheritable_callbacks=callbacks,
+        inheritable_callbacks=handlers,
         inheritable_tags=["tool", name],
         inheritable_metadata=metadata or {},
     )
@@ -221,13 +242,14 @@ async def traced_async_tool_call(
     metadata: dict[str, Any] | None = None,
 ):
     """Trace non-Runnable async IO work as a tool span."""
-    if not callbacks:
+    handlers = _callback_handlers_for_manager(callbacks)
+    if not handlers:
         return await func()
 
     from langchain_core.callbacks import AsyncCallbackManager
 
     manager = AsyncCallbackManager.configure(
-        inheritable_callbacks=callbacks,
+        inheritable_callbacks=handlers,
         inheritable_tags=["tool", name],
         inheritable_metadata=metadata or {},
     )

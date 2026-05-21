@@ -3,8 +3,10 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import date
+from decimal import Decimal, InvalidOperation
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import interrupt
@@ -15,6 +17,7 @@ from agents.flow.state import SQLReactState
 from agents.flow.complex_query import assess_query_feasibility, validate_complex_plan
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool, normalize_sql_answer
+from agents.runtime import AgentScopeRuntime, create_agentscope_runner
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
@@ -24,7 +27,7 @@ from agents.tool.security.policies import authorize_tables, build_audit_event
 from agents.tool.security.presentation import format_result_for_user
 from agents.tool.security.audit import write_audit_log
 from agents.config.settings import settings
-from agents.tool.trace.tracing import callbacks_from_config, child_trace_config, traced_tool_call
+from agents.tool.trace.tracing import callbacks_from_config, child_trace_config, traced_async_tool_call, traced_tool_call
 
 try:
     from elasticsearch import Elasticsearch
@@ -91,6 +94,64 @@ def _query_matched_terms(query: str, evidence: list[str]) -> list[dict[str, str]
 def _query_asks_quantity(query: str) -> bool:
     quantity_markers = ("多少", "金额", "数额", "额度", "几", "多大", "合计", "总额")
     return any(marker in query for marker in quantity_markers)
+
+
+def _query_has_relation_analysis_signal(query: str) -> bool:
+    relation_markers = ("关系", "关联", "相关", "对比", "比较", "分析", "影响", "差异", "趋势")
+    return any(marker in query for marker in relation_markers)
+
+
+def _infer_task_type_from_recall_context(
+    state: SQLReactState,
+    query: str,
+    selected_tables: list[str],
+) -> tuple[str, dict]:
+    """Infer decomposable analysis when recall evidence spans many business terms.
+
+    This is deliberately driven by runtime recall terms and selected-table
+    breadth, not by product table names or hardcoded finance table catalogs.
+    """
+    context = state.get("recall_context") or {}
+    if not isinstance(context, dict):
+        return "", {}
+
+    query_text = " ".join(
+        str(value or "")
+        for value in (
+            query,
+            state.get("enhanced_query"),
+            state.get("rewritten_query"),
+            state.get("query"),
+        )
+    )
+    matched_terms = _unique_ordered([
+        str(term).strip()
+        for term in context.get("matched_terms", [])
+        if str(term).strip()
+    ])
+    related_tables = _unique_ordered([
+        str(table).strip()
+        for table in [
+            *(context.get("business_related_tables") or []),
+            *(context.get("few_shot_related_tables") or []),
+        ]
+        if str(table).strip()
+    ])
+    selected_count = len(set(selected_tables or []))
+    related_selected_count = len(set(related_tables) & set(selected_tables or []))
+
+    if (
+        _query_has_relation_analysis_signal(query_text)
+        and len(matched_terms) >= 3
+        and (selected_count >= 4 or related_selected_count >= 3 or len(related_tables) >= 3)
+    ):
+        return "analysis", {
+            "matched_terms": matched_terms,
+            "business_related_tables_count": len(related_tables),
+            "selected_tables_count": selected_count,
+            "reason": "multi-term relation analysis inferred from recall context",
+        }
+    return "", {}
 
 
 def _amount_label_from_query(query: str, matched_terms: list[dict[str, str]]) -> str | None:
@@ -1031,7 +1092,17 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
             logger.warning("Failed to load table relationships: %s", e)
         logger.info("select_tables: %d candidates, using directly: %s, %d relationships",
                     len(candidate_tables), selected, len(relationships))
-        return {"selected_tables": selected, "table_relationships": relationships, "table_metadata": table_metadata}
+        selected_semantic_model = {
+            table: semantic_model.get(table, {})
+            for table in selected
+            if table in semantic_model
+        }
+        return {
+            "selected_tables": selected,
+            "table_relationships": relationships,
+            "table_metadata": table_metadata,
+            "semantic_model": selected_semantic_model,
+        }
 
     # Stage 2: 候选 > 3 个，LLM 精选
     model = get_chat_model(settings.chat_model_type)
@@ -1105,7 +1176,17 @@ async def select_tables(state: SQLReactState, config=None) -> dict:
 
     logger.info("select_tables: LLM selected %d from %d candidates: %s, %d relationships",
                 len(selected), len(candidate_tables), selected, len(relationships))
-    return {"selected_tables": selected, "table_relationships": relationships, "table_metadata": table_metadata}
+    selected_semantic_model = {
+        table: semantic_model.get(table, {})
+        for table in selected
+        if table in semantic_model
+    }
+    return {
+        "selected_tables": selected,
+        "table_relationships": relationships,
+        "table_metadata": table_metadata,
+        "semantic_model": selected_semantic_model,
+    }
 
 
 async def authorize_selected_tables(state: SQLReactState, config=None) -> dict:
@@ -1153,6 +1234,16 @@ async def assess_feasibility(state: SQLReactState, config=None) -> dict:
         task_type = rule_decision.route_signal
         decision_source = "rules"
         report["route_rule"] = rule_decision.to_dict()
+    if not task_type:
+        inferred_task_type, inferred_report = _infer_task_type_from_recall_context(
+            state,
+            query,
+            selected_tables,
+        )
+        if inferred_task_type:
+            task_type = inferred_task_type
+            decision_source = "recall_context"
+            report["recall_route_signal"] = inferred_report
 
     decision = assess_query_feasibility(
         query=query,
@@ -1229,12 +1320,192 @@ def _normalize_complex_plan_tables(plan: dict, selected_tables: list[str], relat
     return normalized
 
 
+def _fallback_merge_keys(relationships: list[dict]) -> list[str]:
+    candidates = []
+    for rel in relationships or []:
+        for key in ("from_column", "to_column"):
+            column = str(rel.get(key) or "").strip()
+            normalized = _normalize_merge_name(column)
+            if not column or normalized in {"id"}:
+                continue
+            if normalized.endswith(("id", "code", "编码", "代码")) or any(token in normalized for token in ("period", "date", "year", "month", "期间", "日期", "年度", "月份")):
+                candidates.append(column)
+
+    preferred_markers = tuple(_normalize_merge_name(item) for item in (
+        "department", "dept", "cost_center", "period", "month", "year", "project", "customer", "account"
+    ))
+    low_value_markers = tuple(_normalize_merge_name(item) for item in (
+        "entry", "journal", "item", "invoice", "claim", "asset"
+    ))
+
+    preferred = [
+        column for column in _unique_ordered(candidates)
+        if any(marker and marker in _normalize_merge_name(column) for marker in preferred_markers)
+        and not any(marker and marker in _normalize_merge_name(column) for marker in low_value_markers)
+    ]
+    if preferred:
+        return preferred[:2]
+    unique_candidates = _unique_ordered(candidates)
+    return unique_candidates[:2] if unique_candidates else ["period"]
+
+
+def _should_use_complex_plan_fallback(state: SQLReactState) -> bool:
+    decision = state.get("feasibility_decision") or {}
+    if decision.get("execution_mode") == "complex_plan" or decision.get("task_type") in {"analysis", "report", "comparison"}:
+        return True
+    report = state.get("complexity_report") or {}
+    return report.get("execution_mode") == "complex_plan" or report.get("task_type") in {"analysis", "report", "comparison"}
+
+
+def _should_run_agentscope_complex_prepass(state: SQLReactState) -> bool:
+    explicit = state.get("agentscope_prepass_enabled")
+    if explicit is not None:
+        return str(explicit).strip().lower() in {"1", "true", "yes", "y", "on"}
+    return os.getenv("AGENTSCOPE_COMPLEX_PREPASS_ENABLED", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+
+
+def _fallback_complex_plan(state: SQLReactState, selected_tables: list[str], relationships: list[dict]) -> dict:
+    if not selected_tables or not _should_use_complex_plan_fallback(state):
+        return {}
+    tables = list(dict.fromkeys(selected_tables))
+    merge_keys = _fallback_merge_keys(relationships)
+    return {
+        "mode": "complex_plan",
+        "reason": "planner fallback for decomposable analysis",
+        "steps": [
+            {
+                "step": 1,
+                "type": "sql",
+                "goal": "汇总用户问题中的实际发生类指标，输出可用于后续合并的共同维度",
+                "tables": tables,
+                "depends_on": [],
+                "merge_keys": merge_keys,
+            },
+            {
+                "step": 2,
+                "type": "sql",
+                "goal": "汇总用户问题中的计划、预算或目标类指标，输出同名合并维度",
+                "tables": tables,
+                "depends_on": [],
+                "merge_keys": merge_keys,
+            },
+            {
+                "step": 3,
+                "type": "sql",
+                "goal": "汇总用户问题中的回收、结算或效率类关联指标，输出同名合并维度",
+                "tables": tables,
+                "depends_on": [],
+                "merge_keys": merge_keys,
+            },
+            {
+                "step": 4,
+                "type": "python_merge",
+                "goal": "按共同维度合并多类指标并保留未对齐记录",
+                "tables": [],
+                "depends_on": [1, 2, 3],
+                "merge_keys": merge_keys,
+            },
+            {
+                "step": 5,
+                "type": "report",
+                "goal": "基于合并结果输出多指标关系分析结论",
+                "tables": [],
+                "depends_on": [4],
+                "merge_keys": [],
+            },
+        ],
+        "requires_user_confirmation": True,
+    }
+
+
+def _config_thread_id(config) -> str:
+    if not config or not isinstance(config, dict):
+        return ""
+    configurable = config.get("configurable") or {}
+    if not isinstance(configurable, dict):
+        return ""
+    return str(configurable.get("thread_id") or "")
+
+
+def _agentscope_callbacks_for_runtime(config) -> list:
+    callbacks = callbacks_from_config(config)
+    if not callbacks:
+        return []
+    if isinstance(callbacks, (list, tuple)):
+        return list(callbacks)
+    return [callbacks]
+
+
+async def _run_agentscope_complex_analysis_prepass(state: SQLReactState, config=None) -> tuple[dict, dict]:
+    query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
+    thread_id = _config_thread_id(config) or str(state.get("session_id") or "")
+    runtime = AgentScopeRuntime(
+        runner=create_agentscope_runner(),
+        callbacks=_agentscope_callbacks_for_runtime(config),
+    )
+    result = await runtime.run(
+        task_type="complex_analysis",
+        query=query,
+        session_id=str(state.get("session_id") or thread_id or ""),
+        security_context=state.get("security_context", {}),
+        workflow_state={
+            "thread_id": thread_id or str(state.get("session_id") or ""),
+            "session_id": str(state.get("session_id") or thread_id or ""),
+            "query": query,
+            "rewritten_query": state.get("rewritten_query") or "",
+            "enhanced_query": state.get("enhanced_query") or "",
+            "selected_tables": state.get("selected_tables", []),
+            "table_relationships": state.get("table_relationships", []),
+            "semantic_model": state.get("semantic_model") or {},
+            "evidence": state.get("evidence", []),
+            "few_shot_examples": state.get("few_shot_examples", []),
+            "recall_context": state.get("recall_context") or {},
+            "feasibility_decision": state.get("feasibility_decision") or {},
+            "complexity_report": state.get("complexity_report") or {},
+            "security_context": state.get("security_context") or {},
+        },
+    )
+    observation = {
+        "task_type": "complex_analysis",
+        "status": "error" if any(str(flag.get("severity", "")).lower() == "error" for flag in result.risk_flags) else "completed",
+        "backend": str(result.state_patch.get("agentscope_backend") or "unknown"),
+        "thread_id": thread_id or str(state.get("session_id") or ""),
+        "session_id": str(state.get("session_id") or thread_id or ""),
+        "tool_trace_count": len(result.tool_trace),
+        "sql_draft_count": len(result.sql_drafts),
+        "risk_codes": [str(flag.get("code") or "") for flag in result.risk_flags if str(flag.get("code") or "")],
+    }
+    return result.to_dict(), observation
+
+
 async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
     """Generate and validate a complex query plan without executing it."""
     query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
     selected_tables = state.get("selected_tables", [])
     relationships = state.get("table_relationships", [])
     evidence = state.get("evidence", [])
+    agentscope_result = {}
+    agentscope_observation = {}
+
+    if _should_run_agentscope_complex_prepass(state):
+        try:
+            agentscope_result, agentscope_observation = await _run_agentscope_complex_analysis_prepass(state, config)
+        except Exception as exc:
+            logger.warning("AgentScope complex analysis prepass failed: %s", exc, exc_info=True)
+            agentscope_observation = {
+                "task_type": "complex_analysis",
+                "status": "error",
+                "backend": "unavailable",
+                "error": str(exc),
+                "thread_id": _config_thread_id(config) or str(state.get("session_id") or ""),
+                "session_id": str(state.get("session_id") or _config_thread_id(config) or ""),
+            }
 
     model = get_chat_model(settings.chat_model_type)
     response = await model.ainvoke(
@@ -1265,8 +1536,22 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
     )
     plan = _parse_json_object(_response_text(response))
     plan = _normalize_complex_plan_tables(plan, selected_tables, relationships)
+    base_result = {
+        "agentscope_result": agentscope_result,
+        "agentscope_observation": agentscope_observation,
+    }
     if plan.get("mode") == "clarify":
+        fallback_plan = _fallback_complex_plan(state, selected_tables, relationships)
+        if fallback_plan:
+            return {
+                **base_result,
+                "complex_plan": fallback_plan,
+                "plan_validation_error": "",
+                "answer": _format_complex_plan_preview(fallback_plan),
+                "is_sql": False,
+            }
         return {
+            **base_result,
             "complex_plan": plan,
             "plan_validation_error": "",
             "answer": plan.get("reason") or "这个问题需要进一步明确查询范围后再执行。",
@@ -1275,7 +1560,20 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
 
     ok, error = validate_complex_plan(plan, allowed_tables=set(selected_tables))
     if not ok:
+        fallback_plan = _fallback_complex_plan(state, selected_tables, relationships)
+        if fallback_plan:
+            fallback_ok, fallback_error = validate_complex_plan(fallback_plan, allowed_tables=set(selected_tables))
+            if fallback_ok:
+                return {
+                    **base_result,
+                    "complex_plan": fallback_plan,
+                    "plan_validation_error": "",
+                    "answer": _format_complex_plan_preview(fallback_plan),
+                    "is_sql": False,
+                }
+            error = f"{error}; fallback failed: {fallback_error}"
         return {
+            **base_result,
             "complex_plan": plan,
             "plan_validation_error": error,
             "answer": f"复杂查询计划校验失败：{error}。请缩小查询范围或明确需要分析的指标和维度。",
@@ -1283,6 +1581,7 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
         }
 
     return {
+        **base_result,
         "complex_plan": plan,
         "plan_validation_error": "",
         "answer": _format_complex_plan_preview(plan),
@@ -1388,6 +1687,32 @@ def _build_complex_step_query(state: SQLReactState, step: dict, dependency_resul
         "如果存在后续合并键，请在 SELECT 中输出同名别名；无法输出 ID/编码时，至少输出同一业务维度的名称别名。"
         f"{dependency_text}"
     )
+
+
+def _docs_from_complex_step_context(state: SQLReactState, tables: list[str]) -> list[Document]:
+    """Build lightweight schema docs from cached complex-plan context for SQL repair."""
+    docs: list[Document] = []
+    table_metadata = state.get("table_metadata") or {}
+    semantic_model = state.get("semantic_model") or {}
+    for table in tables:
+        parts = [f"表名: {table}"]
+        comment = table_metadata.get(table)
+        if comment:
+            parts.append(f"表描述: {comment}")
+        columns = semantic_model.get(table) or {}
+        if isinstance(columns, dict):
+            for column_name, meta in columns.items():
+                if isinstance(meta, dict):
+                    label = meta.get("business_name") or meta.get("column_comment") or ""
+                    column_type = meta.get("column_type") or ""
+                    synonyms = meta.get("synonyms") or ""
+                    description = meta.get("business_description") or ""
+                    details = " ".join(str(item) for item in (column_type, label, synonyms, description) if item)
+                    parts.append(f"{column_name} {details}".rstrip())
+                else:
+                    parts.append(str(column_name))
+        docs.append(Document(page_content="\n".join(parts), metadata={"table_name": table, "source": "complex_plan_context"}))
+    return docs
 
 
 def _parse_rows_from_sql_result(result) -> list[dict] | None:
@@ -1509,8 +1834,30 @@ def _merge_dependency_rows(
             return None, f"dependency step {dep} result is not structured rows"
         rows_by_dep[dep] = rows
 
+    effective_merge_keys = [
+        str(merge_key)
+        for merge_key in merge_keys
+        if any(
+            _resolve_merge_key_column(row, str(merge_key)) is not None
+            or _resolve_merge_label_column(row, str(merge_key)) is not None
+            for rows in rows_by_dep.values()
+            for row in rows
+        )
+    ]
+    if not effective_merge_keys:
+        return [
+            {
+                **row,
+                "merge_status": "未对齐",
+                "source_step": dep,
+                "missing_merge_keys": ", ".join(str(key) for key in merge_keys),
+            }
+            for dep, rows in rows_by_dep.items()
+            for row in rows
+        ], ""
+
     prefer_label_key: dict[str, bool] = {}
-    for merge_key in merge_keys:
+    for merge_key in effective_merge_keys:
         key = str(merge_key)
         prefer_label_key[key] = any(
             _resolve_merge_key_column(row, key) is None and _resolve_merge_label_column(row, key) is not None
@@ -1519,17 +1866,29 @@ def _merge_dependency_rows(
         )
 
     merged: dict[tuple, dict] = {}
+    unaligned_rows: list[dict] = []
     for dep, rows in rows_by_dep.items():
         for row in rows:
             key_columns = {
                 k: _resolve_canonical_merge_key_column(row, str(k), prefer_label_key.get(str(k), False))
-                for k in merge_keys
+                for k in effective_merge_keys
             }
-            key = tuple(row.get(key_columns[k]) if key_columns[k] else None for k in merge_keys)
+            key = tuple(row.get(key_columns[k]) if key_columns[k] else None for k in effective_merge_keys)
             if any(v is None for v in key):
-                return None, f"dependency step {dep} row missing merge key"
-            bucket = merged.setdefault(key, {k: row.get(k) for k in merge_keys})
-            for merge_key in merge_keys:
+                missing_keys = [
+                    str(k)
+                    for k in effective_merge_keys
+                    if key_columns[k] is None or row.get(key_columns[k]) is None
+                ]
+                unaligned_rows.append({
+                    **row,
+                    "merge_status": "未对齐",
+                    "source_step": dep,
+                    "missing_merge_keys": ", ".join(missing_keys),
+                })
+                continue
+            bucket = merged.setdefault(key, {k: row.get(k) for k in effective_merge_keys})
+            for merge_key in effective_merge_keys:
                 column = key_columns[merge_key]
                 if column:
                     bucket[merge_key] = row.get(column)
@@ -1541,7 +1900,7 @@ def _merge_dependency_rows(
                     out_col = f"step{dep}_{col}"
                 bucket[out_col] = value
 
-    return list(merged.values()), ""
+    return [*merged.values(), *unaligned_rows], ""
 
 
 def _dependency_summary(step: dict, execution_results: dict[str, dict]) -> str:
@@ -1558,6 +1917,322 @@ def _dependency_summary(step: dict, execution_results: dict[str, dict]) -> str:
             lines.append(f"步骤 {dep}: 失败 - {entry['error']}")
             continue
         lines.append(f"步骤 {dep}: {_short_text(entry.get('answer') or entry.get('result'), 300)}")
+    return "\n".join(lines)
+
+
+def _dependency_structured_rows(
+    step: dict,
+    execution_results: dict[str, dict],
+) -> tuple[list[dict] | None, str]:
+    depends_on = step.get("depends_on") or []
+    if not depends_on:
+        return None, "missing depends_on"
+
+    rows: list[dict] = []
+    for dep in depends_on:
+        entry = execution_results.get(str(dep)) or {}
+        if entry.get("error"):
+            return None, f"dependency step {dep} failed"
+        parsed = _parse_rows_from_sql_result(entry.get("result"))
+        if parsed is None:
+            return None, f"dependency step {dep} result is not structured rows"
+        if len(depends_on) > 1:
+            rows.extend({**row, "source_step": dep} for row in parsed)
+        else:
+            rows.extend(parsed)
+    return rows, ""
+
+
+def _decimal_value(value) -> Decimal | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, (int, float)):
+        return Decimal(str(value))
+    if isinstance(value, str):
+        text = value.strip().replace(",", "")
+        if not text:
+            return None
+        try:
+            return Decimal(text)
+        except InvalidOperation:
+            return None
+    return None
+
+
+def _column_matches_metric(column: str, terms: tuple[str, ...]) -> bool:
+    if _is_metric_dimension_column(column):
+        return False
+    normalized = _normalize_merge_name(column)
+    if not _metric_column_allowed_for_terms(normalized, terms):
+        return False
+    return any(term in normalized for term in terms)
+
+
+def _metric_column_allowed_for_terms(normalized: str, terms: tuple[str, ...]) -> bool:
+    term_set = set(terms)
+    if "budget" in normalized or "预算" in normalized:
+        return bool(term_set & {"budget", "预算"})
+    if "balance" in normalized or "余额" in normalized:
+        return False
+    return True
+
+
+def _sum_metric_columns(rows: list[dict], terms: tuple[str, ...]) -> Decimal | None:
+    total = Decimal("0")
+    matched = False
+    for row in rows:
+        for column, value in row.items():
+            if not _column_matches_metric(str(column), terms):
+                continue
+            amount = _decimal_value(value)
+            if amount is None:
+                continue
+            total += amount
+            matched = True
+    return total if matched else None
+
+
+def _format_decimal_amount(amount: Decimal) -> str:
+    return f"{amount.quantize(Decimal('0.01'))}"
+
+
+def _format_decimal_percent(numerator: Decimal, denominator: Decimal) -> str:
+    if denominator == 0:
+        return "无法计算"
+    return f"{(numerator / denominator * Decimal('100')).quantize(Decimal('0.01'))}%"
+
+
+def _is_metric_dimension_column(column: str) -> bool:
+    normalized = _normalize_merge_name(column)
+    compact = normalized.replace("_", "")
+    if not normalized:
+        return True
+    if normalized in {"id", "code", "name", "type", "status"}:
+        return True
+    if normalized.endswith(("id", "code", "name", "type", "status")):
+        return True
+    dimension_markers = (
+        "cost_center",
+        "costcenter",
+        "department",
+        "dept",
+        "period",
+        "month",
+        "year",
+        "date",
+        "account",
+        "center_name",
+        "成本中心",
+        "部门",
+        "期间",
+        "月份",
+        "年度",
+        "日期",
+        "科目",
+    )
+    return any(marker in normalized or marker in compact for marker in dimension_markers)
+
+
+def _format_complex_business_summary(execution_results: dict[str, dict]) -> str:
+    final_rows = None
+    for key in sorted(execution_results, key=lambda x: int(x) if str(x).isdigit() else 10**9):
+        entry = execution_results.get(key) or {}
+        result = entry.get("result")
+        if entry.get("type") in {"python_merge", "report"} and isinstance(result, list):
+            if all(isinstance(row, dict) for row in result):
+                final_rows = result
+
+    if final_rows is None:
+        return ""
+
+    unaligned_count = sum(1 for row in final_rows if row.get("merge_status") == "未对齐")
+    aligned_count = len(final_rows) - unaligned_count
+    income = _sum_metric_columns(final_rows, ("income", "revenue", "收入"))
+    cost = _sum_metric_columns(final_rows, ("cost", "成本"))
+    expense = _sum_metric_columns(final_rows, ("expense", "费用"))
+    budget = _sum_metric_columns(final_rows, ("budget", "预算"))
+    actual = _sum_metric_columns(final_rows, ("actual", "实际"))
+    collection = _sum_metric_columns(final_rows, ("collection", "settled", "received", "receivable", "回款", "收款", "应收"))
+
+    lines = [
+        "经营关系摘要：",
+        f"- 合并结果：{aligned_count} 行，未对齐记录：{unaligned_count} 行。",
+    ]
+    if income is not None:
+        lines.append(f"- 收入合计：{_format_decimal_amount(income)}")
+    if cost is not None:
+        lines.append(f"- 成本合计：{_format_decimal_amount(cost)}")
+    if expense is not None:
+        lines.append(f"- 费用合计：{_format_decimal_amount(expense)}")
+    if budget is not None:
+        lines.append(f"- 预算合计：{_format_decimal_amount(budget)}")
+    if actual is not None:
+        lines.append(f"- 实际执行合计：{_format_decimal_amount(actual)}")
+    if collection is not None:
+        lines.append(f"- 回款合计：{_format_decimal_amount(collection)}")
+    if income is not None and (cost is not None or expense is not None):
+        rough_surplus = income - (cost or Decimal("0")) - (expense or Decimal("0"))
+        lines.append(f"- 粗略盈余：{_format_decimal_amount(rough_surplus)}")
+    if income is not None and income != 0 and collection is not None:
+        ratio = (collection / income * Decimal("100")).quantize(Decimal("0.01"))
+        lines.append(f"- 回款/收入比：{ratio}%")
+    return "\n".join(lines)
+
+
+def _final_complex_rows(execution_results: dict[str, dict]) -> list[dict] | None:
+    final_rows = None
+    for key in sorted(execution_results, key=lambda x: int(x) if str(x).isdigit() else 10**9):
+        entry = execution_results.get(key) or {}
+        result = entry.get("result")
+        if entry.get("type") in {"python_merge", "report"} and isinstance(result, list):
+            structured_rows = [row for row in result if isinstance(row, dict)]
+            if len(structured_rows) == len(result):
+                final_rows = structured_rows
+    return final_rows
+
+
+def _row_metric_sum(row: dict, terms: tuple[str, ...]) -> Decimal | None:
+    total = Decimal("0")
+    matched = False
+    for column, value in row.items():
+        if not _column_matches_metric(str(column), terms):
+            continue
+        amount = _decimal_value(value)
+        if amount is None:
+            continue
+        total += amount
+        matched = True
+    return total if matched else None
+
+
+def _format_row_identity(row: dict, index: int) -> str:
+    labels = []
+    for key, label in (
+        ("department_name", "部门"),
+        ("department", "部门"),
+        ("department_id", "部门"),
+        ("cost_center_name", "成本中心"),
+        ("center_name", "成本中心"),
+        ("cost_center_id", "成本中心"),
+        ("period", "期间"),
+        ("account_name", "科目"),
+        ("account_code", "科目"),
+    ):
+        value = row.get(key)
+        if value is None or value == "":
+            continue
+        rendered = _format_result_value(value)
+        item = f"{label}{rendered}"
+        if item not in labels:
+            labels.append(item)
+        if len(labels) >= 3:
+            break
+    return " / ".join(labels) if labels else f"记录 {index + 1}"
+
+
+def _top_budget_variance_lines(rows: list[dict], max_rows: int = 3) -> list[str]:
+    candidates = []
+    for index, row in enumerate(rows):
+        actual = _row_metric_sum(row, ("actual", "实际"))
+        budget = _row_metric_sum(row, ("budget", "预算"))
+        if actual is None or budget is None:
+            continue
+        variance = actual - budget
+        candidates.append((abs(variance), index, actual, budget, variance, row))
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    lines = []
+    for _abs_variance, index, actual, budget, variance, row in candidates[:max_rows]:
+        lines.append(
+            f"- {_format_row_identity(row, index)}：实际 {_format_decimal_amount(actual)}，"
+            f"预算 {_format_decimal_amount(budget)}，差异 {_format_decimal_amount(variance)}"
+        )
+    return lines
+
+
+def _has_collection_gap(execution_results: dict[str, dict], collection: Decimal | None) -> bool:
+    if collection not in (None, Decimal("0")):
+        return False
+    saw_collection_scope = False
+    for entry in execution_results.values():
+        text = f"{entry.get('goal', '')}\n{entry.get('answer', '')}\n{entry.get('result', '')}"
+        if any(marker in text for marker in ("回款", "收款", "应收", "settled", "received")):
+            saw_collection_scope = True
+            if any(marker in text for marker in ("未查询到", "无数据", "空结果", "0 条")):
+                return True
+    return saw_collection_scope and collection is None
+
+
+def _format_complex_relationship_answer(
+    plan: dict,
+    execution_results: dict[str, dict],
+) -> str:
+    rows = _final_complex_rows(execution_results)
+    if not rows:
+        return ""
+
+    unaligned_count = sum(1 for row in rows if row.get("merge_status") == "未对齐")
+    aligned_count = len(rows) - unaligned_count
+    income = _sum_metric_columns(rows, ("income", "revenue", "收入"))
+    cost = _sum_metric_columns(rows, ("cost", "成本"))
+    expense = _sum_metric_columns(rows, ("expense", "费用"))
+    budget = _sum_metric_columns(rows, ("budget", "预算"))
+    actual = _sum_metric_columns(rows, ("actual", "实际"))
+    collection = _sum_metric_columns(rows, ("collection", "settled", "received", "receivable", "回款", "收款", "应收"))
+
+    steps = plan.get("steps") or []
+    total_steps = len(steps) or len(execution_results)
+    processed_steps = (
+        sum(1 for step in steps if str(step.get("step")) in execution_results)
+        if steps else len(execution_results)
+    )
+    lines = ["关系分析结果："]
+    lines.append(f"- 本次按计划完成 {processed_steps}/{total_steps} 个步骤，合并得到 {aligned_count} 条可对齐记录。")
+    if unaligned_count:
+        lines.append(f"- 另有 {unaligned_count} 条记录缺少合并维度，未纳入关系判断。")
+
+    if actual is not None:
+        lines.append(f"- 实际发生合计：{_format_decimal_amount(actual)}。")
+    if budget is not None:
+        lines.append(f"- 预算合计：{_format_decimal_amount(budget)}。")
+    if actual is not None and budget is not None:
+        variance = actual - budget
+        lines.append(
+            f"- 预算差异：{_format_decimal_amount(variance)}，"
+            f"预算执行率：{_format_decimal_percent(actual, budget)}。"
+        )
+    if income is not None:
+        lines.append(f"- 收入合计：{_format_decimal_amount(income)}。")
+    if cost is not None:
+        lines.append(f"- 成本合计：{_format_decimal_amount(cost)}。")
+    if expense is not None:
+        lines.append(f"- 费用合计：{_format_decimal_amount(expense)}。")
+    if collection is not None:
+        lines.append(f"- 回款合计：{_format_decimal_amount(collection)}。")
+    if income is not None and (cost is not None or expense is not None):
+        rough_surplus = income - (cost or Decimal("0")) - (expense or Decimal("0"))
+        lines.append(f"- 粗略盈余：{_format_decimal_amount(rough_surplus)}。")
+
+    if _has_collection_gap(execution_results, collection):
+        lines.append("- 未查询到可对齐的回款数据，暂不能计算回款效率。")
+    elif collection is not None:
+        denominator = income if income not in (None, Decimal("0")) else actual
+        if denominator not in (None, Decimal("0")):
+            lines.append(f"- 回款效率：{_format_decimal_percent(collection, denominator)}。")
+
+    metric_lines = _format_result_rows_for_answer(rows)
+    if metric_lines:
+        lines.append("结果明细：")
+        lines.extend(metric_lines)
+
+    variance_lines = _top_budget_variance_lines(rows)
+    if variance_lines:
+        lines.append("差异较大的维度：")
+        lines.extend(variance_lines)
+
+    lines.append("执行概况：SQL 已通过安全检查、权限检查并执行。")
     return "\n".join(lines)
 
 
@@ -1624,8 +2299,32 @@ def _run_local_complex_step(step: dict, execution_results: dict[str, dict]) -> d
             "goal": step.get("goal", ""),
             "depends_on": step.get("depends_on", []),
             "merge_keys": step.get("merge_keys", []),
+                "result": _dependency_summary(step, execution_results),
+                "answer": f"报告步骤未能进行结构化行合并（{reason}），已保留依赖步骤摘要。",
+                "error": None,
+            }
+
+    if step_type == "report":
+        rows, reason = _dependency_structured_rows(step, execution_results)
+        if rows is not None:
+            return {
+                "step": step_no,
+                "type": step_type,
+                "goal": step.get("goal", ""),
+                "depends_on": step.get("depends_on", []),
+                "merge_keys": step.get("merge_keys", []),
+                "result": rows,
+                "answer": f"报告步骤已完成本地汇总，共 {len(rows)} 行。",
+                "error": None,
+            }
+        return {
+            "step": step_no,
+            "type": step_type,
+            "goal": step.get("goal", ""),
+            "depends_on": step.get("depends_on", []),
+            "merge_keys": step.get("merge_keys", []),
             "result": _dependency_summary(step, execution_results),
-            "answer": f"报告步骤未能进行结构化行合并（{reason}），已保留依赖步骤摘要。",
+            "answer": f"报告步骤未能进行结构化汇总（{reason}），已保留依赖步骤摘要。",
             "error": None,
         }
 
@@ -1643,8 +2342,16 @@ def _run_local_complex_step(step: dict, execution_results: dict[str, dict]) -> d
 
 def _format_complex_execution_answer(plan: dict, execution_results: dict[str, dict], failed: bool = False) -> str:
     steps = plan.get("steps") or []
+    if not failed:
+        relationship_answer = _format_complex_relationship_answer(plan, execution_results)
+        if relationship_answer:
+            return relationship_answer
+
     title = "复杂查询计划执行失败。" if failed else "复杂查询计划执行完成。"
     lines = [f"{title}共处理 {len(execution_results)}/{len(steps)} 个步骤："]
+    business_summary = _format_complex_business_summary(execution_results)
+    if business_summary:
+        lines.append(business_summary)
     for step in steps:
         step_no = step.get("step")
         entry = execution_results.get(str(step_no))
@@ -1656,7 +2363,8 @@ def _format_complex_execution_answer(plan: dict, execution_results: dict[str, di
         if entry.get("sql"):
             lines.append(f"   SQL: {_short_text(entry['sql'], 260)}")
         if entry.get("error"):
-            lines.append(f"   错误: {_short_text(entry['error'], 300)}")
+            display_error = entry.get("error") or entry.get("answer")
+            lines.append(f"   错误: {_short_text(display_error, 300)}")
         else:
             lines.append(f"   结果: {_format_complex_entry_result(entry)}")
     return "\n".join(lines)
@@ -1681,6 +2389,17 @@ def _format_structured_rows_preview(rows: list[dict], max_rows: int = 3) -> str:
     return "\n   合并结果预览:\n   " + "\n   ".join(preview_rows) + suffix
 
 
+def _format_result_rows_for_answer(rows: list[dict], max_rows: int = 5) -> list[str]:
+    if not rows:
+        return []
+    lines = [f"- 查询结果：共 {len(rows)} 条记录。"]
+    for row in rows[:max_rows]:
+        lines.append(f"- {_format_row_preview(row)}")
+    if len(rows) > max_rows:
+        lines.append(f"- 仅展示前 {max_rows} 条。")
+    return lines
+
+
 def _format_complex_entry_result(entry: dict) -> str:
     answer = str(entry.get("answer") or "").strip()
     result = entry.get("result")
@@ -1694,6 +2413,122 @@ def _format_complex_entry_result(entry: dict) -> str:
     return _short_text(result, 700)
 
 
+def _result_rows_for_compaction(result):
+    if result is None:
+        return None
+    if isinstance(result, list):
+        return result
+    if isinstance(result, dict):
+        for key in ("rows", "data", "result", "items"):
+            value = result.get(key)
+            if isinstance(value, list):
+                return value
+        return [result]
+    if isinstance(result, str):
+        parsed = _parse_sql_result_rows(result)
+        return parsed if isinstance(parsed, list) else None
+    return None
+
+
+def _compact_complex_step_entry(
+    entry: dict,
+    *,
+    max_preview_rows: int = 5,
+    max_result_chars: int = 2000,
+) -> dict:
+    """Return a trace-friendly step entry without duplicating large raw payloads."""
+    compacted = {
+        key: value
+        for key, value in entry.items()
+        if key != "execution_history"
+    }
+
+    history = entry.get("execution_history")
+    if isinstance(history, list) and history:
+        compacted["execution_history_count"] = len(history)
+
+    if "result" not in compacted:
+        return compacted
+
+    result = compacted.get("result")
+    rows = _result_rows_for_compaction(result)
+    if rows is not None:
+        compacted["result_row_count"] = len(rows)
+        if len(rows) > max_preview_rows:
+            compacted["result_preview"] = rows[:max_preview_rows]
+            compacted["result_truncated"] = True
+            compacted.pop("result", None)
+            return compacted
+        compacted["result_truncated"] = False
+
+    if isinstance(result, str) and len(result) > max_result_chars:
+        compacted["result_preview"] = _short_text(result, max_result_chars)
+        compacted["result_truncated"] = True
+        compacted.pop("result", None)
+
+    return compacted
+
+
+def _compact_plan_execution_results(execution_results: dict[str, dict]) -> dict[str, dict]:
+    return {
+        str(key): _compact_complex_step_entry(entry)
+        for key, entry in execution_results.items()
+    }
+
+
+def _complex_plan_result_summary(
+    plan: dict,
+    execution_results: dict[str, dict],
+    *,
+    failed: bool,
+) -> dict:
+    steps = plan.get("steps") or []
+    failed_steps = [
+        str(key)
+        for key, entry in execution_results.items()
+        if isinstance(entry, dict) and entry.get("error")
+    ]
+    row_counts = {}
+    for key, entry in execution_results.items():
+        if not isinstance(entry, dict):
+            continue
+        rows = _result_rows_for_compaction(entry.get("result"))
+        if rows is not None:
+            row_counts[str(key)] = len(rows)
+
+    return {
+        "plan_summary": {
+            "status": "failed" if failed else "completed",
+            "processed_steps": len(execution_results),
+            "total_steps": len(steps),
+            "failed_steps": failed_steps,
+            "result_row_counts": row_counts,
+        }
+    }
+
+
+def _complex_plan_return_payload(
+    plan: dict,
+    execution_results: dict[str, dict],
+    *,
+    current_step: int,
+    failed: bool,
+    error: str | None,
+) -> dict:
+    return {
+        "answer": _format_complex_execution_answer(plan, execution_results, failed=failed),
+        "is_sql": False,
+        "sql": _joined_plan_sql(execution_results),
+        "result": json.dumps(
+            _complex_plan_result_summary(plan, execution_results, failed=failed),
+            ensure_ascii=False,
+        ),
+        "error": error,
+        "plan_current_step": current_step,
+        "plan_execution_results": _compact_plan_execution_results(execution_results),
+    }
+
+
 def _joined_plan_sql(execution_results: dict[str, dict]) -> str:
     blocks = []
     for key in sorted(execution_results, key=lambda x: int(x) if str(x).isdigit() else 10**9):
@@ -1704,6 +2539,242 @@ def _joined_plan_sql(execution_results: dict[str, dict]) -> str:
     return "\n\n".join(blocks)
 
 
+def _completed_complex_step_keys(execution_results: dict[str, dict]) -> set[str]:
+    return {
+        str(step_no)
+        for step_no, entry in execution_results.items()
+        if isinstance(entry, dict) and not entry.get("error")
+    }
+
+
+def _semantic_model_covers_tables(semantic_model: dict, tables: list[str]) -> bool:
+    if not isinstance(semantic_model, dict):
+        return False
+    return all(table in semantic_model for table in tables)
+
+
+async def _ensure_complex_step_semantic_model(
+    state: SQLReactState,
+    steps: list[dict],
+    config=None,
+) -> dict:
+    """Load missing semantic metadata once for the current ready step batch."""
+
+    selected_tables = state.get("selected_tables") or []
+    relationships = state.get("table_relationships", [])
+    expanded_tables: list[str] = []
+    for step in steps:
+        if step.get("type") != "sql":
+            continue
+        step_tables = _expand_step_tables_by_relationship_paths(
+            step.get("tables") or [],
+            selected_tables,
+            relationships,
+        )
+        expanded_tables.extend(step_tables)
+
+    requested = _unique_ordered([str(table).strip() for table in expanded_tables if str(table).strip()])
+    if not requested:
+        return state.get("semantic_model") or {}
+
+    cached_semantic = state.get("semantic_model") or {}
+    if _semantic_model_covers_tables(cached_semantic, requested):
+        return cached_semantic
+
+    missing = [table for table in requested if table not in cached_semantic]
+    if not missing:
+        return cached_semantic
+
+    callbacks = callbacks_from_config(config)
+    try:
+        loaded = await asyncio.wait_for(
+            asyncio.to_thread(
+                traced_tool_call,
+                "schema.get_semantic_model_for_complex_batch",
+                ",".join(missing),
+                callbacks,
+                lambda: get_semantic_model_by_tables(missing),
+                {"storage": "redis_mysql", "node": "execute_complex_plan_step"},
+            ),
+            timeout=settings.resilience.milvus_timeout,
+        )
+    except Exception as exc:
+        logger.warning("Complex plan semantic batch load failed: %s", exc)
+        loaded = {}
+
+    return {
+        **{
+            table: cached_semantic.get(table, {})
+            for table in cached_semantic
+        },
+        **(loaded or {}),
+    }
+
+
+def _ready_complex_plan_batch(
+    steps: list[dict],
+    execution_results: dict[str, dict],
+) -> list[dict]:
+    completed = _completed_complex_step_keys(execution_results)
+    ready: list[dict] = []
+    for step in steps:
+        step_key = str(step.get("step"))
+        if step_key in completed or step_key in execution_results:
+            continue
+        depends_on = [str(dep) for dep in step.get("depends_on", []) or []]
+        if all(dep in completed for dep in depends_on):
+            ready.append(step)
+    return ready
+
+
+def _max_completed_complex_step(steps: list[dict], execution_results: dict[str, dict]) -> int:
+    completed = _completed_complex_step_keys(execution_results)
+    current = 0
+    for step in steps:
+        step_no = step.get("step")
+        if str(step_no) not in completed:
+            continue
+        try:
+            current = max(current, int(step_no))
+        except (TypeError, ValueError):
+            continue
+    return current
+
+
+def _complex_sql_step_entry(
+    step_no,
+    step: dict,
+    tables: list[str],
+    *,
+    sql: str = "",
+    result=None,
+    answer: str = "",
+    error: str | None = None,
+    execution_history: list | None = None,
+    **extra,
+) -> dict:
+    entry = {
+        "step": step_no,
+        "type": "sql",
+        "goal": step.get("goal", ""),
+        "tables": tables,
+        "sql": sql,
+        "result": result,
+        "answer": answer,
+        "error": error,
+    }
+    if execution_history is not None:
+        entry["execution_history"] = execution_history
+    entry.update(extra)
+    return entry
+
+
+async def _run_complex_sql_harness(
+    step_state: dict,
+    step: dict,
+    tables: list[str],
+    callbacks=None,
+) -> dict:
+    step_no = step.get("step")
+    if step_state.get("is_sql") and not (step_state.get("sql") or "").strip():
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            answer="SQL 生成节点返回了空 SQL，已停止执行当前复杂计划步骤。",
+            error="empty generated sql",
+        )
+    if not step_state.get("is_sql"):
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=step_state.get("answer", "未生成 SQL"),
+            error=step_state.get("error") or step_state.get("answer", "not sql"),
+        )
+
+    safety = await traced_async_tool_call(
+        "sql.safety_check",
+        str(step_state.get("sql", "")),
+        callbacks,
+        lambda: safety_check(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    if safety.get("is_sql") is False:
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=safety.get("answer", "SQL 安全检查未通过"),
+            error=safety.get("answer", "SQL 安全检查未通过"),
+            safety_report=safety.get("safety_report"),
+        )
+    step_state.update(safety)
+
+    authorization = await traced_async_tool_call(
+        "sql.authorize_sql",
+        str(step_state.get("sql", "")),
+        callbacks,
+        lambda: authorize_sql(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    if authorization.get("is_sql") is False:
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=authorization.get("answer", "SQL 权限检查未通过"),
+            error=authorization.get("error") or "permission_denied",
+            authorization_report=authorization.get("authorization_report"),
+        )
+    step_state.update(authorization)
+
+    executed = await traced_async_tool_call(
+        "sql.execute_sql",
+        str(step_state.get("sql", "")),
+        callbacks,
+        lambda: execute_sql(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    step_state.update(executed)
+    if executed.get("error") is None and executed.get("result") is None and not executed.get("answer"):
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer="SQL 执行节点返回空结果，已停止当前复杂计划步骤。",
+            error="empty execution result",
+            execution_history=executed.get("execution_history", []),
+        )
+    if not executed.get("error"):
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            result=executed.get("result"),
+            answer=executed.get("answer", ""),
+            error=None,
+            execution_history=executed.get("execution_history", []),
+        )
+
+    error_msg = str(executed.get("error") or "")
+    return _complex_sql_step_entry(
+        step_no,
+        step,
+        tables,
+        sql=step_state.get("sql", ""),
+        result=executed.get("result"),
+        answer=executed.get("answer", ""),
+        error=error_msg,
+        execution_history=executed.get("execution_history", []),
+    )
+
+
 async def _execute_complex_sql_step(
     state: SQLReactState,
     step: dict,
@@ -1711,6 +2782,7 @@ async def _execute_complex_sql_step(
     config=None,
 ) -> dict:
     step_no = step.get("step")
+    callbacks = callbacks_from_config(config)
     tables = _expand_step_tables_by_relationship_paths(
         step.get("tables") or [],
         state.get("selected_tables") or [],
@@ -1727,9 +2799,13 @@ async def _execute_complex_sql_step(
         "selected_tables": tables,
         "table_relationships": _filter_relationships_for_tables(state.get("table_relationships", []), table_set),
         "table_metadata": state.get("table_metadata", {}),
+        "semantic_model": {
+            table: (state.get("semantic_model") or {}).get(table, {})
+            for table in tables
+            if table in (state.get("semantic_model") or {})
+        },
         "security_context": state.get("security_context", {}),
         "docs": [],
-        "semantic_model": {},
         "sql": "",
         "is_sql": False,
         "answer": "",
@@ -1739,149 +2815,99 @@ async def _execute_complex_sql_step(
     }
 
     try:
+        submitted_sql = str(step.get("sql") or "").strip()
+        if submitted_sql:
+            normalized_sql, sql_ok, sql_error = normalize_sql_answer(submitted_sql)
+            if not sql_ok:
+                return _complex_sql_step_entry(
+                    step_no,
+                    step,
+                    tables,
+                    sql=normalized_sql,
+                    answer=f"已提交 SQL 格式不完整或不规范: {sql_error}",
+                    error="invalid_submitted_sql",
+                )
+            step_state.update({
+                "sql": normalized_sql,
+                "answer": normalized_sql,
+                "is_sql": True,
+            })
+            step_state["docs"] = _docs_from_complex_step_context(state, tables)
+            while True:
+                result = await _run_complex_sql_harness(step_state, step, tables, callbacks=callbacks)
+                error_msg = str(result.get("error") or "")
+                if not error_msg:
+                    return result
+                if not _should_repair_sql_error(error_msg):
+                    return result
+                if step_state.get("retry_count", 0) >= settings.resilience.max_sql_retries:
+                    return result
+
+                step_state.update(result)
+                repair = await error_analysis(step_state, config=config)
+                step_state.update(repair)
+                generation = await sql_generate(step_state, config=config)
+                step_state.update(generation)
+                if not step_state.get("is_sql") or not step_state.get("sql"):
+                    return _complex_sql_step_entry(
+                        step_no,
+                        step,
+                        tables,
+                        sql=step_state.get("sql", ""),
+                        answer=step_state.get("answer", "已提交 SQL 修复失败"),
+                        error="repair_failed",
+                        execution_history=step_state.get("execution_history", []),
+                    )
+            # unreachable
+            return _complex_sql_step_entry(
+                step_no,
+                step,
+                tables,
+                sql=step_state.get("sql", ""),
+                answer=step_state.get("answer", "已提交 SQL 修复失败"),
+                error="repair_failed",
+            )
+
         retrieve_update = await sql_retrieve(step_state, config=config)
         step_state.update(retrieve_update)
         docs_check = await check_docs(step_state)
         if docs_check.get("is_sql") is False:
-            return {
-                "step": step_no,
-                "type": "sql",
-                "goal": step.get("goal", ""),
-                "tables": tables,
-                "sql": "",
-                "result": None,
-                "answer": docs_check.get("answer", ""),
-                "error": docs_check.get("answer", "missing schema docs"),
-            }
+            return _complex_sql_step_entry(
+                step_no,
+                step,
+                tables,
+                answer=docs_check.get("answer", ""),
+                error=docs_check.get("answer", "missing schema docs"),
+            )
 
         while True:
             generation = await sql_generate(step_state, config=config)
             step_state.update(generation)
-            generated_sql = (step_state.get("sql") or "").strip()
-            if step_state.get("is_sql") and not generated_sql:
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": "",
-                    "result": None,
-                    "answer": "SQL 生成节点返回了空 SQL，已停止执行当前复杂计划步骤。",
-                    "error": "empty generated sql",
-                }
-            if not step_state.get("is_sql"):
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": None,
-                    "answer": step_state.get("answer", "未生成 SQL"),
-                    "error": step_state.get("error") or step_state.get("answer", "not sql"),
-                }
-
-            safety = await safety_check(step_state)
-            if safety.get("is_sql") is False:
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": None,
-                    "answer": safety.get("answer", "SQL 安全检查未通过"),
-                    "error": safety.get("answer", "SQL 安全检查未通过"),
-                    "safety_report": safety.get("safety_report"),
-                }
-            step_state.update(safety)
-
-            authorization = await authorize_sql(step_state)
-            if authorization.get("is_sql") is False:
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": None,
-                    "answer": authorization.get("answer", "SQL 权限检查未通过"),
-                    "error": authorization.get("error") or "permission_denied",
-                    "authorization_report": authorization.get("authorization_report"),
-                }
-            step_state.update(authorization)
-
-            executed = await execute_sql(step_state)
-            step_state.update(executed)
-            if executed.get("error") is None and executed.get("result") is None and not executed.get("answer"):
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": None,
-                    "answer": "SQL 执行节点返回空结果，已停止当前复杂计划步骤。",
-                    "error": "empty execution result",
-                    "execution_history": executed.get("execution_history", []),
-                }
-            if not executed.get("error"):
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": executed.get("result"),
-                    "answer": executed.get("answer", ""),
-                    "error": None,
-                    "execution_history": executed.get("execution_history", []),
-                }
-
-            error_msg = str(executed.get("error") or "")
+            result = await _run_complex_sql_harness(step_state, step, tables, callbacks=callbacks)
+            error_msg = str(result.get("error") or "")
+            if not error_msg:
+                return result
             if not _should_repair_sql_error(error_msg):
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": executed.get("result"),
-                    "answer": executed.get("answer", ""),
-                    "error": error_msg,
-                    "execution_history": executed.get("execution_history", []),
-                }
+                return result
             if step_state.get("retry_count", 0) >= settings.resilience.max_sql_retries:
-                return {
-                    "step": step_no,
-                    "type": "sql",
-                    "goal": step.get("goal", ""),
-                    "tables": tables,
-                    "sql": step_state.get("sql", ""),
-                    "result": executed.get("result"),
-                    "answer": executed.get("answer", ""),
-                    "error": error_msg,
-                    "execution_history": executed.get("execution_history", []),
-                }
+                return result
 
             repair = await error_analysis(step_state, config=config)
             step_state.update(repair)
     except Exception as e:
         logger.warning("complex plan step %s failed: %s", step_no, e, exc_info=True)
-        return {
-            "step": step_no,
-            "type": "sql",
-            "goal": step.get("goal", ""),
-            "tables": tables,
-            "sql": step_state.get("sql", ""),
-            "result": None,
-            "answer": f"复杂计划步骤 {step_no} 执行失败: {e}",
-            "error": str(e),
-        }
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=f"复杂计划步骤 {step_no} 执行失败: {e}",
+            error=str(e),
+        )
 
 
 async def execute_complex_plan_step(state: SQLReactState, config=None) -> dict:
-    """Execute an approved complex plan sequentially with per-step safety checks."""
+    """Execute an approved complex plan with dependency-aware async batches."""
     plan = state.get("complex_plan") or {}
     steps = plan.get("steps") or []
     execution_results = {
@@ -1892,51 +2918,76 @@ async def execute_complex_plan_step(state: SQLReactState, config=None) -> dict:
             "answer": "复杂查询计划尚未确认，无法执行。",
             "is_sql": False,
             "error": "complex_plan_not_approved",
-            "plan_execution_results": execution_results,
+            "plan_execution_results": _compact_plan_execution_results(execution_results),
         }
     if not steps:
         return {
             "answer": "复杂查询计划为空，无法执行。",
             "is_sql": False,
             "error": "empty_complex_plan",
-            "plan_execution_results": execution_results,
+            "plan_execution_results": _compact_plan_execution_results(execution_results),
         }
 
     current_step = state.get("plan_current_step", 0) or 0
-    for step in steps:
-        step_no = step.get("step")
-        step_key = str(step_no)
-        if step_key in execution_results and not execution_results[step_key].get("error"):
-            current_step = step_no
-            continue
+    while len(_completed_complex_step_keys(execution_results)) < len(steps):
+        batch = _ready_complex_plan_batch(steps, execution_results)
+        if not batch:
+            return _complex_plan_return_payload(
+                plan,
+                execution_results,
+                current_step=current_step,
+                failed=True,
+                error="complex_plan_step_failed",
+            )
 
-        if step.get("type") == "sql":
-            entry = await _execute_complex_sql_step(state, step, execution_results, config=config)
-        else:
-            entry = _run_local_complex_step(step, execution_results)
-        execution_results[step_key] = entry
-        current_step = step_no
+        sql_steps = [step for step in batch if step.get("type") == "sql"]
+        local_steps = [step for step in batch if step.get("type") != "sql"]
 
-        if entry.get("error"):
-            return {
-                "answer": _format_complex_execution_answer(plan, execution_results, failed=True),
-                "is_sql": False,
-                "sql": _joined_plan_sql(execution_results),
-                "result": json.dumps(execution_results, ensure_ascii=False),
-                "error": "complex_plan_step_failed",
-                "plan_current_step": current_step,
-                "plan_execution_results": execution_results,
+        if sql_steps:
+            batch_semantic_model = await _ensure_complex_step_semantic_model(
+                state,
+                sql_steps,
+                config=config,
+            )
+            step_state = {
+                **state,
+                "semantic_model": batch_semantic_model,
             }
+            sql_entries = await asyncio.gather(
+                *[
+                    _execute_complex_sql_step(step_state, step, execution_results, config=config)
+                    for step in sql_steps
+                ]
+            )
+            for step, entry in zip(sql_steps, sql_entries, strict=False):
+                execution_results[str(step.get("step"))] = entry
 
-    return {
-        "answer": _format_complex_execution_answer(plan, execution_results, failed=False),
-        "is_sql": False,
-        "sql": _joined_plan_sql(execution_results),
-        "result": json.dumps(execution_results, ensure_ascii=False),
-        "error": None,
-        "plan_current_step": current_step,
-        "plan_execution_results": execution_results,
-    }
+        for step in local_steps:
+            execution_results[str(step.get("step"))] = _run_local_complex_step(step, execution_results)
+
+        current_step = _max_completed_complex_step(steps, execution_results)
+        failed = [
+            entry
+            for step in batch
+            for entry in [execution_results.get(str(step.get("step"))) or {}]
+            if entry.get("error")
+        ]
+        if failed:
+            return _complex_plan_return_payload(
+                plan,
+                execution_results,
+                current_step=current_step,
+                failed=True,
+                error="complex_plan_step_failed",
+            )
+
+    return _complex_plan_return_payload(
+        plan,
+        execution_results,
+        current_step=current_step,
+        failed=False,
+        error=None,
+    )
 
 
 async def recall_evidence(state: SQLReactState, config=None) -> dict:
@@ -2036,22 +3087,44 @@ async def sql_retrieve(state: SQLReactState, config=None) -> dict:
 
     # 1. 加载语义模型（包含完整 schema + 业务映射）
     if tables:
-        try:
-            semantic = await asyncio.wait_for(
-                asyncio.to_thread(
-                    traced_tool_call,
-                    "schema.get_semantic_model_by_tables",
-                    ",".join(tables),
-                    callbacks,
-                    lambda: get_semantic_model_by_tables(tables),
-                    {"storage": "redis_mysql", "node": "sql_retrieve"},
-                ),
-                timeout=settings.resilience.milvus_timeout,
-            )
-            result["semantic_model"] = semantic
-        except Exception as e:
-            logger.warning("Semantic model load failed: %s", e)
-            result["semantic_model"] = {}
+        cached_semantic = state.get("semantic_model") or {}
+        semantic_tables = set(cached_semantic.keys()) if isinstance(cached_semantic, dict) else set()
+        requested_tables = set(tables)
+        if semantic_tables and requested_tables.issubset(semantic_tables):
+            result["semantic_model"] = {
+                table: cached_semantic.get(table, {})
+                for table in tables
+                if table in cached_semantic
+            }
+        else:
+            missing_tables = [table for table in tables if table not in semantic_tables]
+            try:
+                loaded_semantic = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        traced_tool_call,
+                        "schema.get_semantic_model_by_tables",
+                        ",".join(missing_tables or tables),
+                        callbacks,
+                        lambda: get_semantic_model_by_tables(missing_tables or tables),
+                        {"storage": "redis_mysql", "node": "sql_retrieve"},
+                    ),
+                    timeout=settings.resilience.milvus_timeout,
+                )
+                result["semantic_model"] = {
+                    **{
+                        table: cached_semantic.get(table, {})
+                        for table in tables
+                        if table in cached_semantic
+                    },
+                    **loaded_semantic,
+                }
+            except Exception as e:
+                logger.warning("Semantic model load failed: %s", e)
+                result["semantic_model"] = {
+                    table: cached_semantic.get(table, {})
+                    for table in tables
+                    if table in cached_semantic
+                }
     else:
         result["semantic_model"] = {}
 
@@ -2076,6 +3149,73 @@ async def check_docs(state: SQLReactState) -> dict:
 
 
 _MAX_TABLE_SEARCH_ROUNDS = 3
+_TABLE_NAME_VALUE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_TABLE_NAME_IN_CONTENT_RE = re.compile(
+    r"(?:^|\n)\s*(?:表名|table(?:\s+name)?)\s*[:：]\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_missing_tables(value) -> list[str]:
+    """Normalize tool-call missing_tables into a deduplicated table-name list."""
+    if not value:
+        return []
+
+    raw_items: list = []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, (list, tuple, set)):
+            raw_items.extend(parsed)
+        elif isinstance(parsed, str):
+            raw_items.append(parsed)
+        else:
+            raw_items.extend(re.split(r"[,，;\n]+", text))
+    elif isinstance(value, (list, tuple, set)):
+        raw_items.extend(value)
+    else:
+        raw_items.append(value)
+
+    tables: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        table = str(item or "").strip().strip("'\"`[]() ")
+        if not table or not _TABLE_NAME_VALUE_RE.match(table):
+            continue
+        if table not in seen:
+            seen.add(table)
+            tables.append(table)
+    return tables
+
+
+def _provided_table_names(docs: list) -> set[str]:
+    """Extract physical table names already present in schema docs."""
+    names: set[str] = set()
+    for doc in docs or []:
+        metadata = getattr(doc, "metadata", {}) or {}
+        for key in ("table_name", "TABLE_NAME"):
+            value = str(metadata.get(key) or "").strip()
+            if value and _TABLE_NAME_VALUE_RE.match(value):
+                names.add(value)
+
+        content = str(getattr(doc, "page_content", "") or "")
+        for match in _TABLE_NAME_IN_CONTENT_RE.finditer(content):
+            names.add(match.group(1))
+    return names
+
+
+def _filter_unprovided_missing_tables(missing_tables: list[str], docs: list) -> list[str]:
+    """Keep only table names that are not already included in provided docs."""
+    provided = _provided_table_names(docs)
+    if not provided:
+        return missing_tables
+    provided_lower = {name.lower() for name in provided}
+    return [table for table in missing_tables if table.lower() not in provided_lower]
 
 
 async def _retrieve_missing_tables(missing_tables: list[str], existing_docs: list, callbacks=None) -> list:
@@ -2129,17 +3269,32 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
 1. 使用 MySQL 语法
 2. 只生成 SELECT 查询（禁止 DROP/DELETE/TRUNCATE 等危险操作）
 3. 如果有执行历史和错误信息，请分析错误原因并生成修正后的 SQL
-4. 如果现有表结构不足以生成正确的 SQL（例如缺少关联表、缺少字段所在的表），
-   请设置 needs_more_tables=true 并在 missing_tables 中列出你需要的表名
+4. 只有当 SQL 必须引用的物理表完全未出现在“表结构信息”中时，才设置 needs_more_tables=true。
+   已提供表结构中的表不得再列入 missing_tables；missing_tables 必须是数组，不要返回字符串形式的 JSON。
 5. 参考相似问题的 SQL 示例，但要根据实际表结构调整
 6. 表结构中已包含字段的业务名称、同义词和描述，生成 SQL 时优先使用物理字段名，但可参考业务信息理解字段含义
 7. 使用表关系信息来确定正确的 JOIN 条件
 8. 生成盈亏/正负判断时必须区分三种情况：大于 0、小于 0、等于 0；不要用 ELSE 把 0 归为亏损或盈利
 9. 当用户问“亏损多少/亏损金额”时，应返回亏损金额：净利润 < 0 时为 ABS(净利润)，否则为 0；不要仅返回名为“净利润”的字段
-10. 如果上下文中提供了上一轮 SQL，且用户是在追问或省略表达，必须沿用上一轮的时间范围、状态过滤、表连接、指标计算口径和排除条件；除非用户明确要求变更口径
-11. 不要在同一层 SELECT 中嵌套聚合函数，例如 SUM(CASE WHEN SUM(...) THEN ... END)；需要二次聚合时先在子查询中产出净利润/亏损金额，再在外层 SUM(亏损金额)
-12. 外层查询只能引用子查询输出列或子查询别名，不能引用内层表别名（如 a.account_type、ji.debit_amount）
-13. 使用 sql_format_response 工具输出结果"""),
+10. 如果字段/科目辅助信息已在已提供表中，例如已提供表存在 account_type='损益' 或“科目类型”字段，必须直接使用，不要声称缺少辅助信息
+11. 如果上下文中提供了上一轮 SQL，且用户是在追问或省略表达，必须沿用上一轮的时间范围、状态过滤、表连接、指标计算口径和排除条件；除非用户明确要求变更口径
+12. 不要在同一层 SELECT 中嵌套聚合函数，例如 SUM(CASE WHEN SUM(...) THEN ... END)；需要二次聚合时先在子查询中产出净利润/亏损金额，再在外层 SUM(亏损金额)
+13. 外层查询只能引用子查询输出列或子查询别名，不能引用内层表别名（如 a.account_type、ji.debit_amount）
+16. CASE 语法必须选一种，不得混用：
+    - 简单 CASE：CASE expr WHEN value1 THEN r1 WHEN value2 THEN r2 ELSE r3 END（WHEN 后是字面值，不是布尔条件）
+    - 搜索 CASE：CASE WHEN bool_expr1 THEN r1 WHEN bool_expr2 THEN r2 ELSE r3 END（WHEN 后是布尔条件）
+    生成盈亏判断时必须用搜索 CASE，正确写法示例：
+      CASE WHEN net_profit < 0 THEN ABS(net_profit) ELSE 0 END
+    错误写法（禁止）：CASE net_profit WHEN net_profit < 0 THEN ...（不能在简单 CASE 中写布尔条件）
+17. 净利润/亏损的正确分层计算模式（当需要先聚合再判断时）：
+    SELECT CASE WHEN net_profit < 0 THEN ABS(net_profit) ELSE 0 END AS 亏损金额
+    FROM (
+        SELECT SUM(credit_amount - debit_amount) AS net_profit
+        FROM ...
+        WHERE ...
+    ) t
+14. 当 is_sql=true 时，answer 只能包含 SQL，不要包含解释性文字
+15. 使用 sql_format_response 工具输出结果"""),
         HumanMessage(content=query),
     ]
 
@@ -2215,21 +3370,31 @@ async def sql_generate(state: SQLReactState, config=None) -> dict:
         docs_text = "\n\n".join([d.page_content for d in all_docs])
 
         messages = _build_sql_messages(query_for_sql, docs_text, refine_context, history_context, evidence_text, few_shot_text, relationships_text)
-        response = await model_with_tools.ainvoke(
-            messages,
-            config=child_trace_config(config, "sql.sql_generate.llm", tags=["llm", "sql_react"]),
-        )
+        try:
+            response = await model_with_tools.ainvoke(
+                messages,
+                config=child_trace_config(config, "sql.sql_generate.llm", tags=["llm", "sql_react"]),
+            )
+        except Exception as exc:
+            logger.warning("sql_generate llm failed: %s", exc, exc_info=True)
+            return {
+                "answer": "SQL 生成模型暂时不可用，无法生成可执行 SQL。请稍后重试或切换可用模型配置。",
+                "sql": "",
+                "is_sql": False,
+                "error": "sql_generation_llm_unavailable",
+            }
 
         if not response.tool_calls:
             return {"answer": response.content, "sql": response.content, "is_sql": False, "error": None}
 
         tool_call = response.tool_calls[0]
         args = tool_call["args"]
-        needs_more = args.get("needs_more_tables", False)
-        missing = args.get("missing_tables", [])
+        missing = _normalize_missing_tables(args.get("missing_tables", []))
+        missing = _filter_unprovided_missing_tables(missing, all_docs)
+        needs_more = bool(args.get("needs_more_tables", False)) and bool(missing)
 
         # If LLM says it has enough tables, return the result
-        if not needs_more or not missing:
+        if not needs_more:
             answer_text = args.get("answer", "")
             is_sql = args.get("is_sql", False)
             if is_sql:

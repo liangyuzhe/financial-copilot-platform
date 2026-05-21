@@ -99,6 +99,34 @@ class TestFlowImports:
         assert callable(build_final_graph)
 
 
+class TestRuntimeImports:
+    """Test runtime module imports."""
+
+    def test_tool_catalog_imports(self):
+        from agents.runtime.agentscope_runtime import COMPLEX_ANALYSIS_AGENT_PROMPT
+        from agents.runtime.agentscope_runtime import AgentScopeRunContext, AgentScopeRuntime
+        from agents.runtime.agentscope_runtime import REPORT_AGENT_PROMPT
+        from agents.runtime.result import AgentRunResult
+        from agents.runtime.shadow_benchmark import ShadowBenchmark, ShadowRunRecord
+        from agents.runtime.skill_registry import SkillDefinition, SkillRegistry
+        from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+        from agents.runtime.tool_contracts import ToolCallResult, ToolContract
+
+        assert AgentScopeRuntime is not None
+        assert AgentScopeRunContext is not None
+        assert "complex_analysis_agent" in COMPLEX_ANALYSIS_AGENT_PROMPT
+        assert "report_agent" in REPORT_AGENT_PROMPT
+        assert AgentRunResult is not None
+        assert ShadowBenchmark is not None
+        assert ShadowRunRecord is not None
+        assert SkillDefinition is not None
+        assert SkillRegistry is not None
+        assert ToolCatalog is not None
+        assert ToolProviders is not None
+        assert ToolContract is not None
+        assert ToolCallResult is not None
+
+
 class TestToolImports:
     """Test tool module imports."""
 
@@ -148,7 +176,7 @@ class TestAPIImports:
         assert app is not None
 
     def test_routers_import(self):
-        from agents.api.routers import chat, rag, query, document
+        from agents.api.routers import agentscope, chat, rag, query, document
 
     def test_sse_import(self):
         from agents.api.sse import sse_response

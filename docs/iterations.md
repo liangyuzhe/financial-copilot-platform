@@ -1,5 +1,81 @@
 # 迭代优化记录
 
+## Iteration 43：AgentScope Data Planner 主链路重构
+
+### 背景
+
+最近的复杂查询链路把 SQLReact 放在主路径：先做召回、选表、复杂度判断，再把 `workflow_state` 注入 AgentScope prepass。实际验证发现，AgentScope 只是在已有上下文上补一个规划动作，既没有充分发挥自主决策能力，又增加了 LLM 和上下文注入延迟。
+
+### 方案
+
+入口路由收敛为三类：
+
+- `data`：当前系统数据处理请求。
+- `chat`：通用对话或外部信息。
+- `clarify`：需要补充目标、口径、时间或主体。
+
+所有 `data` 请求统一进入 `AgentScopePlanner`。Planner 自主调用 business knowledge、schema、semantic model、relationship、time 等工具，最终提交结构化 `analysis_plan`。简单查询是单 SQL step，复杂分析是多 SQL step 加 merge/report step。
+
+SQL 执行仍由 Harness 负责：
+
+```text
+AgentScopePlanner -> analysis_plan.submit -> validate -> safety -> authorize -> approve -> execute -> report
+```
+
+### 验证要求
+
+- 单测验证 `data/chat/clarify` 入口路由。
+- 单测验证 `data` 不再进入 SQLReact 主路径。
+- 单测验证 `analysis_plan.submit` 只做 handoff，不执行 SQL。
+- 真实 query 验证 tool trace 和 LangSmith span：`dispatcher.classify_route.llm`、`agentscope.runtime.data_analysis`、`agentscope.tool.*`、`analysis_plan.submit`。
+
+### 2026-05-19 修复记录：真实 AgentScope 计划提交失败
+
+真实查询 `收入成本预算回款费用之间的关系` 暴露了两个问题：
+
+- AgentScope package 会把 `analysis_plan.submit` 参数提交成半结构化草稿，例如只有 `reason/steps/sql_draft`，缺少 `mode/type/tables`。工具层现在在 `ToolCatalog` 内统一归一化 `plan`、`analysis_plan`、`plan_text`，既保留已经结构化的 plan，也能从 SQL/Markdown 草稿提取表并生成可校验 plan。
+- AgentScope 最终 reply metadata 可能带有旧的 `analysis_plan` wrapper。adapter 之前用 `setdefault` 合并，导致成功的工具输出无法覆盖旧 metadata，dispatcher 最终误判为“未提交 analysis_plan”。现在成功的 `analysis_plan.submit` 输出是权威来源，会覆盖模型 reply metadata。
+
+验证结果：
+
+```bash
+.venv/bin/python -m pytest tests/test_runtime_tool_catalog.py tests/test_agentscope_adapter.py tests/test_dispatcher.py tests/test_agentscope_runtime.py::test_data_analysis_runtime_hands_analysis_plan_to_harness tests/test_agentscope_runtime.py::test_runtime_emits_langsmith_spans_for_runner_and_tools -q
+# 56 passed
+```
+
+真实接口验证：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/query/invoke \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"收入成本预算回款费用之间的关系","session_id":"debug-agentscope-toolcatalog-normalized-20260519","route":"data","rewritten_query":"收入成本预算回款费用之间的关系"}'
+```
+
+返回 `status=pending_approval`、`pending_approval=true`、`approval_type=complex_plan`，展示给用户的是可读的 SQL Harness 审批计划，不再是“AgentScope 未提交可执行 analysis_plan”的失败文案。
+
+### 2026-05-19 修复记录：计划 SQL 行注释被压平导致 MySQL 语法错误
+
+审批执行阶段曾出现：
+
+```text
+复杂查询计划执行失败。共处理 1/1 个步骤：
+错误: You have an error in your SQL syntax ... near '' at line 1
+```
+
+根因是 `ToolCatalog._normalize_sql_text()` 用空格压缩了所有 whitespace，导致多行 SQL 里的 `-- 收入...` 行注释和下一行 `SUM(...)` 被合并到同一行。MySQL 会把 `--` 后面的整段 SQL 当作注释，执行时只剩不完整的 `SELECT je.period,`。
+
+修复：
+
+- SQL 文本归一化只去掉行尾空白和末尾分号，保留换行，避免破坏 `--` 行注释语义。
+- `analysis_plan.submit` 会从 step SQL 的 `FROM/JOIN` 中提取真实物理表并并入 `step.tables`，避免模型提交 `tables:["business"]` 但 SQL 实际引用 `t_receivable_payable` 时绕过授权。
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_runtime_tool_catalog.py tests/test_agentscope_adapter.py tests/test_dispatcher.py tests/test_sql_react.py::TestComplexRoute::test_execute_complex_plan_step_uses_submitted_step_sql_without_regenerating tests/test_sql_react.py::TestComplexRoute::test_execute_complex_plan_step_preserves_submitted_sql_line_comments tests/test_sql_react.py::TestComplexRoute::test_execute_complex_plan_step_blocks_unsafe_submitted_step_sql -q
+# 59 passed
+```
+
 ## 迭代 1：Schema 召回策略优化（参考 DataAgent）
 
 ### 为什么优化
@@ -3421,3 +3497,155 @@ SELECT u.real_name AS 真实姓名, r.name AS 角色名称
 ### 当前结论
 
 数据权限不能作为 SQL 执行失败后的补丁，而应该进入 NL2SQL 主链路：先让系统判断“这个问题需要什么业务数据”，再判断“当前用户是否有权访问”。本轮 V1 已经把表级权限接入选表后、补表时、SQL 审批前和复杂计划 SQL step，避免 LLM 因看不到表而幻觉，也避免补表和复杂计划绕过表级权限边界。下一阶段重点是把表级策略扩展到 SQL AST、行级权限、列级脱敏和持久化审计。
+
+## Iteration：AgentScope Data Planner 端到端修复与延迟复测
+
+日期：2026-05-18
+
+### 背景
+
+本轮重构目标是让入口收敛为 `data / chat / clarify`，数据类请求统一由 AgentScope Planner 产出 `analysis_plan`，再交给 SQL Harness 做审批、安全检查、SQL 生成、执行和 report。验证过程中发现两个核心问题：
+
+- 本地 AgentScope 兼容 runner 在 `analysis_plan.steps[0].sql` 中塞入了 `select ... count(*) ...` smoke SQL。由于 `execute_complex_plan_step` 已经支持信任提交的 `step.sql`，这段 fake SQL 被直接执行，导致最终结果是假分析。
+- 成功执行后的最终展示仍可能回退到“复杂查询计划执行完成 + SQL 明细 + 样例行”，用户不可读。
+
+### 本轮改动
+
+1. `LocalAgentScopeCompatibleRunner._data_analysis_plan()` 不再提交可执行 SQL，只提交结构化 step 目标、表、依赖和 report 步骤。SQL 仍由 SQL Harness 在执行阶段基于 schema/semantic/evidence 生成。
+2. `classify_intent()` 增加规则短路：数据库规则命中且当前没有对话历史依赖时，直接返回 `data/chat/clarify` 和 rewrite，不再加载 domain summary，也不再调用分类 LLM。需要结合历史补全的追问仍保留 LLM 分类/重写路径。
+3. `report` 步骤即使没有 `merge_keys`，也会把依赖 SQL 的结构化行带入最终 formatter，生成业务可读的“关系分析结果”。
+4. 指标汇总做了两个展示修正：
+   - `budget_cost` 不再被误算进“成本合计”；
+   - `receivable_amount` 可被识别为回款/应收相关指标。
+5. README GIF 脚本中 complex demo 的等待文案从旧的“复杂查询计划执行完成”改成“关系分析结果”，并重新录制 GIF。
+
+### 端到端验证
+
+浏览器真实链路：
+
+```text
+问题：收入成本预算回款费用之间的关系
+入口：Data Agent
+服务：APP_PORT=8081 AGENTSCOPE_RUNTIME_BACKEND=local
+```
+
+复测结果：
+
+```text
+TOTAL_MS=71306
+CLASSIFY_MS=253
+PLAN_MS=572
+HAS_COUNT_SQL=false
+HAS_RELATION=true
+HAS_PLAN_COMPLETE=false
+```
+
+最终 UI 展示已经变为：
+
+```text
+关系分析结果：
+- 本次按计划完成 2/2 个步骤，合并得到 1 条可对齐记录。
+- 预算合计：15588682.45。
+- 收入合计：1316000.00。
+- 成本合计：1413000.00。
+- 费用合计：167108.81。
+- 回款合计：1372036.02。
+- 粗略盈余：-264108.81。
+- 回款效率：104.26%。
+执行概况：SQL 明细和样例行已保留在 trace 中，这里只展示面向业务判断的结论。
+```
+
+GIF 已重新生成：
+
+```text
+docs/assets/demos/sql-complex-finance-relation-plan-approved.gif  8.4M
+docs/assets/demos/raw/sql-complex-finance-relation-plan-approved.webm  6.8M
+```
+
+### 延迟结论
+
+分类和规划阶段已经明显缩短：
+
+- `/api/query/classify`：从此前约 12s 级别降到本次 253ms，因为命中 DB rule 后不再调用分类 LLM。
+- `/api/query/invoke` planner：本次约 572ms，主要是业务知识召回、schema.list、semantic_model、related_tables 和 `analysis_plan.submit`。
+- 总耗时仍可能较长，主要在审批后的 SQL 生成与修复回路。实际日志里仍出现过 `rp.cost_center_id`、`ji.entry_date` 等不存在字段导致的 repair retry，说明下一步瓶颈不是 AgentScope Planner，而是 SQL generation prompt/schema 约束和错误修复质量。
+
+### Trace 状态
+
+服务启动日志确认：
+
+- `LangSmith tracing enabled (endpoint: https://api.smith.langchain.com, project: agent-platform-py)`
+- AgentScope runtime tool summary 覆盖 `business_knowledge.search`、`schema.list_tables`、`semantic_model.search`、`schema.related_tables`、`analysis_plan.submit`
+- CozeLoop trace ingest 返回 200
+
+受当前运行环境限制，未在浏览器中直接打开私有 LangSmith UI 链接做人工点查；本轮以服务端 trace 日志和工具链路日志作为可复现证据。
+
+补充排查结论：
+
+- `agentscope_data_planner` 原先没有把 LangGraph config 里的 callbacks 传给 `AgentScopeRuntime`，因此 LangSmith 只能看到顶层 graph node，看不到 AgentScope runtime/tool 子 span。已补齐 callback 透传，并用单测固定。
+- 当前 `AGENTSCOPE_RUNTIME_BACKEND=local` 时，`agentscope_data_planner` 不会产生 LLM call。它是本地兼容 runner，确定性调用 ToolCatalog 工具并提交 `analysis_plan`，LangSmith 中预期看到的是 `agentscope.runtime.data_analysis` 和 `agentscope.tool.*`，不是模型调用。
+- 只有启用真实 AgentScope package backend 时，Planner 才会通过 AgentScope `ReActAgent` 调用模型。那时是否能在 LangSmith 中展示为 LLM span，取决于 AgentScope package 的 model adapter 是否接入 LangChain callback；平台侧至少需要保证 runtime/tool span 已经透传。
+- `/api/query/invoke` 在 `approve_analysis_plan` 处 `interrupt()` 后会结束本次 root run；用户点击确认后 `/api/query/approve/stream` 用同一个 graph thread resume，但通常会在 LangSmith 中形成另一条 root run。因此截图只停在 `approve_analysis_plan` 时，看到的是审批前半段，不代表审批后的执行节点没有跑。
+
+### 后续优化
+
+1. 优化 SQL generation prompt，只传当前 step 必需字段，减少全 schema 噪声。
+2. 在 `sql_generate` 前加入字段存在性约束或候选字段白名单，降低 `rp.cost_center_id` / `ji.entry_date` 这类幻觉字段。
+3. 对高频复杂分析沉淀结构化 metric plan，而不是让单个 SQL step 自由拼所有指标。
+4. LangSmith 私有 UI 可访问时，按本轮 session_id / timestamp 对照检查 graph node、tool span 和 LLM span 是否完整。
+
+## Iteration：data 入口简单查询报错修复
+
+日期：2026-05-19
+
+### 问题
+
+用户问题 `收入成本预算回款费用之间的关系` 曾返回：
+
+```text
+数据分析计划生成失败：AgentScope 未提交可执行的 analysis_plan
+```
+
+复测当前代码后确认，复杂关系查询已经能返回 `pending_approval`。随后用简单查询 `查询 2025 年销售收入总额` 发现另一条失败链路：
+
+1. 未命中 DB intent rule 时，`classify_route.llm` 调用默认 `ark` 模型。
+2. 当前环境 Ark 账号返回 `AccountOverdueError`，API 直接返回系统错误。
+3. 命中规则进入 data 后，真实 AgentScope package 同样因 Ark 403 无法提交 plan，但 dispatcher 已 fallback 到 `LocalAgentScopeCompatibleRunner`，能生成 `analysis_plan`。
+4. 用户审批后，SQL Harness 的 `sql_generate` 仍依赖 chat LLM；当前 Ark 403 会导致 SQL 生成失败。
+
+### 本轮修复
+
+- `classify_intent()` 捕获分类 LLM 异常，降级进入 `data`，不再把 provider 403 直接暴露为 API 系统错误。
+- `data/intent_rules_seed.json` 扩展省略主体财务查数规则，支持 `2025 年` 这类明确年份表达；运行 `python -m scripts.seed_intent_rules` 后，`查询 2025 年销售收入总额` 可由 DB rule 短路到 data，避免分类 LLM。
+- `sql_generate()` 捕获 SQL 生成 LLM 异常，返回用户可读的 `SQL 生成模型暂时不可用...`，同时保留结构化错误码 `sql_generation_llm_unavailable` 供 trace/排障使用。
+- 复杂计划失败展示优先使用 step 的用户可读 `answer`，不再只展示内部错误码。
+
+### 验证
+
+单测：
+
+```text
+.venv/bin/python -m pytest tests/test_dispatcher.py tests/test_seed_intent_rules.py -q
+17 passed
+
+.venv/bin/python -m pytest tests/test_sql_react.py::TestSqlGenerate::test_generate_llm_failure_returns_user_safe_error tests/test_sql_react.py::TestSqlGenerate::test_complex_plan_failure_prefers_user_safe_answer_over_error_code -q
+2 passed
+```
+
+真实 API：
+
+```text
+POST /api/query/invoke
+query=查询 2025 年销售收入总额
+
+返回：status=pending_approval，approval_type=complex_plan
+日志：classify_route: rule_short_circuit route=data
+
+POST /api/query/approve
+返回：status=error
+用户可见错误：SQL 生成模型暂时不可用，无法生成可执行 SQL。请稍后重试或切换可用模型配置。
+```
+
+### 当前限制
+
+当前环境 `CHAT_MODEL_TYPE=ark`，Ark 调用返回 `AccountOverdueError`；`OPENAI_CHAT_MODEL` 和 `QWEN_CHAT_MODEL` 仍是占位值 `your-chat-model`。因此本轮只能验证到错误收敛和审批链路正常，不能在当前模型配置下验证 SQL 真正生成并执行成功。

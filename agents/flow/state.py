@@ -32,6 +32,7 @@ class RAGChatState(TypedDict):
 class SQLReactState(TypedDict):
     """SQL React 图的状态。"""
     query: Annotated[str, latest_non_empty]      # 当前用户问题（可能是代词化的）
+    session_id: str                              # 前端/API 会话 ID
     rewritten_query: Annotated[str, latest_non_empty]  # 上下文化后的独立问题
     enhanced_query: str                          # 业务术语增强后的查询
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
@@ -50,6 +51,8 @@ class SQLReactState(TypedDict):
     plan_approved: bool                          # 复杂计划是否已确认
     plan_current_step: int                       # 当前计划步骤编号
     plan_execution_results: dict                 # step_id -> result/error/sql
+    agentscope_result: dict                      # AgentScope 内部规划观测结果，不作为执行事实
+    agentscope_observation: dict                 # AgentScope 内部运行摘要，用于 trace/排障
     evidence: list[str]                          # 业务知识检索结果
     few_shot_examples: list[str]                 # SQL Q&A few-shot 参考
     recall_context: dict                         # 单次召回后的结构化上下文，供后续节点复用
@@ -84,9 +87,30 @@ class FinalGraphState(TypedDict):
     session_id: str
     chat_history: list[dict]                     # 对话历史 [{"role": str, "content": str}]
     security_context: dict                       # 当前用户、角色和数据权限上下文
-    intent: str                                  # sql_query | anomaly_detect | reconciliation | report | audit | knowledge | chat
+    route: str                                   # data | chat | clarify
+    route_confidence: float
+    route_reason: str
+    intent: str                                  # 兼容字段，逐步废弃
     rewritten_query: Annotated[str, latest_non_empty]  # classify 或前端预分类产出的独立查询
+    analysis_plan: dict
+    complex_plan: dict
+    plan_validation_error: str
+    plan_approved: bool
+    plan_current_step: int
+    plan_execution_results: dict
+    enhanced_query: str
+    selected_tables: list[str]
+    table_metadata: dict
+    table_relationships: list[dict]
+    semantic_model: dict
+    evidence: list[str]
+    few_shot_examples: list[str]
+    recall_context: dict
+    agentscope_result: dict
+    agentscope_observation: dict
     sql: str
+    is_sql: bool
     result: str
     answer: str
+    error: str | None
     status: str                                  # "pending" | "approved" | "rejected" | "completed"

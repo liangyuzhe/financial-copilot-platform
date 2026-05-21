@@ -25,7 +25,8 @@ router = APIRouter()
 class QueryRequest(BaseModel):
     query: str
     session_id: str = "default_user"
-    intent: str = ""  # 前端预分类的意图，非空时跳过 LLM 分类
+    route: str = ""  # 前端预分类的路由，非空时跳过 LLM 分类
+    intent: str = ""  # 兼容旧字段
     rewritten_query: str = ""  # 前端预重写的查询，非空时跳过上下文重写
 
 
@@ -36,11 +37,15 @@ class QueryResponse(BaseModel):
     session_id: str
     pending_approval: bool = False
     sql: str = ""
+    result: str = ""
     approval_type: str = ""
 
 
 class ClassifyResponse(BaseModel):
-    intent: str
+    route: str
+    intent: str = ""
+    route_confidence: float = 0.0
+    route_reason: str = ""
     rewritten_query: str  # 重写后的独立查询
     session_id: str
 
@@ -234,6 +239,7 @@ async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
             session_id=req.session_id,
             pending_approval=True,
             sql=interrupt_val.get("sql", ""),
+            result=result.get("result", ""),
             approval_type=interrupt_val.get("approval_type", "sql"),
         )
 
@@ -250,6 +256,7 @@ async def _approve_sql_result(req: ApproveRequest) -> QueryResponse:
         status=result.get("status", "completed"),
         session_id=req.session_id,
         sql=sql,
+        result=result.get("result", ""),
     )
 
 
@@ -263,7 +270,10 @@ async def classify_intent_endpoint(req: QueryRequest):
         config=_make_config(req.session_id),
     )
     return ClassifyResponse(
-        intent=result.get("intent", "chat"),
+        route=result.get("route", "chat"),
+        intent=result.get("route", "chat"),
+        route_confidence=float(result.get("route_confidence", 0.0) or 0.0),
+        route_reason=result.get("route_reason", ""),
         rewritten_query=result.get("rewritten_query", req.query),
         session_id=req.session_id,
     )
@@ -271,7 +281,7 @@ async def classify_intent_endpoint(req: QueryRequest):
 
 @router.post("/invoke", response_model=QueryResponse)
 async def query_invoke(req: QueryRequest, request: Request = None):
-    """查询调用：传入 intent 时跳过分类，直接路由到子图。"""
+    """查询调用：传入 route 时跳过分类，直接路由到子图。"""
     graph = build_final_graph()
     graph_thread_id = _new_graph_thread_id(req.session_id)
     config = _make_config(req.session_id, graph_thread_id)
@@ -281,7 +291,8 @@ async def query_invoke(req: QueryRequest, request: Request = None):
         "query": req.query,
         "session_id": req.session_id,
         "chat_history": chat_history,
-        "intent": req.intent or "",
+        "route": req.route or req.intent or "",
+        "intent": req.intent or req.route or "",
         "rewritten_query": req.rewritten_query or "",
         "security_context": _build_security_context(
             req.session_id,
@@ -312,6 +323,7 @@ async def query_invoke(req: QueryRequest, request: Request = None):
             session_id=req.session_id,
             pending_approval=True,
             sql=interrupt_val.get("sql", ""),
+            result=result.get("result", ""),
             approval_type=interrupt_val.get("approval_type", "sql"),
         )
 
@@ -328,6 +340,7 @@ async def query_invoke(req: QueryRequest, request: Request = None):
         status=result.get("status", "completed"),
         session_id=req.session_id,
         sql=sql,
+        result=result.get("result", ""),
     )
 
 
