@@ -1,0 +1,21 @@
+graph TD
+    classify-intent["classify_intent\nroute + rewritten query"]
+    route-switch["Route Switch\ndata / chat / clarify"]
+    agentscope-data-planner["agentscope_data_planner\nAgentScopeRuntime data_analysis"]
+    chat-direct["chat_direct\nRAG Chat"]
+    clarify-direct["clarify_direct\nmissing scope response"]
+    approve-analysis-plan["approve_analysis_plan\nvalidate + authorize + interrupt"]
+    execute-analysis-plan["execute_analysis_plan\nSQL Harness execution"]
+    graph-state["FinalGraphState\nagents/flow/state.py"]
+
+    classify-intent -->|"sets route"| route-switch
+    route-switch -->|"data"| agentscope-data-planner
+    route-switch -->|"chat"| chat-direct
+    route-switch -->|"clarify"| clarify-direct
+    agentscope-data-planner -->|"writes analysis_plan"| graph-state
+    graph-state -->|"plan ready"| approve-analysis-plan
+    approve-analysis-plan -->|"approved resume"| execute-analysis-plan
+    approve-analysis-plan -->|"denied or invalid"| graph-state
+    execute-analysis-plan -->|"answer, sql, results"| graph-state
+    chat-direct -->|"answer"| graph-state
+    clarify-direct -->|"clarification"| graph-state

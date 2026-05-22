@@ -1,0 +1,1 @@
+Provider availability and local infrastructure readiness influence runtime behavior. The architecture keeps deterministic local fallback paths for AgentScope planning and retrieval degradation where possible.

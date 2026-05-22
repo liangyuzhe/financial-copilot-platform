@@ -799,10 +799,132 @@ async def test_package_runner_submits_structured_data_analysis_plan_to_harness()
 
     result = await runner(context)
 
-    assert seen["structured_model"] is not None
+    assert seen["structured_model"] is None
     assert result.state_patch["analysis_plan"] == plan
     assert result.state_patch["requires_harness"] is True
     assert [trace["tool_name"] for trace in context.tool_trace] == ["analysis_plan.submit"]
+
+
+@pytest.mark.asyncio
+async def test_package_runner_retries_data_analysis_once_when_model_finishes_without_tools_or_plan():
+    from agents.runtime.agentscope_adapter import AgentScopePackageRunner
+    from agents.runtime.agentscope_runtime import AgentScopeRunContext
+    from agentscope.message import Msg
+
+    calls = []
+    plan = {
+        "mode": "analysis_plan",
+        "reason": "retry 后提交计划",
+        "steps": [
+            {
+                "step": 1,
+                "type": "sql",
+                "goal": "统计收入",
+                "tables": ["finance_revenue"],
+                "depends_on": [],
+                "merge_keys": [],
+            }
+        ],
+    }
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.toolkit = kwargs["toolkit"]
+
+        async def __call__(self, msg, structured_model=None):
+            calls.append(msg.get_text_content())
+            if len(calls) == 1:
+                return Msg(
+                    name="assistant",
+                    role="assistant",
+                    content="需要澄清，暂不调用工具。",
+                    metadata={"clarification_questions": ["请说明口径"]},
+                )
+            tool = self.toolkit.tools["analysis_plan_submit"]
+            await tool.original_func(
+                purpose="retry 后提交计划",
+                plan=plan,
+            )
+            return Msg(name="assistant", role="assistant", content="plan submitted", metadata={})
+
+    runner = AgentScopePackageRunner(
+        model_factory=lambda: object(),
+        formatter_factory=lambda: object(),
+        agent_factory=lambda **kwargs: FakeAgent(**kwargs),
+    )
+    catalog = _finance_catalog()
+    context = AgentScopeRunContext(
+        task_type="data_analysis",
+        query="统计收入",
+        session_id="s-plan-retry",
+        thread_id="th-plan-retry",
+        security_context={"allowed_tables": ["finance_revenue"]},
+        workflow_state={},
+        enabled_skills=[],
+        tools=catalog.get_tools(
+            "data_analysis",
+            security_context={"allowed_tables": ["finance_revenue"]},
+        ),
+        tool_catalog=catalog,
+        system_prompt="system prompt",
+    )
+
+    result = await runner(context)
+
+    assert len(calls) == 2
+    assert "必须先实际调用至少一个" in calls[1]
+    assert result.state_patch["analysis_plan"] == plan
+    assert [trace["tool_name"] for trace in context.tool_trace] == ["analysis_plan.submit"]
+
+
+def test_package_runner_guards_data_analysis_finish_until_toolcatalog_tool_called():
+    from agents.runtime.agentscope_adapter import AgentScopePackageRunner
+    from agents.runtime.agentscope_runtime import AgentScopeRunContext
+    from agentscope.tool import ToolResponse
+    from agentscope.message import TextBlock
+
+    class DummyAgent:
+        finish_function_name = "generate_response"
+
+        def generate_response(self, **kwargs):
+            return ToolResponse(
+                content=[TextBlock(type="text", text="ok")],
+                metadata={"success": True, "structured_output": kwargs},
+                is_last=True,
+            )
+
+    runner = AgentScopePackageRunner(
+        model_factory=lambda: object(),
+        formatter_factory=lambda: object(),
+        agent_factory=lambda **kwargs: DummyAgent(),
+    )
+    catalog = _finance_catalog()
+    context = AgentScopeRunContext(
+        task_type="data_analysis",
+        query="统计收入",
+        session_id="s-finish-guard",
+        thread_id="th-finish-guard",
+        security_context={"allowed_tables": ["finance_revenue"]},
+        workflow_state={},
+        enabled_skills=[],
+        tools=catalog.get_tools(
+            "data_analysis",
+            security_context={"allowed_tables": ["finance_revenue"]},
+        ),
+        tool_catalog=catalog,
+        system_prompt="system prompt",
+    )
+
+    agent = runner._build_agent(context, runner._build_toolkit(context))
+
+    assert agent.generate_response.__name__ == "generate_response"
+    blocked = agent.generate_response(answer="直接结束")
+    assert blocked.metadata["success"] is False
+    assert "ToolCatalog" in blocked.content[0]["text"]
+
+    context.tool_trace.append({"tool_name": "current_time.now", "status": "success"})
+    allowed = agent.generate_response(answer="已取证")
+    assert allowed.metadata["success"] is True
 
 
 @pytest.mark.asyncio

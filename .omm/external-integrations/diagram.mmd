@@ -1,0 +1,19 @@
+graph LR
+    app["Financial Copilot Platform\nagents/"]
+    llm["LLM Providers\nArk / OpenAI / DeepSeek / Qwen / Gemini"]
+    redis["Redis\ncache, checkpoint, session"]
+    mysql["MySQL\nsemantic model, rules, business data"]
+    milvus["Milvus\nvector knowledge base"]
+    es["Elasticsearch\nBM25 index"]
+    mcp["MCP MySQL Server\napproved query endpoint"]
+    traces["LangSmith / CozeLoop\nobservability"]
+    agentscope["AgentScope package\noptional real backend"]
+
+    app -->|"model calls"| llm
+    app -->|"session and checkpoints"| redis
+    app -->|"semantic model and rules"| mysql
+    app -->|"vector retrieval"| milvus
+    app -->|"keyword retrieval"| es
+    app -->|"approved SQL execution"| mcp
+    app -->|"runtime and tool tracing"| traces
+    app -->|"optional planner backend"| agentscope

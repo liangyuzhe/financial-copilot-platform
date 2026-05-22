@@ -1,0 +1,1 @@
+Runtime boundary in agents/runtime/. It wraps the optional real AgentScope package or a local compatible runner, applies task tool allowlists, invokes ToolCatalog, collects tool traces, and returns AgentRunResult patches. For data_analysis it is a planner only.

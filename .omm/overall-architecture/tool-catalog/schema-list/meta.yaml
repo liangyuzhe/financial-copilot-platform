@@ -1,0 +1,9 @@
+created: 2026-05-21T10:16:28.624Z
+updated: 2026-05-21T10:16:28.625Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: schema-list
+children: []
+parentPath:
+  - tool-catalog

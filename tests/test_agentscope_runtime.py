@@ -643,15 +643,24 @@ async def test_data_analysis_runtime_hands_analysis_plan_to_harness():
 
     assert seen["task_type"] == "data_analysis"
     assert seen["tool_names"] == [
-        "semantic_model.search",
+        "query.context_rewrite",
         "business_knowledge.search",
+        "sql_examples.search",
+        "query.enhance",
         "schema.list_tables",
         "schema.describe_table",
+        "schema.select_candidates",
+        "semantic_model.search",
         "schema.related_tables",
+        "plan.assess_feasibility",
+        "sql.normalize",
+        "sql.safety_check",
+        "sql.authorize_draft",
         "current_time.now",
         "analysis_plan.submit",
     ]
     assert "data_analysis_agent" in seen["prompt"]
+    assert "query.context_rewrite" in seen["prompt"]
     assert "business_knowledge.search" in seen["prompt"]
     assert result.answer
     assert "SQL Harness" in result.answer

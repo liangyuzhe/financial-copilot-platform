@@ -2363,11 +2363,38 @@ def _format_complex_execution_answer(plan: dict, execution_results: dict[str, di
         if entry.get("sql"):
             lines.append(f"   SQL: {_short_text(entry['sql'], 260)}")
         if entry.get("error"):
-            display_error = entry.get("error") or entry.get("answer")
+            display_error = _complex_step_display_error(entry)
             lines.append(f"   错误: {_short_text(display_error, 300)}")
         else:
             lines.append(f"   结果: {_format_complex_entry_result(entry)}")
     return "\n".join(lines)
+
+
+_COMPLEX_STEP_USER_SAFE_ERROR_CODES = {
+    "empty execution result",
+    "empty generated sql",
+    "invalid_sql_format",
+    "invalid_submitted_sql",
+    "permission_denied",
+    "repair_failed",
+    "sql_generation_llm_unavailable",
+}
+
+
+def _complex_step_display_error(entry: dict) -> str:
+    """Prefer user-facing step answers over internal status codes."""
+    error = str(entry.get("error") or "").strip()
+    answer = str(entry.get("answer") or "").strip()
+    if answer and error in _COMPLEX_STEP_USER_SAFE_ERROR_CODES and not _looks_like_sql_text(answer):
+        return answer
+    return error or answer
+
+
+def _looks_like_sql_text(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return bool(re.match(r"^(--[^\n]*\n\s*)*(with|select)\b", text))
 
 
 def _format_row_preview(row: dict, max_columns: int = 8) -> str:

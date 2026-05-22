@@ -1,0 +1,16 @@
+graph TD
+    app["FastAPI App\nagents/api/app.py"]
+    query-router["Query Router\nagents/api/routers/query.py"]
+    agentscope-router["AgentScope Router\nagents/api/routers/agentscope.py"]
+    rag-router["RAG Router\nagents/api/routers/rag.py"]
+    admin-router["Admin Router\nagents/api/routers/admin.py"]
+    eval-router["Eval Router\nagents/api/routers/eval.py"]
+    sse["SSE Helpers\nagents/api/sse.py"]
+
+    app -->|"mounts query endpoints"| query-router
+    app -->|"mounts planning workspace endpoints"| agentscope-router
+    app -->|"mounts RAG endpoints"| rag-router
+    app -->|"mounts semantic and rule admin endpoints"| admin-router
+    app -->|"mounts evaluation endpoints"| eval-router
+    query-router -->|"streams graph events"| sse
+    agentscope-router -->|"streams runtime events"| sse

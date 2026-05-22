@@ -1,0 +1,9 @@
+created: 2026-05-21T10:14:49.567Z
+updated: 2026-05-21T10:14:49.567Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: approve-analysis-plan
+children: []
+parentPath:
+  - final-graph

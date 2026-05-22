@@ -1,0 +1,30 @@
+graph TD
+    plan-adapter["Plan Adapter\nanalysis_plan -> complex_plan"]
+    plan-validation["Plan Validation\nvalidate_complex_plan"]
+    table-authorization["Table Authorization\nauthorize_tables"]
+    human-approval["Human Approval\ninterrupt/resume"]
+    step-executor["Step Executor\nexecute_complex_plan_step"]
+    sql-retrieval["SQL Retrieval\nsql_retrieve + check_docs"]
+    sql-generation["SQL Generation\nsql_generate"]
+    safety-check["Safety Check\nSELECT/WITH only"]
+    sql-authorization["SQL Authorization\nauthorize_sql"]
+    mysql-execution["MySQL Execution\nMCP execute"]
+    repair-reflection["Repair + Reflection\nerror_analysis/result_reflection"]
+    merge-report["Merge + Report\nlocal summary steps"]
+    answer-formatting["Answer Formatting\nuser-safe output"]
+
+    plan-adapter -->|"normalizes planner output"| plan-validation
+    plan-validation -->|"valid plan"| table-authorization
+    table-authorization -->|"allowed"| human-approval
+    human-approval -->|"approved"| step-executor
+    step-executor -->|"step has no SQL"| sql-retrieval
+    sql-retrieval -->|"schema docs ready"| sql-generation
+    step-executor -->|"step has submitted SQL"| safety-check
+    sql-generation -->|"generated SQL"| safety-check
+    safety-check -->|"safe SQL"| sql-authorization
+    sql-authorization -->|"authorized"| mysql-execution
+    mysql-execution -->|"repairable error or suspicious result"| repair-reflection
+    repair-reflection -->|"revised SQL"| safety-check
+    mysql-execution -->|"rows"| merge-report
+    merge-report -->|"execution entries"| answer-formatting
+    mysql-execution -->|"non-repairable failure"| answer-formatting

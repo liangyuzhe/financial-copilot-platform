@@ -1,0 +1,1 @@
+The API was verified with a real local service: invoke returned pending_approval=true for a complex finance relationship query, permission denial was readable when a required table was missing, and approval completed after permissions were supplied.

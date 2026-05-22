@@ -1,0 +1,9 @@
+created: 2026-05-21T10:18:36.513Z
+updated: 2026-05-21T10:18:36.514Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: merge-report
+children: []
+parentPath:
+  - sql-harness

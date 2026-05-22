@@ -2840,6 +2840,30 @@ FROM t_journal_item ji;"""
         assert "SQL 生成模型暂时不可用" in answer
         assert "sql_generation_llm_unavailable" not in answer
 
+    def test_complex_plan_repair_failure_does_not_show_sql_as_error_message(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        answer = _format_complex_execution_answer(
+            {
+                "steps": [
+                    {"step": 1, "goal": "查询收入", "type": "sql"},
+                    {"step": 2, "goal": "生成报告", "type": "report"},
+                ]
+            },
+            {
+                "1": {
+                    "step": 1,
+                    "goal": "查询收入",
+                    "answer": "SELECT amount FROM t_journal_item",
+                    "error": "repair_failed",
+                }
+            },
+            failed=True,
+        )
+
+        assert "错误: repair_failed" in answer
+        assert "错误: SELECT amount" not in answer
+
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.create_format_tool")
     @patch("agents.flow.sql_react.get_chat_model")

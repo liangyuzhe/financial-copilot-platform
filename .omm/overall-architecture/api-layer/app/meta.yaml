@@ -1,0 +1,9 @@
+created: 2026-05-21T10:12:43.964Z
+updated: 2026-05-21T10:12:43.965Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: app
+children: []
+parentPath:
+  - api-layer

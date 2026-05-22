@@ -1,0 +1,20 @@
+graph TD
+    business-knowledge["business_knowledge.search\nbusiness terms and formulas"]
+    schema-list["schema.list_tables\nvisible table list"]
+    schema-describe["schema.describe_table\nvisible table fields"]
+    semantic-search["semantic_model.search\nfield meanings and aliases"]
+    related-tables["schema.related_tables\nauthorized relationships"]
+    current-time["current_time.now\nrelative time anchor"]
+    analysis-plan-submit["analysis_plan.submit\nplan-only handoff"]
+    permission-filter["Permission Filter\nsecurity context"]
+
+    permission-filter -->|"limits visible metadata"| schema-list
+    permission-filter -->|"limits field descriptions"| schema-describe
+    permission-filter -->|"limits semantic evidence"| semantic-search
+    permission-filter -->|"filters relationships"| related-tables
+    business-knowledge -->|"grounds business terms"| analysis-plan-submit
+    schema-list -->|"candidate tables"| analysis-plan-submit
+    schema-describe -->|"available columns"| analysis-plan-submit
+    semantic-search -->|"business field meanings"| analysis-plan-submit
+    related-tables -->|"join and bridge hints"| analysis-plan-submit
+    current-time -->|"resolved time windows"| analysis-plan-submit

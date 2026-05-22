@@ -1,0 +1,9 @@
+created: 2026-05-21T10:18:41.410Z
+updated: 2026-05-21T10:18:41.411Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: answer-formatting
+children: []
+parentPath:
+  - sql-harness

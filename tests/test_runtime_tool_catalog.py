@@ -78,14 +78,23 @@ def test_data_analysis_tools_expose_analysis_plan_submit_not_sql_draft():
     )
 
     assert _tool_names(tools) == [
-        "semantic_model.search",
+        "query.context_rewrite",
         "business_knowledge.search",
+        "sql_examples.search",
+        "query.enhance",
         "schema.list_tables",
         "schema.describe_table",
+        "schema.select_candidates",
+        "semantic_model.search",
         "schema.related_tables",
+        "plan.assess_feasibility",
+        "sql.normalize",
+        "sql.safety_check",
+        "sql.authorize_draft",
         "current_time.now",
         "analysis_plan.submit",
     ]
+    assert "sql_draft.submit" not in _tool_names(tools)
 
     plan_contract = catalog.get_contract("analysis_plan.submit")
     assert plan_contract.read_only is False
@@ -125,6 +134,31 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "business_knowledge.search": [
             "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "query.context_rewrite": [
+            "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "sql_examples.search": [
+            "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "query.enhance": [
+            "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -132,6 +166,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "schema.list_tables": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -139,6 +174,15 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "schema.describe_table": [
             "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "schema.select_candidates": [
+            "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -146,6 +190,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "schema.related_tables": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -153,6 +198,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "current_time.now": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -160,6 +206,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "artifact.read": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -167,6 +214,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "report.render": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -174,6 +222,39 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "sql_draft.submit": [
             "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "plan.assess_feasibility": [
+            "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "sql.normalize": [
+            "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "sql.safety_check": [
+            "Purpose:",
+            "Call it when:",
+            "Boundary:",
+            "Required input:",
+            "Output:",
+            "Do not use when:",
+        ],
+        "sql.authorize_draft": [
+            "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -181,6 +262,7 @@ def test_tool_contract_descriptions_explain_use_boundaries_io_and_negative_cases
         ],
         "analysis_plan.submit": [
             "Purpose:",
+            "Call it when:",
             "Boundary:",
             "Required input:",
             "Output:",
@@ -200,11 +282,19 @@ def test_tool_contract_io_schema_properties_are_documented():
 
     catalog = ToolCatalog()
     tool_names = [
+        "query.context_rewrite",
         "semantic_model.search",
         "business_knowledge.search",
+        "sql_examples.search",
+        "query.enhance",
         "schema.list_tables",
         "schema.describe_table",
+        "schema.select_candidates",
         "schema.related_tables",
+        "plan.assess_feasibility",
+        "sql.normalize",
+        "sql.safety_check",
+        "sql.authorize_draft",
         "current_time.now",
         "artifact.read",
         "report.render",
@@ -453,6 +543,254 @@ async def test_business_knowledge_current_time_and_trace_context():
         "date": "2026-05-16",
         "timezone": "UTC",
     }
+
+
+@pytest.mark.asyncio
+async def test_data_analysis_planning_tools_rewrite_recall_enhance_and_select_candidates():
+    from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+
+    def rewrite_provider(summary, history, query, config=None):
+        assert query == "去年亏损"
+        assert "我们公司" in str(history)
+        return "我们公司去年是否亏损"
+
+    providers = ToolProviders(
+        query_rewriter=rewrite_provider,
+        business_knowledge_search=lambda query, top_k: [
+            Document(
+                page_content="术语: 亏损\n公式: 净利润 < 0\n关联表: t_profit_statement",
+                metadata={"source": "business_knowledge", "score": 0.93, "related_tables": ["t_profit_statement"]},
+            )
+        ],
+        agent_knowledge_search=lambda query, top_k, callbacks=None: [
+            Document(
+                page_content="用户: 去年亏损\nSQL: select fiscal_year, net_profit from t_profit_statement where net_profit < 0",
+                metadata={"source": "agent_knowledge", "score": 0.91, "related_tables": ["t_profit_statement"]},
+            )
+        ],
+        table_metadata_loader=lambda: [
+            {"table_name": "t_profit_statement", "table_comment": "利润表，包含净利润和亏损指标"},
+            {"table_name": "t_employee_salary", "table_comment": "员工工资表"},
+        ],
+        semantic_model_loader=lambda table_names: {
+            table: (
+                {
+                    "net_profit": {
+                        "table_name": table,
+                        "column_name": "net_profit",
+                        "business_name": "净利润",
+                        "business_description": "净利润小于 0 表示亏损",
+                    },
+                    "fiscal_year": {
+                        "table_name": table,
+                        "column_name": "fiscal_year",
+                        "business_name": "会计年度",
+                    },
+                }
+                if table == "t_profit_statement"
+                else {
+                    "salary_amount": {
+                        "table_name": table,
+                        "column_name": "salary_amount",
+                        "business_name": "工资金额",
+                    }
+                }
+            )
+            for table in table_names
+        },
+        table_relationship_loader=lambda table_names: [],
+    )
+    catalog = ToolCatalog(providers=providers)
+    context = {"allowed_tables": ["t_profit_statement", "t_employee_salary"]}
+    workflow_state = {
+        "chat_history": [{"role": "user", "content": "看我们公司的经营情况"}],
+        "conversation_summary": "当前主体是我们公司",
+    }
+
+    rewritten = await catalog.invoke(
+        "query.context_rewrite",
+        {"query": "去年亏损"},
+        task_type="data_analysis",
+        security_context=context,
+        workflow_state=workflow_state,
+    )
+    assert rewritten.ok is True
+    assert rewritten.output["rewritten_query"] == "我们公司去年是否亏损"
+
+    examples = await catalog.invoke(
+        "sql_examples.search",
+        {"query": rewritten.output["rewritten_query"], "top_k": 3},
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert examples.ok is True
+    assert examples.output["results"][0]["metadata"]["source"] == "agent_knowledge"
+    assert "few_shot_examples" in examples.output
+
+    enhanced = await catalog.invoke(
+        "query.enhance",
+        {
+            "query": rewritten.output["rewritten_query"],
+            "evidence": ["术语: 亏损\n公式: 净利润 < 0\n关联表: t_profit_statement"],
+        },
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert enhanced.ok is True
+    assert "净利润 < 0" in enhanced.output["enhanced_query"]
+
+    selected = await catalog.invoke(
+        "schema.select_candidates",
+        {
+            "query": enhanced.output["enhanced_query"],
+            "top_k": 1,
+            "evidence": ["术语: 亏损\n公式: 净利润 < 0\n关联表: t_profit_statement"],
+        },
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert selected.ok is True
+    assert selected.output["selected_tables"] == ["t_profit_statement"]
+    assert selected.output["semantic_model"]["t_profit_statement"]["net_profit"]["business_name"] == "净利润"
+    assert selected.output["table_metadata"]["t_profit_statement"] == "利润表，包含净利润和亏损指标"
+
+
+@pytest.mark.asyncio
+async def test_schema_select_candidates_uses_plain_table_names_from_evidence():
+    from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+
+    providers = ToolProviders(
+        table_metadata_loader=lambda: [
+            {"table_name": "t_journal_entry", "table_comment": "总账凭证主表"},
+            {"table_name": "t_journal_item", "table_comment": "总账凭证明细"},
+            {"table_name": "t_budget", "table_comment": "预算表"},
+        ],
+        semantic_model_loader=lambda table_names: {
+            table: (
+                {
+                    "net_profit": {
+                        "table_name": table,
+                        "column_name": "net_profit",
+                        "business_name": "净利润",
+                        "business_description": "净利润小于 0 表示亏损",
+                    }
+                }
+                if table == "t_journal_item"
+                else {}
+            )
+            for table in table_names
+        },
+    )
+    catalog = ToolCatalog(providers=providers)
+
+    selected = await catalog.invoke(
+        "schema.select_candidates",
+        {
+            "query": "去年亏损",
+            "top_k": 2,
+            "evidence": ["t_journal_entry, t_journal_item, t_account"],
+        },
+        task_type="data_analysis",
+        security_context={"allowed_tables": ["t_journal_entry", "t_journal_item", "t_budget"]},
+    )
+
+    assert selected.ok is True
+    assert selected.output["recall_context"]["business_related_tables"] == [
+        "t_journal_entry",
+        "t_journal_item",
+        "t_account",
+    ]
+    assert selected.output["selected_tables"][:2] == ["t_journal_entry", "t_journal_item"]
+
+
+@pytest.mark.asyncio
+async def test_data_analysis_sql_validation_tools_are_local_checks_without_execution():
+    from agents.runtime.tool_catalog import ToolCatalog
+
+    catalog = ToolCatalog()
+    context = {"allowed_tables": ["t_profit_statement"], "denied_tables": ["t_payroll"]}
+
+    normalized = await catalog.invoke(
+        "sql.normalize",
+        {"answer": "```sql\nselect * from t_profit_statement where net_profit < 0\n```"},
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert normalized.ok is True
+    assert normalized.output == {
+        "sql": "select * from t_profit_statement where net_profit < 0;",
+        "is_valid": True,
+        "error": "",
+    }
+
+    safety = await catalog.invoke(
+        "sql.safety_check",
+        {"sql": "delete from t_profit_statement"},
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert safety.ok is True
+    assert safety.output["is_safe"] is False
+    assert safety.output["risks"]
+    assert "execution_result" not in safety.output
+
+    authorized = await catalog.invoke(
+        "sql.authorize_draft",
+        {"sql": "select * from t_profit_statement"},
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert authorized.ok is True
+    assert authorized.output["authorization_report"]["allowed"] is True
+    assert authorized.output["tables"] == ["t_profit_statement"]
+    assert authorized.output["execution_mode"] == "validation_only"
+
+    denied = await catalog.invoke(
+        "sql.authorize_draft",
+        {"sql": "select * from t_payroll"},
+        task_type="data_analysis",
+        security_context=context,
+    )
+    assert denied.ok is False
+    assert denied.trace.status == "denied"
+
+
+@pytest.mark.asyncio
+async def test_plan_assess_feasibility_tool_returns_execution_mode_without_sql_execution():
+    from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+
+    catalog = ToolCatalog(
+        providers=ToolProviders(
+            table_relationship_loader=lambda table_names: [
+                {
+                    "from_table": "t_profit_statement",
+                    "from_column": "company_id",
+                    "to_table": "t_company",
+                    "to_column": "id",
+                }
+            ]
+        )
+    )
+
+    result = await catalog.invoke(
+        "plan.assess_feasibility",
+        {
+            "query": "我们公司去年是否亏损",
+            "selected_tables": ["t_profit_statement", "t_company"],
+        },
+        task_type="data_analysis",
+        security_context={"allowed_tables": ["t_profit_statement", "t_company"]},
+    )
+
+    assert result.ok is True
+    assert result.output["feasibility_decision"]["execution_mode"] in {
+        "single_sql",
+        "single_sql_with_strict_checks",
+        "complex_plan",
+        "clarify",
+    }
+    assert result.output["relationships"][0]["from_table"] == "t_profit_statement"
+    assert "execution_result" not in result.output
 
 
 @pytest.mark.asyncio

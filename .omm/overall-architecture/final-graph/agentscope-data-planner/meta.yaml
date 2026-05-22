@@ -1,0 +1,9 @@
+created: 2026-05-21T10:14:08.772Z
+updated: 2026-05-21T10:14:08.773Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: agentscope-data-planner
+children: []
+parentPath:
+  - final-graph

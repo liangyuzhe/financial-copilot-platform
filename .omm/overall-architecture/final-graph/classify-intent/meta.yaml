@@ -1,0 +1,9 @@
+created: 2026-05-21T10:13:45.909Z
+updated: 2026-05-21T10:13:45.910Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: classify-intent
+children: []
+parentPath:
+  - final-graph

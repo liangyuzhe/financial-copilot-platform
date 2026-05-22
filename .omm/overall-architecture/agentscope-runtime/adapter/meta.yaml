@@ -1,0 +1,9 @@
+created: 2026-05-21T10:15:34.469Z
+updated: 2026-05-21T10:15:34.470Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: adapter
+children: []
+parentPath:
+  - agentscope-runtime

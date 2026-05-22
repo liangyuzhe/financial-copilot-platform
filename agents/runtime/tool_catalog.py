@@ -17,8 +17,12 @@ from agents.rag.retriever import (
     get_semantic_model_by_tables,
     get_table_relationships,
     load_full_table_metadata,
+    recall_agent_knowledge,
     recall_business_knowledge,
 )
+from agents.flow.complex_query import assess_query_feasibility
+from agents.model.format_tool import normalize_sql_answer
+from agents.rag.query_rewrite import rewrite_query
 from agents.runtime.tool_contracts import (
     RuntimeTool,
     ToolCallResult,
@@ -26,8 +30,11 @@ from agents.runtime.tool_contracts import (
     ToolTrace,
 )
 from agents.tool.security.policies import SecurityContext, authorize_tables
+from agents.tool.sql_tools.safety import SQLSafetyChecker
 
 logger = logging.getLogger(__name__)
+
+_SQL_TABLE_RE = re.compile(r"\b(?:FROM|JOIN)\s+`?([a-zA-Z_][\w]*)`?", re.IGNORECASE)
 
 _TASK_ALLOWLISTS: dict[str, tuple[str, ...]] = {
     "exploratory_analysis": (
@@ -48,11 +55,19 @@ _TASK_ALLOWLISTS: dict[str, tuple[str, ...]] = {
         "sql_draft.submit",
     ),
     "data_analysis": (
-        "semantic_model.search",
+        "query.context_rewrite",
         "business_knowledge.search",
+        "sql_examples.search",
+        "query.enhance",
         "schema.list_tables",
         "schema.describe_table",
+        "schema.select_candidates",
+        "semantic_model.search",
         "schema.related_tables",
+        "plan.assess_feasibility",
+        "sql.normalize",
+        "sql.safety_check",
+        "sql.authorize_draft",
         "current_time.now",
         "analysis_plan.submit",
     ),
@@ -75,6 +90,24 @@ _TOOL_ORDER: tuple[str, ...] = (
     "analysis_plan.submit",
 )
 
+_DATA_ANALYSIS_TOOL_ORDER: tuple[str, ...] = (
+    "query.context_rewrite",
+    "business_knowledge.search",
+    "sql_examples.search",
+    "query.enhance",
+    "schema.list_tables",
+    "schema.describe_table",
+    "schema.select_candidates",
+    "semantic_model.search",
+    "schema.related_tables",
+    "plan.assess_feasibility",
+    "sql.normalize",
+    "sql.safety_check",
+    "sql.authorize_draft",
+    "current_time.now",
+    "analysis_plan.submit",
+)
+
 
 def _default_table_metadata_loader() -> list[dict]:
     return load_full_table_metadata()
@@ -92,6 +125,14 @@ def _default_business_knowledge_search(query: str, top_k: int) -> list[Document]
     return recall_business_knowledge(query, top_k=top_k)
 
 
+def _default_agent_knowledge_search(query: str, top_k: int, callbacks=None) -> list[Document]:
+    return recall_agent_knowledge(query, top_k=top_k, callbacks=callbacks)
+
+
+async def _default_query_rewriter(summary: str, history: Any, query: str, config=None) -> str:
+    return await rewrite_query(summary=summary, history=history, query=query, config=config)
+
+
 def _default_time_provider() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -101,6 +142,8 @@ class ToolProviders:
     """Injectable data providers for ToolCatalog."""
 
     business_knowledge_search: Any = _default_business_knowledge_search
+    agent_knowledge_search: Any = _default_agent_knowledge_search
+    query_rewriter: Any = _default_query_rewriter
     table_metadata_loader: Any = _default_table_metadata_loader
     semantic_model_loader: Any = _default_semantic_model_loader
     table_relationship_loader: Any = _default_relationship_loader
@@ -129,9 +172,15 @@ class ToolCatalog:
         required_input: str,
         output: str,
         negative: str,
+        call_when: str | None = None,
     ) -> str:
+        call_when_text = call_when or (
+            "you need this capability for the current step. Do not merely describe using this tool; "
+            "call it when its output is needed to build or validate the plan."
+        )
         return (
             f"Purpose: {purpose}\n"
+            f"Call it when: {call_when_text}\n"
             f"Boundary: {boundary}\n"
             f"Required input: {required_input}\n"
             f"Output: {output}\n"
@@ -157,6 +206,192 @@ class ToolCatalog:
 
     def _build_contracts(self) -> dict[str, ToolContract]:
         return {
+            "query.context_rewrite": ToolContract(
+                name="query.context_rewrite",
+                description=self._tool_description(
+                    purpose=(
+                        "Rewrite an ambiguous follow-up or omitted-subject user question into a standalone "
+                        "data-analysis query using conversation summary and recent chat history."
+                    ),
+                    boundary=(
+                        "Planning-only text transformation. It does not retrieve schema, recall knowledge, "
+                        "draft SQL, or execute SQL."
+                    ),
+                    required_input=(
+                        "query is required. summary and history are optional; when omitted the tool reads "
+                        "workflow_state conversation context."
+                    ),
+                    output=(
+                        "An object with original_query, rewritten_query, summary_used, and history_count."
+                    ),
+                    negative=(
+                        "the query is already self-contained and there is no relevant conversation context, "
+                        "or you need business definitions rather than context resolution."
+                    ),
+                    call_when=(
+                        "the user says something like '去年亏损', '这个呢', or uses pronouns/omitted subjects. "
+                        "Call this tool instead of merely saying the query should be rewritten."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Latest user data-analysis question to rewrite.",
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Optional conversation or domain summary to use for context.",
+                        },
+                        "history": {
+                            "description": "Optional recent chat history as text or message objects.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "original_query": {
+                            "type": "string",
+                            "description": "Input query before context rewriting.",
+                        },
+                        "rewritten_query": {
+                            "type": "string",
+                            "description": "Standalone query suitable for recall, schema search, and planning.",
+                        },
+                        "summary_used": {
+                            "type": "boolean",
+                            "description": "Whether a non-empty summary was supplied to the rewrite provider.",
+                        },
+                        "history_count": {
+                            "type": "integer",
+                            "description": "Number of history messages used when history was a list.",
+                        },
+                    },
+                },
+            ),
+            "sql_examples.search": ToolContract(
+                name="sql_examples.search",
+                description=self._tool_description(
+                    purpose=(
+                        "Recall prior agent SQL examples, few-shot patterns, and successful query templates "
+                        "that can guide analysis-plan design."
+                    ),
+                    boundary=(
+                        "Read-only example recall. It returns examples and related metadata but does not draft, "
+                        "approve, or execute SQL."
+                    ),
+                    required_input=(
+                        "query is required and should be the rewritten or enhanced analytical question; top_k "
+                        "optionally limits returned examples."
+                    ),
+                    output=(
+                        "An object with results and few_shot_examples. Each result keeps content and metadata "
+                        "for traceability."
+                    ),
+                    negative=(
+                        "you need business metric definitions, actual rows, or already have enough examples in "
+                        "workflow_state."
+                    ),
+                    call_when=(
+                        "you need examples of similar SQL or decomposition patterns before submitting an "
+                        "analysis_plan. Call it; do not just mention example recall."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Current standalone analysis question.",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum number of example snippets to return.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Matched SQL/example snippets with content and metadata.",
+                        },
+                        "few_shot_examples": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Example texts extracted from results for prompt construction.",
+                        },
+                        **self._readthrough_output_properties(),
+                    },
+                },
+            ),
+            "query.enhance": ToolContract(
+                name="query.enhance",
+                description=self._tool_description(
+                    purpose=(
+                        "Enhance the standalone user query with recalled business evidence such as metric "
+                        "definitions, formulas, synonyms, and related table hints."
+                    ),
+                    boundary=(
+                        "Planning-only text enrichment. It uses supplied evidence or workflow_state evidence "
+                        "and never queries database rows or executes SQL."
+                    ),
+                    required_input=(
+                        "query is required. evidence is optional but should include business_knowledge.search "
+                        "results or evidence strings when available."
+                    ),
+                    output=(
+                        "An object with enhanced_query and evidence_used."
+                    ),
+                    negative=(
+                        "there is no business evidence to apply, or enhancement would add filters the user did "
+                        "not ask for."
+                    ),
+                    call_when=(
+                        "business_knowledge.search has returned definitions or formulas that should be reflected "
+                        "in downstream schema selection and planning."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Standalone analysis question to enrich.",
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "items": {},
+                            "description": "Business evidence strings or result objects to apply.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "enhanced_query": {
+                            "type": "string",
+                            "description": "Query after deterministic evidence-driven enrichment.",
+                        },
+                        "evidence_used": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Evidence strings considered by the enhancement logic.",
+                        },
+                    },
+                },
+            ),
             "semantic_model.search": ToolContract(
                 name="semantic_model.search",
                 description=self._tool_description(
@@ -362,6 +597,93 @@ class ToolCatalog:
                     },
                 },
             ),
+            "schema.select_candidates": ToolContract(
+                name="schema.select_candidates",
+                description=self._tool_description(
+                    purpose=(
+                        "Select likely physical tables for the analysis by scoring visible table metadata, "
+                        "semantic columns, and recalled evidence."
+                    ),
+                    boundary=(
+                        "Read-only deterministic planning helper. It filters by security context and returns "
+                        "candidate metadata; it does not call an LLM or execute SQL."
+                    ),
+                    required_input=(
+                        "query is required. candidate_tables, top_k, evidence, and few_shot_examples are optional "
+                        "signals for narrowing."
+                    ),
+                    output=(
+                        "An object with selected_tables, table_metadata, semantic_model, candidate_scores, and "
+                        "recall_context."
+                    ),
+                    negative=(
+                        "the final table set is already known with sufficient semantic_model, or you need rows "
+                        "rather than schema candidates."
+                    ),
+                    call_when=(
+                        "you have a rewritten/enhanced query and need a scoped table set before relationship "
+                        "lookup, feasibility assessment, or analysis_plan.submit."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Standalone or enhanced analysis question.",
+                        },
+                        "candidate_tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional authorized table names to score instead of all visible tables.",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Maximum number of selected tables to return.",
+                        },
+                        "evidence": {
+                            "type": "array",
+                            "items": {},
+                            "description": "Business evidence strings or objects with related table metadata.",
+                        },
+                        "few_shot_examples": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional few-shot examples whose SQL can hint related tables.",
+                        },
+                    },
+                    "required": ["query"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "selected_tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Ranked authorized candidate tables selected for planning.",
+                        },
+                        "table_metadata": {
+                            "type": "object",
+                            "description": "Table comments keyed by selected table name.",
+                        },
+                        "semantic_model": {
+                            "type": "object",
+                            "description": "Semantic metadata keyed by selected table and then column.",
+                        },
+                        "candidate_scores": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Scoring diagnostics for visible candidates.",
+                        },
+                        "recall_context": {
+                            "type": "object",
+                            "description": "Evidence-derived related tables and matched terms used for ranking.",
+                        },
+                    },
+                },
+            ),
             "schema.related_tables": ToolContract(
                 name="schema.related_tables",
                 description=self._tool_description(
@@ -405,6 +727,262 @@ class ToolCatalog:
                             "description": "Authorized relationship edges between requested visible tables.",
                         },
                         **self._readthrough_output_properties(),
+                    },
+                },
+            ),
+            "plan.assess_feasibility": ToolContract(
+                name="plan.assess_feasibility",
+                description=self._tool_description(
+                    purpose=(
+                        "Assess whether selected tables are suitable for single SQL, strict single SQL, "
+                        "multi-step analysis_plan, or clarification."
+                    ),
+                    boundary=(
+                        "Planning-only structural check over selected tables and relationships. It does not "
+                        "draft SQL, approve SQL, execute SQL, or create user-facing data facts."
+                    ),
+                    required_input=(
+                        "query and selected_tables are required. relationships and task_type are optional; "
+                        "missing relationships are loaded from read-only metadata."
+                    ),
+                    output=(
+                        "An object with feasibility_decision, relationships, selected_tables, and route_mode."
+                    ),
+                    negative=(
+                        "no candidate tables have been selected, or the plan has already been submitted and is "
+                        "waiting for SQL Harness."
+                    ),
+                    call_when=(
+                        "you need to decide whether to submit a single-step or multi-step analysis_plan after "
+                        "candidate table selection."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Standalone or enhanced analysis question.",
+                        },
+                        "selected_tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Authorized candidate tables being considered.",
+                        },
+                        "relationships": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Optional relationship edges among selected tables.",
+                        },
+                        "task_type": {
+                            "type": "string",
+                            "description": "Optional semantic task type such as analysis, report, comparison, detail, export, sensitive, or ambiguous.",
+                        },
+                    },
+                    "required": ["query", "selected_tables"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "feasibility_decision": {
+                            "type": "object",
+                            "description": "Execution-mode decision and structural risk fields.",
+                        },
+                        "relationships": {
+                            "type": "array",
+                            "items": {"type": "object"},
+                            "description": "Relationship edges used for the decision.",
+                        },
+                        "selected_tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Authorized tables considered by the decision.",
+                        },
+                        "route_mode": {
+                            "type": "string",
+                            "description": "Convenience copy of feasibility_decision.execution_mode.",
+                        },
+                    },
+                },
+            ),
+            "sql.normalize": ToolContract(
+                name="sql.normalize",
+                description=self._tool_description(
+                    purpose=(
+                        "Normalize and validate a draft SQL string with the same local format rules used by "
+                        "SQLReact before any Harness handoff."
+                    ),
+                    boundary=(
+                        "Local syntax/format validation only. It does not authorize, approve, execute, explain, "
+                        "or repair SQL."
+                    ),
+                    required_input=(
+                        "answer or sql is required and should contain a proposed SELECT/WITH SQL draft."
+                    ),
+                    output=(
+                        "An object with sql, is_valid, and error."
+                    ),
+                    negative=(
+                        "you need table authorization, safety risk analysis, execution, or final result rows."
+                    ),
+                    call_when=(
+                        "you have drafted SQL inside an analysis step and need to check whether it is formatted "
+                        "as a valid SELECT/WITH statement before submit."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "answer": {
+                            "type": "string",
+                            "description": "Raw model answer that may contain fenced SQL or prose.",
+                        },
+                        "sql": {
+                            "type": "string",
+                            "description": "Raw SQL draft to normalize when answer is not provided.",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "Normalized SQL candidate, possibly empty or invalid.",
+                        },
+                        "is_valid": {
+                            "type": "boolean",
+                            "description": "Whether the SQL passed local format validation.",
+                        },
+                        "error": {
+                            "type": "string",
+                            "description": "Validation error message, or empty string when valid.",
+                        },
+                    },
+                },
+            ),
+            "sql.safety_check": ToolContract(
+                name="sql.safety_check",
+                description=self._tool_description(
+                    purpose=(
+                        "Run local static SQL safety analysis for destructive or risky patterns before Harness "
+                        "handoff."
+                    ),
+                    boundary=(
+                        "Local static analysis only. It does not authorize tables, approve SQL, or execute SQL."
+                    ),
+                    required_input=(
+                        "sql is required and should be the normalized draft SQL."
+                    ),
+                    output=(
+                        "An object with is_safe, risks, estimated_rows, and required_permissions."
+                    ),
+                    negative=(
+                        "the SQL draft is missing, you need permission checks, or you expect query results."
+                    ),
+                    call_when=(
+                        "you have a SQL draft in an analysis_plan step and want to flag obvious risk before "
+                        "analysis_plan.submit."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "Draft SQL to inspect with static safety rules.",
+                        },
+                    },
+                    "required": ["sql"],
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "is_safe": {
+                            "type": "boolean",
+                            "description": "Whether the draft passed local static safety checks.",
+                        },
+                        "risks": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Detected safety risk descriptions.",
+                        },
+                        "estimated_rows": {
+                            "description": "Estimated row count when a simple LIMIT is detected, otherwise null.",
+                        },
+                        "required_permissions": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Permission hints implied by detected SQL patterns.",
+                        },
+                    },
+                },
+            ),
+            "sql.authorize_draft": ToolContract(
+                name="sql.authorize_draft",
+                description=self._tool_description(
+                    purpose=(
+                        "Check whether tables referenced by a draft SQL are visible under the current security "
+                        "context before SQL Harness approval."
+                    ),
+                    boundary=(
+                        "Authorization validation only. It never grants permissions, approves, executes, or "
+                        "returns database rows."
+                    ),
+                    required_input=(
+                        "sql is required unless tables is provided. tables may explicitly list referenced physical "
+                        "tables when SQL parsing is not enough."
+                    ),
+                    output=(
+                        "An object with tables, authorization_report, execution_mode=validation_only, and "
+                        "requires_harness=true."
+                    ),
+                    negative=(
+                        "you need SQL safety checks, approval, execution, or row-level/column masking results."
+                    ),
+                    call_when=(
+                        "you have a draft SQL or step table list and need to verify table permissions before "
+                        "analysis_plan.submit."
+                    ),
+                ),
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "sql": {
+                            "type": "string",
+                            "description": "Draft SQL whose referenced tables should be checked.",
+                        },
+                        "tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional explicit referenced table names.",
+                        },
+                    },
+                    "additionalProperties": False,
+                },
+                output_contract={
+                    "type": "object",
+                    "properties": {
+                        "tables": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Referenced tables checked under current security context.",
+                        },
+                        "authorization_report": {
+                            "type": "object",
+                            "description": "Permission decision from the platform authorization policy.",
+                        },
+                        "execution_mode": {
+                            "type": "string",
+                            "description": "Always validation_only because this tool does not execute SQL.",
+                        },
+                        "requires_harness": {
+                            "type": "boolean",
+                            "description": "Always true; SQL still requires SQL Harness approval/execution.",
+                        },
                     },
                 },
             ),
@@ -747,10 +1325,11 @@ class ToolCatalog:
 
         visible_tables = self._visible_tables_for_task(security_context)
         tools: list[RuntimeTool] = []
-        for tool_name in _TOOL_ORDER:
+        tool_order = _DATA_ANALYSIS_TOOL_ORDER if task_type == "data_analysis" else _TOOL_ORDER
+        for tool_name in tool_order:
             if tool_name not in allowed_names:
                 continue
-            if tool_name in {"semantic_model.search", "schema.describe_table", "schema.related_tables"}:
+            if tool_name in {"semantic_model.search", "schema.describe_table", "schema.select_candidates", "schema.related_tables"}:
                 if visible_tables is not None and not visible_tables:
                     continue
             tools.append(RuntimeTool(contract=self.get_contract(tool_name), task_types=(task_type,)))
@@ -855,6 +1434,9 @@ class ToolCatalog:
         context: SecurityContext,
         workflow_state: dict[str, Any],
     ) -> Any:
+        if tool_name == "query.context_rewrite":
+            return await self._rewrite_query_with_context(payload, workflow_state)
+
         if tool_name == "business_knowledge.search":
             query = str(payload.get("query", "")).strip()
             top_k = int(payload.get("top_k", 5) or 5)
@@ -871,6 +1453,35 @@ class ToolCatalog:
                     for doc in docs
                 ]
             }
+
+        if tool_name == "sql_examples.search":
+            query = str(payload.get("query", "")).strip()
+            if not query:
+                raise ValueError("query is required")
+            top_k = int(payload.get("top_k", 5) or 5)
+            cached = self._agent_knowledge_from_workflow_state(query, top_k, workflow_state)
+            if cached is not None:
+                return cached
+            docs = await self._call_provider(
+                self.providers.agent_knowledge_search,
+                query=query,
+                top_k=top_k,
+                callbacks=None,
+            )
+            results = [
+                {
+                    "content": doc.page_content,
+                    "metadata": dict(doc.metadata or {}),
+                }
+                for doc in docs
+            ]
+            return {
+                "results": results,
+                "few_shot_examples": [str(item["content"]) for item in results if str(item.get("content") or "").strip()],
+            }
+
+        if tool_name == "query.enhance":
+            return self._enhance_query_with_evidence(payload, workflow_state)
 
         if tool_name == "current_time.now":
             current = await self._call_provider(self.providers.time_provider)
@@ -905,6 +1516,9 @@ class ToolCatalog:
                 "table_comment": table_comment,
                 "columns": columns,
             }
+
+        if tool_name == "schema.select_candidates":
+            return await self._select_candidate_tables(payload, context, workflow_state)
 
         if tool_name == "semantic_model.search":
             requested = [str(item).strip() for item in payload.get("table_names", []) if str(item).strip()]
@@ -962,6 +1576,33 @@ class ToolCatalog:
             ]
             return {"relationships": filtered}
 
+        if tool_name == "plan.assess_feasibility":
+            return await self._assess_plan_feasibility(payload, context)
+
+        if tool_name == "sql.normalize":
+            raw_sql = str(payload.get("answer") or payload.get("sql") or "").strip()
+            sql, ok, error = normalize_sql_answer(raw_sql)
+            return {
+                "sql": sql,
+                "is_valid": ok,
+                "error": error or "",
+            }
+
+        if tool_name == "sql.safety_check":
+            sql = str(payload.get("sql") or "").strip()
+            if not sql:
+                raise ValueError("sql is required")
+            report = SQLSafetyChecker().check(sql)
+            return {
+                "is_safe": report.is_safe,
+                "risks": list(report.risks),
+                "estimated_rows": report.estimated_rows,
+                "required_permissions": list(report.required_permissions),
+            }
+
+        if tool_name == "sql.authorize_draft":
+            return self._authorize_sql_draft(payload, context, workflow_state)
+
         if tool_name == "artifact.read":
             return {
                 "artifacts": self._read_workflow_artifacts(payload, workflow_state),
@@ -979,10 +1620,236 @@ class ToolCatalog:
         raise KeyError(f"Unknown tool: {tool_name}")
 
     async def _call_provider(self, provider, *args, **kwargs):
-        result = provider(*args, **kwargs)
+        try:
+            result = provider(*args, **kwargs)
+        except TypeError:
+            filtered_kwargs = self._filter_provider_kwargs(provider, kwargs)
+            if filtered_kwargs == kwargs:
+                raise
+            result = provider(*args, **filtered_kwargs)
         if inspect.isawaitable(result):
             return await result
         return result
+
+    def _filter_provider_kwargs(self, provider, kwargs: dict[str, Any]) -> dict[str, Any]:
+        try:
+            signature = inspect.signature(provider)
+        except (TypeError, ValueError):
+            return kwargs
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return kwargs
+        allowed = set(signature.parameters)
+        return {key: value for key, value in kwargs.items() if key in allowed}
+
+    async def _rewrite_query_with_context(
+        self,
+        payload: dict[str, Any],
+        workflow_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = str(payload.get("query") or self._workflow_state_query(workflow_state)).strip()
+        if not query:
+            raise ValueError("query is required")
+        summary = str(
+            payload.get("summary")
+            or workflow_state.get("conversation_summary")
+            or workflow_state.get("summary")
+            or workflow_state.get("domain_summary")
+            or ""
+        )
+        history = payload.get("history")
+        if history is None:
+            history = workflow_state.get("chat_history", [])
+        rewritten = await self._call_provider(
+            self.providers.query_rewriter,
+            summary=summary,
+            history=history,
+            query=query,
+            config=None,
+        )
+        rewritten_query = str(rewritten or "").strip() or query
+        return {
+            "original_query": query,
+            "rewritten_query": rewritten_query,
+            "summary_used": bool(summary.strip()),
+            "history_count": len(history) if isinstance(history, list) else (1 if str(history or "").strip() else 0),
+        }
+
+    def _enhance_query_with_evidence(
+        self,
+        payload: dict[str, Any],
+        workflow_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = str(payload.get("query") or self._workflow_state_query(workflow_state)).strip()
+        if not query:
+            raise ValueError("query is required")
+        evidence = self._evidence_strings(payload.get("evidence"))
+        if not evidence:
+            evidence = self._evidence_strings(workflow_state.get("evidence"))
+        enhanced = query
+        additions: list[str] = []
+        for entry in self._parse_business_evidence(evidence):
+            term = str(entry.get("term") or "")
+            formula = str(entry.get("formula") or "")
+            aliases = [term, *[str(item) for item in entry.get("synonyms", [])]]
+            if not term:
+                continue
+            if any(alias and alias in query for alias in aliases):
+                addition = f"{term}: {formula}" if formula else term
+                if addition not in enhanced and (not formula or formula not in enhanced):
+                    additions.append(addition)
+        if additions:
+            enhanced = f"{enhanced}（业务口径: {'; '.join(additions)}）"
+        return {
+            "enhanced_query": enhanced,
+            "evidence_used": evidence,
+        }
+
+    async def _select_candidate_tables(
+        self,
+        payload: dict[str, Any],
+        context: SecurityContext,
+        workflow_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        query = str(payload.get("query") or self._workflow_state_query(workflow_state)).strip()
+        if not query:
+            raise ValueError("query is required")
+
+        metadata = await self._call_provider(self.providers.table_metadata_loader)
+        visible_rows = self._filter_table_metadata(metadata, context)
+        visible_names = [str(row.get("table_name") or "").strip() for row in visible_rows if str(row.get("table_name") or "").strip()]
+        requested = [str(item).strip() for item in payload.get("candidate_tables", []) if str(item).strip()]
+        if requested:
+            candidate_names = [table for table in self._filter_requested_tables(requested, context) if table in set(visible_names)]
+        else:
+            candidate_names = visible_names
+        if not candidate_names:
+            return {
+                "selected_tables": [],
+                "table_metadata": {},
+                "semantic_model": {},
+                "candidate_scores": [],
+                "recall_context": {},
+            }
+
+        table_metadata = {
+            str(row.get("table_name")): str(row.get("table_comment") or "")
+            for row in visible_rows
+            if str(row.get("table_name") or "") in set(candidate_names)
+        }
+        semantic_model = await self._call_provider(self.providers.semantic_model_loader, candidate_names)
+        evidence = self._evidence_strings(payload.get("evidence")) or self._evidence_strings(workflow_state.get("evidence"))
+        few_shot_examples = self._string_list(payload.get("few_shot_examples")) or self._string_list(workflow_state.get("few_shot_examples"))
+        recall_context = self._build_recall_context(query, evidence, few_shot_examples)
+        evidence_tables = [
+            table
+            for table in [
+                *recall_context.get("business_related_tables", []),
+                *recall_context.get("few_shot_related_tables", []),
+            ]
+            if table in set(candidate_names)
+        ]
+
+        scored = []
+        for index, table in enumerate(candidate_names):
+            score = self._table_semantic_score(table, query, table_metadata, semantic_model)
+            if table in evidence_tables:
+                score += 30.0
+            scored.append({"table": table, "score": score, "rank_input_order": index})
+        scored.sort(key=lambda item: (float(item["score"]), -int(item["rank_input_order"])), reverse=True)
+        top_k = int(payload.get("top_k", min(12, len(scored))) or min(12, len(scored)))
+        selected = [row["table"] for row in scored if float(row["score"]) > 0]
+        if not selected:
+            selected = [row["table"] for row in scored]
+        selected = self._unique_strings([*evidence_tables, *selected])[:top_k]
+        selected_model = {
+            table: semantic_model.get(table, {})
+            for table in selected
+            if isinstance(semantic_model, dict) and table in semantic_model
+        }
+        return {
+            "selected_tables": selected,
+            "table_metadata": {table: table_metadata.get(table, "") for table in selected},
+            "semantic_model": selected_model,
+            "candidate_scores": scored,
+            "recall_context": recall_context,
+        }
+
+    async def _assess_plan_feasibility(
+        self,
+        payload: dict[str, Any],
+        context: SecurityContext,
+    ) -> dict[str, Any]:
+        query = str(payload.get("query") or "").strip()
+        selected_tables = self._filter_requested_tables(
+            [str(item).strip() for item in payload.get("selected_tables", []) if str(item).strip()],
+            context,
+        )
+        if not query:
+            raise ValueError("query is required")
+        if not selected_tables:
+            raise ValueError("selected_tables is required")
+        relationships = payload.get("relationships")
+        if not isinstance(relationships, list):
+            relationships = await self._call_provider(self.providers.table_relationship_loader, selected_tables)
+        relationships = [
+            dict(row)
+            for row in relationships
+            if isinstance(row, dict)
+            and self._is_table_visible(str(row.get("from_table", "")), context)
+            and self._is_table_visible(str(row.get("to_table", "")), context)
+        ]
+        decision = assess_query_feasibility(
+            query=query,
+            selected_tables=selected_tables,
+            relationships=relationships,
+            task_type=str(payload.get("task_type") or "") or None,
+            decision_source="agentscope_tool",
+        )
+        feasibility_decision = {
+            "execution_mode": decision.execution_mode,
+            "task_type": decision.task_type,
+            "can_single_sql": decision.can_single_sql,
+            "can_decompose": decision.can_decompose,
+            "needs_clarification": decision.needs_clarification,
+            "join_risk": decision.join_risk,
+            "decision_source": decision.decision_source,
+            "reason": decision.reason,
+            "selected_tables_count": decision.selected_tables_count,
+            "relationship_count": decision.relationship_count,
+            "estimated_join_count": decision.estimated_join_count,
+        }
+        return {
+            "feasibility_decision": feasibility_decision,
+            "relationships": relationships,
+            "selected_tables": selected_tables,
+            "route_mode": decision.execution_mode,
+        }
+
+    def _authorize_sql_draft(
+        self,
+        payload: dict[str, Any],
+        context: SecurityContext,
+        workflow_state: dict[str, Any],
+    ) -> dict[str, Any]:
+        tables = [str(table).strip() for table in payload.get("tables", []) if str(table).strip()]
+        sql = str(payload.get("sql") or "").strip()
+        if not tables and sql:
+            tables = self._tables_from_sql(sql)
+        if not tables:
+            tables = self._workflow_selected_tables(workflow_state)
+        if not tables:
+            raise ValueError("sql or tables is required")
+        table_metadata = workflow_state.get("table_metadata")
+        auth_metadata = table_metadata if isinstance(table_metadata, dict) else None
+        report = authorize_tables(tables, context, table_metadata=auth_metadata, stage="sql.authorize_draft")
+        if not report.allowed:
+            raise PermissionError(report.message or "SQL draft references unauthorized tables")
+        return {
+            "tables": report.allowed_tables,
+            "authorization_report": report.to_dict(),
+            "execution_mode": "validation_only",
+            "requires_harness": True,
+        }
 
     def _workflow_query_matches(self, query: str, workflow_state: dict[str, Any]) -> bool:
         query = str(query or "").strip()
@@ -1019,6 +1886,39 @@ class ToolCatalog:
             for table in selected
             if str(table).strip()
         ]
+
+    def _agent_knowledge_from_workflow_state(
+        self,
+        query: str,
+        top_k: int,
+        workflow_state: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        examples = workflow_state.get("few_shot_examples")
+        if not query or not isinstance(examples, list) or not examples:
+            return None
+        if not self._workflow_query_matches(query, workflow_state):
+            reused_from = self._workflow_evidence_can_answer_subquery(query, workflow_state)
+            if not reused_from:
+                return None
+        rows = [str(item).strip() for item in examples if str(item).strip()]
+        if not rows:
+            return None
+        return {
+            "results": [
+                {
+                    "content": row,
+                    "metadata": {
+                        "source": "workflow_state",
+                        "score": 1.0,
+                        "retriever_source": "workflow_state",
+                    },
+                }
+                for row in rows[:top_k]
+            ],
+            "few_shot_examples": rows[:top_k],
+            "source": "workflow_state",
+            "cache_hit": True,
+        }
 
     def _workflow_evidence_can_answer_subquery(
         self,
@@ -1374,6 +2274,188 @@ class ToolCatalog:
                 continue
             seen.add(row)
             deduped.append(row)
+        return deduped
+
+    def _string_list(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item).strip()]
+
+    def _evidence_strings(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        rows: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                text = item.strip()
+            elif isinstance(item, dict):
+                text = str(item.get("content") or item.get("text") or "").strip()
+            else:
+                text = str(item).strip()
+            if text:
+                rows.append(text)
+        return rows
+
+    def _label_value(self, line: str, labels: tuple[str, ...]) -> str | None:
+        for label in labels:
+            for sep in (":", "："):
+                prefix = f"{label}{sep}"
+                if line.startswith(prefix):
+                    return line[len(prefix):].strip()
+        return None
+
+    def _split_terms(self, value: str) -> list[str]:
+        normalized = value.replace("，", ",").replace("、", ",").replace("；", ",").replace(";", ",")
+        return [item.strip() for item in normalized.split(",") if item.strip()]
+
+    def _parse_business_evidence(self, evidence: list[str]) -> list[dict[str, Any]]:
+        entries = []
+        for item in evidence:
+            entry: dict[str, Any] = {
+                "term": "",
+                "formula": "",
+                "synonyms": [],
+                "related_tables": [],
+            }
+            for line in item.splitlines():
+                line = line.strip()
+                term = self._label_value(line, ("术语",))
+                formula = self._label_value(line, ("公式", "定义"))
+                synonyms = self._label_value(line, ("同义词",))
+                related_tables = self._label_value(line, ("关联表",))
+                if term is not None:
+                    entry["term"] = term
+                elif formula is not None:
+                    entry["formula"] = formula
+                elif synonyms is not None:
+                    entry["synonyms"] = self._split_terms(synonyms)
+                elif related_tables is not None:
+                    entry["related_tables"] = self._split_terms(related_tables)
+            if entry.get("term"):
+                entries.append(entry)
+        return entries
+
+    def _build_recall_context(
+        self,
+        query: str,
+        evidence: list[str],
+        few_shot_examples: list[str],
+    ) -> dict[str, Any]:
+        matched_terms: list[str] = []
+        business_related_tables: list[str] = []
+        evidence_related_tables: list[str] = []
+        for item in evidence:
+            evidence_related_tables.extend(self._extract_candidate_tables(item, []))
+        for entry in self._parse_business_evidence(evidence):
+            if not self._business_entry_matches_query(entry, query):
+                continue
+            term = str(entry.get("term") or "")
+            if term:
+                matched_terms.append(term)
+            business_related_tables.extend(str(table) for table in entry.get("related_tables", []) if str(table))
+        return {
+            "query_key": query,
+            "business_evidence": evidence,
+            "few_shot_examples": few_shot_examples,
+            "business_related_tables": self._unique_strings([*business_related_tables, *evidence_related_tables]),
+            "few_shot_related_tables": self._tables_from_few_shot_examples(few_shot_examples),
+            "matched_terms": self._unique_strings(matched_terms),
+        }
+
+    def _business_entry_matches_query(self, entry: dict[str, Any], query: str) -> bool:
+        aliases = [str(entry.get("term") or ""), *[str(item) for item in entry.get("synonyms", [])]]
+        if any(alias and alias in query for alias in aliases):
+            return True
+        profile = "\n".join(
+            [
+                str(entry.get("term") or ""),
+                str(entry.get("formula") or ""),
+                ",".join(str(item) for item in entry.get("synonyms", [])),
+            ]
+        )
+        query_terms = {term for term in self._ranking_terms(query) if len(term) >= 2}
+        profile_terms = {term for term in self._ranking_terms(profile) if len(term) >= 2}
+        return bool(query_terms & profile_terms)
+
+    def _tables_from_few_shot_examples(self, few_shot_examples: list[str]) -> list[str]:
+        tables: list[str] = []
+        for item in few_shot_examples:
+            tables.extend(self._tables_from_sql(item))
+        return self._unique_strings(tables)
+
+    def _tables_from_sql(self, sql: str) -> list[str]:
+        return self._unique_strings([table for table in _SQL_TABLE_RE.findall(sql or "") if table])
+
+    def _ranking_terms(self, text: str) -> set[str]:
+        normalized = str(text or "").lower()
+        terms = set(re.findall(r"[a-z0-9_]+", normalized))
+        terms.update(ch for ch in normalized if "\u4e00" <= ch <= "\u9fff")
+        for size in (2, 3, 4):
+            for index in range(0, max(0, len(normalized) - size + 1)):
+                chunk = normalized[index : index + size]
+                if any("\u4e00" <= ch <= "\u9fff" for ch in chunk):
+                    terms.add(chunk)
+        return terms
+
+    def _table_semantic_text(
+        self,
+        table: str,
+        table_metadata: dict[str, str],
+        semantic_model: dict[str, Any],
+    ) -> str:
+        parts = [table, table_metadata.get(table, "")]
+        columns = semantic_model.get(table) if isinstance(semantic_model, dict) else {}
+        if isinstance(columns, dict):
+            for column_name, meta in columns.items():
+                parts.append(str(column_name))
+                if isinstance(meta, dict):
+                    parts.extend(
+                        [
+                            str(meta.get("column_comment") or ""),
+                            str(meta.get("business_name") or ""),
+                            str(meta.get("synonyms") or ""),
+                            str(meta.get("business_description") or ""),
+                        ]
+                    )
+        return "\n".join(part for part in parts if part)
+
+    def _table_semantic_score(
+        self,
+        table: str,
+        query: str,
+        table_metadata: dict[str, str],
+        semantic_model: dict[str, Any],
+    ) -> float:
+        query_terms = self._ranking_terms(query)
+        if not query_terms:
+            return 0.0
+        table_terms = self._ranking_terms(self._table_semantic_text(table, table_metadata, semantic_model))
+        overlap = query_terms & table_terms
+        score = sum(max(1, len(term)) for term in overlap)
+        columns = semantic_model.get(table) if isinstance(semantic_model, dict) else {}
+        if isinstance(columns, dict):
+            for meta in columns.values():
+                if not isinstance(meta, dict):
+                    continue
+                phrases = [
+                    str(meta.get("business_name") or ""),
+                    str(meta.get("column_comment") or ""),
+                    *self._split_terms(str(meta.get("synonyms") or "")),
+                ]
+                for phrase in phrases:
+                    if phrase and phrase in query:
+                        score += 6 + min(len(phrase), 8)
+        return float(score)
+
+    def _unique_strings(self, rows: list[str]) -> list[str]:
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            value = str(row).strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            deduped.append(value)
         return deduped
 
     def _submit_sql_draft(

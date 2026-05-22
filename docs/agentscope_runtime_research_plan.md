@@ -1,5 +1,7 @@
 # AgentScope Runtime 调研与迭代计划
 
+> 当前实现状态（2026-05-21）：`data` 主路由已前置到 AgentScope data planner，AgentScope 负责提交结构化 `analysis_plan`，SQL Harness 继续负责计划校验、安全、权限、人工审批、执行、审计和评测。本文保留为历史调研和迭代背景；最新架构图与请求生命周期以 [current_architecture.md](current_architecture.md) 为准。
+
 本文沉淀 Financial Copilot Platform 是否以及如何引入 AgentScope 的调研结论。目标不是把现有 SQL React 主链路整体替换为自由 ReAct Agent，而是在保留企业级 NL2SQL harness 的前提下，引入可控的 agentic analysis 能力。
 
 Phase 0 只做文档边界确认和 README 定位同步，不修改 `dispatcher`、`sql_react`、API 路由或 SQL 执行代码。后续 Phase 1 起才进入 ToolCatalog、AgentScopeRuntime 等运行时开发。

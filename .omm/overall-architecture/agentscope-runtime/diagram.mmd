@@ -1,0 +1,16 @@
+graph TD
+    runtime["AgentScopeRuntime\nagents/runtime/agentscope_runtime.py"]
+    adapter["AgentScope Adapter\nagents/runtime/agentscope_adapter.py"]
+    skill-registry["Skill Registry\nagents/runtime/skill_registry.py"]
+    tool-contracts["Tool Contracts\nagents/runtime/tool_contracts.py"]
+    result-object["AgentRunResult\nagents/runtime/result.py"]
+    shadow-benchmark["Shadow Benchmark\nagents/runtime/shadow_benchmark.py"]
+    tool-catalog["ToolCatalog\nagents/runtime/tool_catalog.py"]
+
+    runtime -->|"chooses runner backend"| adapter
+    runtime -->|"adds task and skill prompt"| skill-registry
+    runtime -->|"enforces allowed tools"| tool-contracts
+    runtime -->|"invokes tools"| tool-catalog
+    adapter -->|"returns structured run output"| result-object
+    runtime -->|"normalizes answer and state_patch"| result-object
+    shadow-benchmark -->|"offline compares runtime modes"| result-object

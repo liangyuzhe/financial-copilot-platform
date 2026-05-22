@@ -1,0 +1,9 @@
+created: 2026-05-21T10:17:40.301Z
+updated: 2026-05-21T10:17:40.301Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: human-approval
+children: []
+parentPath:
+  - sql-harness

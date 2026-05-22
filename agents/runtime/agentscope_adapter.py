@@ -108,10 +108,7 @@ class AgentScopePackageRunner:
             },
         )
         try:
-            if context.task_type == "data_analysis":
-                reply = await agent(input_msg, structured_model=_DataAnalysisPlanOutput)
-            else:
-                reply = await agent(input_msg)
+            reply = await self._call_agent(agent, input_msg, context)
         except Exception as exc:
             await context.end_llm_span(llm_span, llm_span_name, "", str(exc))
             return self._adapter_error_result(exc)
@@ -125,13 +122,58 @@ class AgentScopePackageRunner:
             await self._submit_structured_analysis_plan(result, context)
         return result
 
+    async def _call_agent(
+        self,
+        agent: Any,
+        input_msg: Msg,
+        context: AgentScopeRunContext,
+    ) -> Msg:
+        reply = await agent(input_msg)
+        if context.task_type != "data_analysis" or not self._data_analysis_needs_evidence_retry(reply, context):
+            return reply
+        retry_msg = Msg(
+            name="user",
+            role="user",
+            content=self._build_evidence_retry_message(context),
+        )
+        return await agent(retry_msg)
+
+    def _data_analysis_needs_evidence_retry(
+        self,
+        reply: Msg,
+        context: AgentScopeRunContext,
+    ) -> bool:
+        if context.tool_trace:
+            return False
+        result = self._convert_reply(reply, context=None)
+        plan = result.state_patch.get("analysis_plan")
+        if isinstance(plan, dict) and plan.get("steps"):
+            return False
+        return True
+
+    def _build_evidence_retry_message(self, context: AgentScopeRunContext) -> str:
+        return (
+            f"用户问题: {context.query}\n\n"
+            "上一轮没有任何 ToolCatalog 工具调用，也没有提交可执行 analysis_plan。"
+            "这不满足 data_analysis_agent 的证据门槛。\n"
+            "请保留自主决策，但必须先实际调用至少一个与你判断相关的工具，例如 "
+            "query_context_rewrite、business_knowledge_search、sql_examples_search、"
+            "schema_list_tables、schema_select_candidates、semantic_model_search、"
+            "schema_related_tables、plan_assess_feasibility 或 current_time_now。"
+            "不要只描述应该调用工具。\n"
+            "取得证据后，如果足以规划，调用 analysis_plan_submit 提交 mode=analysis_plan 且 steps 非空的计划；"
+            "如果仍需澄清，请基于已调用工具的证据提出澄清问题。"
+        )
+
     def _build_initial_user_message(self, context: AgentScopeRunContext) -> str:
         if context.task_type == "data_analysis":
             tool_names = self._tool_name_instruction(context)
             return (
                 f"用户问题: {context.query}\n\n"
-                "你现在是数据分析规划 Agent。请先自主决定是否需要业务知识、schema、semantic model、表关系或澄清，"
-                "再提交 analysis_plan。\n"
+                "你现在是数据分析规划 Agent。请自主决定是否需要 context rewrite、业务知识、SQL 示例、query enhance、"
+                "schema、semantic model、候选表选择、表关系、可行性评估、当前时间或 SQL 本地校验，然后提交 analysis_plan。\n"
+                "不要只描述要调用哪些工具；当工具输出是规划所需证据时必须实际调用工具。\n"
+                "analysis_plan 必须包含 mode=analysis_plan 和非空 steps；如果无法规划，只返回澄清问题。\n"
                 f"{tool_names}"
             )
         return context.query
@@ -148,7 +190,7 @@ class AgentScopePackageRunner:
             "可用函数名：" + ", ".join(visible_names),
         ]
         if "analysis_plan_submit" in visible_names:
-            lines.append("完成规划后必须调用 analysis_plan_submit 提交结构化 analysis_plan。")
+            lines.append("完成规划后必须调用 analysis_plan_submit 提交结构化且 steps 非空的 analysis_plan。")
         return "\n".join(lines)
 
     def _workflow_context_packet(self, context: AgentScopeRunContext) -> str:
@@ -202,13 +244,60 @@ class AgentScopePackageRunner:
         model = self._build_model()
         formatter = self._build_formatter()
         factory = self.agent_factory or ReActAgent
-        return factory(
+        agent = factory(
             name=self._agent_name_for_task(context.task_type),
             sys_prompt=self._system_prompt_for_agent(context),
             model=model,
             formatter=formatter,
             toolkit=toolkit,
             max_iters=self.max_iters,
+        )
+        if context.task_type == "data_analysis":
+            self._guard_structured_finish_until_tool_evidence(agent, context)
+        return agent
+
+    def _guard_structured_finish_until_tool_evidence(
+        self,
+        agent: Any,
+        context: AgentScopeRunContext,
+    ) -> None:
+        finish_name = getattr(agent, "finish_function_name", "generate_response")
+        original = getattr(agent, finish_name, None)
+        if not callable(original):
+            return
+
+        def _guarded_finish(**kwargs: Any) -> ToolResponse:
+            if not self._has_successful_toolcatalog_evidence(context):
+                return ToolResponse(
+                    content=[
+                        TextBlock(
+                            type="text",
+                            text=(
+                                "ToolCatalog evidence is required before structured output. "
+                                "Call at least one available planning tool such as current_time_now, "
+                                "business_knowledge_search, schema_list_tables, schema_select_candidates, "
+                                "semantic_model_search, schema_related_tables, or plan_assess_feasibility, "
+                                "then call generate_response or analysis_plan_submit."
+                            ),
+                        )
+                    ],
+                    metadata={
+                        "success": False,
+                        "structured_output": {},
+                        "error": "missing_toolcatalog_evidence",
+                    },
+                )
+            return original(**kwargs)
+
+        _guarded_finish.__name__ = str(finish_name)
+        _guarded_finish.__doc__ = getattr(original, "__doc__", None)
+        setattr(agent, finish_name, _guarded_finish)
+
+    def _has_successful_toolcatalog_evidence(self, context: AgentScopeRunContext) -> bool:
+        return any(
+            trace.get("status") == "success"
+            and trace.get("tool_name") not in {"analysis_plan.submit", "sql_draft.submit"}
+            for trace in context.tool_trace
         )
 
     def _system_prompt_for_agent(self, context: AgentScopeRunContext) -> str:

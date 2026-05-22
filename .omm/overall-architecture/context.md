@@ -1,0 +1,1 @@
+The previous primary NL2SQL description routed data queries directly into the full SQLReact graph. The current implementation routes data queries through AgentScopeRuntime first, but AgentScope remains a planner only. SQL execution authority stays inside the existing SQL Harness.

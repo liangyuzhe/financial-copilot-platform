@@ -1,0 +1,21 @@
+created: 2026-05-21T10:19:02.936Z
+updated: 2026-05-21T10:19:57.543Z
+update_count: 6
+last_field: note
+git_commit: 691bde5
+git_branch: feature/agentscope-data-planner
+children:
+  - agent-planner
+  - analysis-plan
+  - approve-plan
+  - classify
+  - final-answer
+  - invoke
+  - load-context
+  - mysql
+  - pending
+  - resume
+  - route
+  - sql-harness
+  - tool-catalog
+  - user

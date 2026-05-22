@@ -1,0 +1,9 @@
+created: 2026-05-21T10:16:45.306Z
+updated: 2026-05-21T10:16:45.307Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: related-tables
+children: []
+parentPath:
+  - tool-catalog

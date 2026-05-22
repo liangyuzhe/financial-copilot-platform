@@ -1,0 +1,9 @@
+created: 2026-05-21T10:15:45.843Z
+updated: 2026-05-21T10:15:45.843Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: tool-contracts
+children: []
+parentPath:
+  - agentscope-runtime

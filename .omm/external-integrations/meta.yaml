@@ -1,0 +1,36 @@
+created: 2026-05-21T10:21:45.687Z
+updated: 2026-05-21T10:24:19.432Z
+update_count: 7
+last_field: diagram
+git_commit: 691bde5
+git_branch: feature/agentscope-data-planner
+children:
+  - agentscope
+  - app
+  - es
+  - llm
+  - mcp
+  - milvus
+  - mysql
+  - redis
+  - traces
+prev_diagram: |
+  graph LR
+      app["Financial Copilot Platform"]
+      llm["LLM Providers\nArk / OpenAI / DeepSeek / Qwen / Gemini"]
+      redis["Redis\ncache, checkpoint, session"]
+      mysql["MySQL\nsemantic model, rules, business data"]
+      milvus["Milvus\nvector knowledge base"]
+      es["Elasticsearch\nBM25 index"]
+      mcp["MCP MySQL Server"]
+      traces["LangSmith / CozeLoop"]
+      agentscope["AgentScope package\noptional real backend"]
+
+      app -->|"model calls"| llm
+      app -->|"session and checkpoints"| redis
+      app -->|"semantic model and rules"| mysql
+      app -->|"vector retrieval"| milvus
+      app -->|"keyword retrieval"| es
+      app -->|"approved SQL execution"| mcp
+      app -->|"runtime and tool tracing"| traces
+      app -->|"optional planner backend"| agentscope

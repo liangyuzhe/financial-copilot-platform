@@ -1,0 +1,1 @@
+End-to-end lifecycle for the current main data request path. A data query enters /api/query/invoke, gets routed by Final Graph, is planned by AgentScope, pauses for complex-plan approval, resumes through /api/query/approve, and is executed by SQL Harness.

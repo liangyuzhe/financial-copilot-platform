@@ -1,0 +1,1 @@
+Enterprise SQL control plane in agents/flow/sql_react.py. It owns SQL retrieval, generation, safety checks, authorization, human approval, execution, repair, reflection, local merge/report steps, audit, and user-facing formatting.

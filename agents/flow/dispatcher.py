@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
@@ -45,6 +46,11 @@ _CLASSIFY_SYSTEM_PROMPT = """你是一个路由分类器，同时完成两个任
 
 请只返回 JSON，不要输出其他内容：
 {{"route": "data|chat|clarify", "rewritten_query": "...", "confidence": 0.0, "reason": "..."}}"""
+
+
+def _agentscope_data_planner_fallback_enabled() -> bool:
+    value = os.getenv("AGENTSCOPE_DATA_PLANNER_FALLBACK", "").strip().lower()
+    return value in {"1", "true", "yes", "on", "local", "local_compatible"}
 
 
 def _normalize_route(value: str) -> str:
@@ -303,6 +309,21 @@ async def agentscope_data_planner(state: FinalGraphState, config=None) -> dict:
     presentation = result.state_patch.get("presentation", {})
     analysis_plan = result.state_patch.get("analysis_plan", {})
     if not (isinstance(analysis_plan, dict) and analysis_plan.get("steps")):
+        if _agentscope_result_is_clarification(result):
+            logger.info(
+                "agentscope_data_planner returned clarification without analysis_plan: backend=%s answer=%s",
+                observation["backend"],
+                result.answer[:500],
+            )
+            questions = _agentscope_clarification_questions(result)
+            return {
+                "answer": result.answer or "\n".join(questions) or "请补充查询对象、时间范围或口径后再问。",
+                "status": "clarify",
+                "analysis_plan": {},
+                "clarification_questions": questions,
+                "agentscope_result": result.to_dict(),
+                "agentscope_observation": observation,
+            }
         logger.error(
             "agentscope_data_planner returned no analysis_plan: backend=%s risks=%s answer=%s",
             observation["backend"],
@@ -342,6 +363,27 @@ async def agentscope_data_planner(state: FinalGraphState, config=None) -> dict:
     }
 
 
+def _agentscope_clarification_questions(result: AgentRunResult) -> list[str]:
+    if result.clarification_questions:
+        return [str(item) for item in result.clarification_questions if str(item).strip()]
+    answer = str(result.answer or "")
+    lines = []
+    for line in answer.splitlines():
+        stripped = line.strip(" -0123456789.、\t")
+        if stripped.endswith(("？", "?")) and stripped:
+            lines.append(stripped)
+    return lines[:5]
+
+
+def _agentscope_result_is_clarification(result: AgentRunResult) -> bool:
+    if any(str(flag.get("severity", "")).lower() == "error" for flag in result.risk_flags):
+        return False
+    if _agentscope_clarification_questions(result):
+        return True
+    answer = str(result.answer or "")
+    return any(marker in answer for marker in ("请说明", "请补充", "请明确", "需要澄清", "澄清以下"))
+
+
 async def _ensure_agentscope_analysis_plan(
     result: AgentRunResult,
     state: FinalGraphState,
@@ -364,6 +406,16 @@ async def _ensure_agentscope_analysis_plan(
         original_observation["risk_flags"],
         result.answer[:500],
     )
+
+    if not _agentscope_data_planner_fallback_enabled():
+        original_observation.update(
+            {
+                "fallback_disabled": True,
+                "fallback_reason": "missing_analysis_plan",
+                "no_evidence_tool_calls": len(result.tool_trace) == 0,
+            }
+        )
+        return result, original_observation
 
     fallback_runtime = AgentScopeRuntime(
         runner=LocalAgentScopeCompatibleRunner(),

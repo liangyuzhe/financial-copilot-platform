@@ -1,0 +1,1 @@
+The main risk is architectural drift between README-level descriptions, historical AgentScope research notes, and the implemented Final Graph handoff. Keep this perspective synchronized when data-routing behavior changes.

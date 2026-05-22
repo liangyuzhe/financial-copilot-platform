@@ -1,0 +1,1 @@
+Current architecture for the Financial Copilot Platform as of 2026-05-21. Data requests enter the Final Graph, use AgentScope as the primary data-analysis planner, and hand structured analysis plans back to the SQL Harness for validation, permission checks, human approval, execution, repair, audit, and result formatting.

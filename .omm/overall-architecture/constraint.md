@@ -1,0 +1,1 @@
+AgentScope cannot execute SQL or produce execution facts. Every submitted analysis_plan must be converted into a validated complex plan and pass SQL Harness controls before any database query is executed.

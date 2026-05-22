@@ -1,0 +1,1 @@
+LangGraph dispatcher in agents/flow/dispatcher.py. It classifies each request, routes data requests into AgentScope data planning, routes chat requests into RAG chat, asks clarification when needed, and hands approved analysis plans to the SQL Harness.

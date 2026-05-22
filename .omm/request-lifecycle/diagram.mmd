@@ -1,0 +1,32 @@
+graph TD
+    user["User\nWeb UI"]
+    invoke["POST /api/query/invoke\nagents/api/routers/query.py"]
+    load-context["Load context\nsession + security + trace"]
+    classify["classify_intent\nroute + rewrite"]
+    route{route}
+    agent-planner["agentscope_data_planner\nAgentScopeRuntime(data_analysis)"]
+    tool-catalog["ToolCatalog\nread-only evidence"]
+    analysis-plan["analysis_plan\nplan-only output"]
+    approve-plan["approve_analysis_plan\nvalidate + authorize"]
+    pending["Pending approval\ninterrupt response"]
+    resume["POST /api/query/approve\nresume command"]
+    sql-harness["SQL Harness\nexecute_analysis_plan"]
+    mysql["MCP MySQL\napproved SQL execution"]
+    final-answer["Final answer\nanswer + sql + summary"]
+
+    user -->|"sends request"| invoke
+    invoke -->|"loads state"| load-context
+    load-context -->|"runs graph"| classify
+    classify -->|"normalized route"| route
+    route -->|"data"| agent-planner
+    route -->|"chat"| final-answer
+    route -->|"clarify"| final-answer
+    agent-planner -->|"evidence lookup"| tool-catalog
+    tool-catalog -->|"returns findings"| analysis-plan
+    analysis-plan -->|"handoff"| approve-plan
+    approve-plan -->|"needs approval"| pending
+    pending -->|"user confirms"| resume
+    resume -->|"resume graph"| sql-harness
+    sql-harness -->|"approved SQL"| mysql
+    mysql -->|"rows or errors"| final-answer
+    approve-plan -->|"approved and safe"| sql-harness

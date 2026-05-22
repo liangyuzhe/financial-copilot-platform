@@ -1,0 +1,1 @@
+The data route may use LLMs for routing, planning, SQL generation, and reflection, but execution still flows through MCP MySQL after harness approval. Retrieval uses MySQL, Milvus, and Elasticsearch depending on the evidence type.

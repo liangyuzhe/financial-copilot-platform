@@ -1,0 +1,9 @@
+created: 2026-05-21T10:18:02.457Z
+updated: 2026-05-21T10:18:02.457Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: sql-generation
+children: []
+parentPath:
+  - sql-harness

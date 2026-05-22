@@ -1,0 +1,15 @@
+created: 2026-05-21T10:12:23.720Z
+updated: 2026-05-21T10:12:34.294Z
+update_count: 2
+last_field: diagram
+kind: nested-class
+title: api-layer
+children:
+  - admin-router
+  - agentscope-router
+  - app
+  - eval-router
+  - query-router
+  - rag-router
+  - sse
+parentPath: []

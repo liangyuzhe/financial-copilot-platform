@@ -178,50 +178,31 @@ async def test_dispatcher_forwards_langsmith_callbacks_to_agentscope_runtime():
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_does_not_surface_agentscope_unstructured_failure_as_chat_answer():
-    """If AgentScope returns no plan, data route should fall back instead of showing ReAct chatter."""
+async def test_dispatcher_does_not_fallback_to_local_compatible_by_default_when_agentscope_returns_no_plan(monkeypatch):
+    """If AgentScope returns no plan, default data route should surface a planner error diagnostic."""
     from agents.flow.dispatcher import agentscope_data_planner
     from agents.runtime.result import AgentRunResult
 
+    monkeypatch.delenv("AGENTSCOPE_DATA_PLANNER_FALLBACK", raising=False)
     _RecordingAgentScopeRuntime.calls = []
-    results = [
-        AgentRunResult(
-            answer=(
-                "I encountered tool execution delays and errors during attempts to retrieve necessary information. "
-                "I was unable to retrieve these details within the maximum allowed iterations."
-            ),
-            state_patch={"agentscope_backend": "agentscope"},
-            risk_flags=[
-                {
-                    "code": "agentscope_no_handoff",
-                    "severity": "error",
-                    "message": "AgentScope did not submit analysis_plan.",
-                }
-            ],
+    _RecordingAgentScopeRuntime.result = AgentRunResult(
+        answer=(
+            "I encountered tool execution delays and errors during attempts to retrieve necessary information. "
+            "I was unable to retrieve these details within the maximum allowed iterations."
         ),
-        AgentRunResult(
-            answer="fallback plan ready",
-            state_patch={
-                "agentscope_backend": "local_compatible",
-                "analysis_plan": {
-                    "mode": "analysis_plan",
-                    "steps": [
-                        {"step": 1, "type": "sql", "goal": "fallback", "tables": ["t_orders"]}
-                    ],
-                },
-                "requires_harness": True,
-            },
-        ),
-    ]
-
-    class FallbackRecordingRuntime(_RecordingAgentScopeRuntime):
-        async def run(self, **kwargs):
-            self.__class__.calls.append(kwargs)
-            return results.pop(0)
+        state_patch={"agentscope_backend": "agentscope"},
+        risk_flags=[
+            {
+                "code": "agentscope_no_handoff",
+                "severity": "error",
+                "message": "AgentScope did not submit analysis_plan.",
+            }
+        ],
+    )
 
     with (
-        patch("agents.flow.dispatcher.AgentScopeRuntime", FallbackRecordingRuntime),
-        patch("agents.flow.dispatcher.create_agentscope_runner", side_effect=[object(), None]),
+        patch("agents.flow.dispatcher.AgentScopeRuntime", _RecordingAgentScopeRuntime),
+        patch("agents.flow.dispatcher.create_agentscope_runner", return_value=object()),
     ):
         result = await agentscope_data_planner({
             "query": "收入成本预算回款费用之间的关系",
@@ -231,19 +212,65 @@ async def test_dispatcher_does_not_surface_agentscope_unstructured_failure_as_ch
         })
 
     _RecordingAgentScopeRuntime.result = None
-    assert result["status"] == "needs_harness"
-    assert result["analysis_plan"]["steps"][0]["goal"] == "fallback"
+    assert result["status"] == "error"
+    assert result["analysis_plan"] == {}
+    assert len(_RecordingAgentScopeRuntime.calls) == 1
     assert "I encountered tool execution delays" not in result["answer"]
-    assert result["agentscope_observation"]["backend"] == "local_compatible"
-    assert result["agentscope_observation"]["fallback_from_backend"] == "agentscope"
+    assert result["agentscope_observation"]["backend"] == "agentscope"
+    assert result["agentscope_observation"]["fallback_disabled"] is True
+    assert result["agentscope_observation"]["fallback_reason"] == "missing_analysis_plan"
     assert result["agentscope_observation"]["risk_flags"][0]["code"] == "agentscope_no_handoff"
 
 
 @pytest.mark.asyncio
-async def test_dispatcher_traces_agentscope_primary_and_fallback_runtime_calls():
+async def test_dispatcher_returns_clarify_when_agentscope_collected_evidence_but_needs_more_input(monkeypatch):
     from agents.flow.dispatcher import agentscope_data_planner
     from agents.runtime.result import AgentRunResult
 
+    monkeypatch.delenv("AGENTSCOPE_DATA_PLANNER_FALLBACK", raising=False)
+    _RecordingAgentScopeRuntime.calls = []
+    _RecordingAgentScopeRuntime.result = AgentRunResult(
+        answer="请说明亏损主体和净利润口径。",
+        tool_trace=[
+            {"tool_name": "business_knowledge.search", "status": "success"},
+            {"tool_name": "schema.list_tables", "status": "success"},
+        ],
+        clarification_questions=[
+            "请说明亏损主体是公司整体、部门还是项目？",
+            "亏损是否按净利润 < 0 计算？",
+        ],
+        state_patch={"agentscope_backend": "agentscope"},
+    )
+
+    with (
+        patch("agents.flow.dispatcher.AgentScopeRuntime", _RecordingAgentScopeRuntime),
+        patch("agents.flow.dispatcher.create_agentscope_runner", return_value=object()),
+    ):
+        result = await agentscope_data_planner({
+            "query": "去年亏损",
+            "session_id": "clarify-session",
+            "rewritten_query": "去年亏损",
+            "chat_history": [],
+        })
+
+    _RecordingAgentScopeRuntime.result = None
+    assert result["status"] == "clarify"
+    assert result["analysis_plan"] == {}
+    assert result["answer"] == "请说明亏损主体和净利润口径。"
+    assert result["clarification_questions"] == [
+        "请说明亏损主体是公司整体、部门还是项目？",
+        "亏损是否按净利润 < 0 计算？",
+    ]
+    assert result["agentscope_observation"]["fallback_disabled"] is True
+    assert result["agentscope_observation"]["tool_trace_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_traces_agentscope_primary_and_fallback_runtime_calls_when_enabled(monkeypatch):
+    from agents.flow.dispatcher import agentscope_data_planner
+    from agents.runtime.result import AgentRunResult
+
+    monkeypatch.setenv("AGENTSCOPE_DATA_PLANNER_FALLBACK", "local_compatible")
     traced_names = []
     results = [
         AgentRunResult(

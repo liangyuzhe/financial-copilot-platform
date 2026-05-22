@@ -1,0 +1,9 @@
+created: 2026-05-21T10:12:59.317Z
+updated: 2026-05-21T10:12:59.317Z
+update_count: 1
+last_field: description
+kind: nested-class
+title: rag-router
+children: []
+parentPath:
+  - api-layer

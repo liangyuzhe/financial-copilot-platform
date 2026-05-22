@@ -1,0 +1,1 @@
+Controlled tool registry used by AgentScopeRuntime. The data_analysis allowlist is read-only except for analysis_plan.submit, which records a plan-only handoff and explicitly requires SQL Harness execution.

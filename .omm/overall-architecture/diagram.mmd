@@ -1,0 +1,42 @@
+graph LR
+    web-ui["Web UI\nagents/static/index.html"]
+    api-layer["API Layer\nagents/api/"]
+    final-graph["Final Graph\nagents/flow/dispatcher.py"]
+    agentscope-runtime["AgentScope Runtime\nagents/runtime/"]
+    tool-catalog["Tool Catalog\nagents/runtime/tool_catalog.py"]
+    sql-harness["SQL Harness\nagents/flow/sql_react.py"]
+    rag-chat["RAG Chat\nagents/flow/rag_chat.py"]
+    model-layer["Model Layer\nagents/model/"]
+    security-audit["Security + Audit\nagents/tool/security/"]
+    storage-systems["Storage Systems\nRedis / MySQL / Milvus / ES"]
+    external-services["External Services\nLLM / MCP MySQL / AgentScope package"]
+    trace-system["Trace System\nagents/tool/trace/"]
+
+    web-ui -->|"POST/SSE query requests"| api-layer
+    api-layer -->|"builds and resumes graph"| final-graph
+    final-graph -->|"data route planning"| agentscope-runtime
+    final-graph -->|"chat route answers"| rag-chat
+    agentscope-runtime -->|"allowlisted read-only calls"| tool-catalog
+    tool-catalog -->|"metadata and knowledge lookup"| storage-systems
+    tool-catalog -->|"permission-filtered metadata"| security-audit
+    agentscope-runtime -->|"submits analysis_plan"| final-graph
+    final-graph -->|"validates and executes plan"| sql-harness
+    sql-harness -->|"safety checks and table authorization"| security-audit
+    sql-harness -->|"executes approved SELECT/WITH"| external-services
+    sql-harness -->|"semantic model and relation evidence"| storage-systems
+    rag-chat -->|"hybrid retrieval"| storage-systems
+    rag-chat -->|"LLM answer generation"| model-layer
+    agentscope-runtime -->|"planner model calls"| model-layer
+    sql-harness -->|"SQL and reflection model calls"| model-layer
+    model-layer -->|"provider API calls"| external-services
+    api-layer -->|"request and stream tracing"| trace-system
+    final-graph -->|"node tracing"| trace-system
+    agentscope-runtime -->|"tool trace events"| trace-system
+    sql-harness -->|"audit and execution trace"| trace-system
+
+    classDef entry fill:#89b4fa,stroke:#89b4fa,color:#1e1e2e
+    classDef store fill:#a6e3a1,stroke:#a6e3a1,color:#1e1e2e
+    classDef external fill:#585b70,stroke:#585b70,color:#cdd6f4
+    class api-layer,final-graph entry
+    class storage-systems store
+    class external-services external
