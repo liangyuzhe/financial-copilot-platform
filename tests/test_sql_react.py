@@ -2011,6 +2011,28 @@ GROUP BY period"""
         assert rows[1]["missing_merge_keys"] == "department_id, cost_center_id"
         assert rows[1]["income_amount"] == 100
 
+    def test_merge_dependency_rows_uses_common_available_merge_keys(self):
+        from agents.flow.sql_react import _merge_dependency_rows
+
+        step = {
+            "type": "python_merge",
+            "depends_on": [1, 2],
+            "merge_keys": ["parent_id", "department_id", "cost_center_id"],
+        }
+        rows, reason = _merge_dependency_rows(step, {
+            "1": {"result": '[{"department_id":2,"cost_center_id":2,"total_budget":"373754.83"}]'},
+            "2": {"result": '[{"parent_id":1,"department_id":2,"cost_center_id":2,"total_approved_amount":"26238.19"}]'},
+        })
+
+        assert reason == ""
+        assert rows == [{
+            "department_id": 2,
+            "cost_center_id": 2,
+            "total_budget": "373754.83",
+            "parent_id": 1,
+            "total_approved_amount": "26238.19",
+        }]
+
     def test_merge_dependency_rows_ignores_merge_keys_absent_from_all_dependencies(self):
         from agents.flow.sql_react import _merge_dependency_rows
 
@@ -2141,6 +2163,72 @@ GROUP BY period"""
         assert "SQL:" not in answer
         assert "SELECT" not in answer
         assert "合并结果预览" not in answer
+
+    def test_complex_execution_answer_renders_budget_expense_table_before_diagnostics(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "steps": [
+                {"step": 1, "type": "sql", "goal": "查询2025年各部门预算执行率"},
+                {"step": 2, "type": "sql", "goal": "查询2025年各部门已审批报销费用"},
+                {"step": 3, "type": "python_merge", "goal": "按部门合并预算和报销费用", "merge_keys": ["department_id", "cost_center_id"]},
+                {"step": 4, "type": "report", "goal": "生成业务可读对比表", "depends_on": [3]},
+            ]
+        }
+        execution_results = {
+            "4": {
+                "step": 4,
+                "type": "report",
+                "goal": "生成业务可读对比表",
+                "answer": "报告步骤已基于依赖步骤结果生成摘要。",
+                "result": [
+                    {
+                        "department_id": 2,
+                        "cost_center_id": 2,
+                        "department_name": "技术部",
+                        "cost_center_name": "财务部",
+                        "total_budget": "373754.83",
+                        "total_actual": "365975.71",
+                        "execution_rate": "97.92",
+                        "budget_variance": "7779.12",
+                        "total_approved_amount": "26238.19",
+                    },
+                    {
+                        "department_id": 3,
+                        "cost_center_id": 3,
+                        "cost_center_name": "研发部",
+                        "total_budget": "462095.66",
+                        "total_actual": "448502.36",
+                        "execution_rate": "97.06",
+                    },
+                    {
+                        "department_id": 5,
+                        "cost_center_id": 5,
+                        "cost_center_name": "人力资源部",
+                        "total_budget": "536478.20",
+                        "total_actual": "444966.38",
+                        "execution_rate": "82.94",
+                        "merge_status": "未对齐",
+                        "source_step": 1,
+                        "missing_merge_keys": "department_id, cost_center_id",
+                    },
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert answer.startswith("预算执行率与已审批报销费用对比：")
+        assert "| 年度 | 部门 | 预算执行率 | 已审批报销费用 | 预算 | 已审批报销费用与预算差异 |" in answer
+        assert "| 2025 | 财务部 | 97.92% | 26238.19 | 373754.83 | -347516.64 |" in answer
+        assert "| 2025 | 研发部 | 97.06% | 0.00 | 462095.66 | -462095.66 |" in answer
+        assert "数据诊断：" in answer
+        assert answer.index("数据诊断：") > answer.index("| 年度 |")
+        assert "缺少字段：department_id, cost_center_id" in answer
+        assert "建议在预算和报销费用查询结果中同时输出 department_id、cost_center_id" in answer
+        assert "merge_status" not in answer
+        assert "未对齐" not in answer
 
     def test_report_step_with_merge_keys_produces_local_merge_preview(self):
         from agents.flow.sql_react import _format_complex_execution_answer, _run_local_complex_step

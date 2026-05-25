@@ -4758,3 +4758,54 @@ curl -sS -N -X POST http://127.0.0.1:8081/api/query/approve/stream \
 .venv/bin/python -m pytest tests/test_skill_runtime.py tests/test_runtime_tool_catalog.py tests/test_agentscope_adapter.py::test_local_runner_submits_data_analysis_plan_to_harness_without_sqlreact_context tests/test_agentscope_adapter.py::test_local_runner_prefers_workflow_state_selected_tables_without_business_topic_hardcode tests/test_complex_query.py tests/test_sql_react.py -q
 # 187 passed
 ```
+
+## Iteration 77：复杂计划结果业务化展示与指标列规则化
+
+### 问题
+
+真实 case“2025年按部门分析预算执行率，并对比已审批报销费用与预算差异”执行后，最终回答直接暴露了内部 merge 字段：
+
+- 顶部出现“另有 6 条记录缺少合并维度，未纳入关系判断”和大量 `merge_status=未对齐`。
+- 业务人员看不到最需要的对比视图：年度、部门、预算执行率、已审批报销费用、预算、已审批报销费用与预算差异。
+- trace 显示计划使用 `parent_id, department_id, cost_center_id` 作为合并键，但预算 SQL 只从 `t_budget/t_cost_center` 取数，无法输出 `parent_id`。旧 merge 逻辑只要任一依赖出现某个 key，就把它作为所有依赖的必需键，导致预算侧 6 条记录被错误标记为未对齐。
+
+### 调整
+
+1. `_merge_dependency_rows()` 的有效合并键改为“每个依赖结果都能提供的公共键”。当计划给出 `parent_id, department_id, cost_center_id`，但预算结果没有 `parent_id` 时，会自动降级用 `department_id + cost_center_id` 合并。
+2. 复杂计划最终 formatter 新增预算执行率/已审批报销费用业务表格：
+   - 年度
+   - 部门
+   - 预算执行率
+   - 已审批报销费用
+   - 预算
+   - 已审批报销费用与预算差异
+3. 没有报销费用的部门在业务表中显示 `0.00`，并继续计算“已审批报销费用 - 预算”差异。
+4. 技术诊断下沉到“数据诊断”区，只说明缺少哪些维度、建议 SQL step 同时输出哪些字段，不再把 `merge_status` 展示给业务用户。
+5. 指标结果列识别迁移到 `agents/tool/sql_tools/metric_column_rules.json`：
+   - formatter 不再写 `差异/偏差/rate` 这类散落 hardcode。
+   - `MetricRegistry.column_matches()` 统一按 rule 的 `role / aliases / include_terms / exclude_terms` 匹配列。
+   - 后续扩展列名口径时改 JSON rule，不改 formatter 逻辑。
+
+### 真实数据回放
+
+使用 LangSmith trace `019e5e31-3db6-75d3-9f57-7b9070bbae83` 中的两步 SQL 结果本地回放：
+
+```text
+MERGED_ROWS 6
+
+预算执行率与已审批报销费用对比：
+| 年度 | 部门 | 预算执行率 | 已审批报销费用 | 预算 | 已审批报销费用与预算差异 |
+| 2025 | 总裁办 | 94.08% | 0.00 | 573323.46 | -573323.46 |
+| 2025 | 财务部 | 97.92% | 26238.19 | 373754.83 | -347516.64 |
+| 2025 | 研发部 | 97.06% | 0.00 | 462095.66 | -462095.66 |
+| 2025 | 销售部 | 99.72% | 0.00 | 421524.37 | -421524.37 |
+| 2025 | 人力资源部 | 90.68% | 0.00 | 490722.29 | -490722.29 |
+| 2025 | 生产部 | 80.45% | 0.00 | 631254.43 | -631254.43 |
+```
+
+### 回归
+
+```bash
+.venv/bin/python -m pytest tests/test_metric_registry.py tests/test_sql_react.py
+# 144 passed
+```

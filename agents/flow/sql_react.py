@@ -20,6 +20,7 @@ from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.runtime import AgentScopeRuntime, create_agentscope_runner
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.semantic_check import check_sql_semantics
+from agents.tool.sql_tools.metric_registry import default_metric_registry
 from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.tool.storage.checkpoint import get_checkpointer
@@ -36,6 +37,7 @@ except ImportError:
     Elasticsearch = None
 
 logger = logging.getLogger(__name__)
+_METRIC_REGISTRY = default_metric_registry()
 
 
 _EXECUTION_TIME_RE = re.compile(r"\s*Query execution time:\s*[\d.]+\s*ms\s*$", re.IGNORECASE)
@@ -1803,11 +1805,14 @@ def _merge_dependency_rows(
     effective_merge_keys = [
         str(merge_key)
         for merge_key in merge_keys
-        if any(
-            _resolve_merge_key_column(row, str(merge_key)) is not None
-            or _resolve_merge_label_column(row, str(merge_key)) is not None
+        if rows_by_dep
+        and all(
+            any(
+                _resolve_merge_key_column(row, str(merge_key)) is not None
+                or _resolve_merge_label_column(row, str(merge_key)) is not None
+                for row in rows
+            )
             for rows in rows_by_dep.values()
-            for row in rows
         )
     ]
     if not effective_merge_keys:
@@ -1930,19 +1935,7 @@ def _decimal_value(value) -> Decimal | None:
 def _column_matches_metric(column: str, terms: tuple[str, ...]) -> bool:
     if _is_metric_dimension_column(column):
         return False
-    normalized = _normalize_merge_name(column)
-    if not _metric_column_allowed_for_terms(normalized, terms):
-        return False
-    return any(term in normalized for term in terms)
-
-
-def _metric_column_allowed_for_terms(normalized: str, terms: tuple[str, ...]) -> bool:
-    term_set = set(terms)
-    if "budget" in normalized or "预算" in normalized:
-        return bool(term_set & {"budget", "预算"})
-    if "balance" in normalized or "余额" in normalized:
-        return False
-    return True
+    return _METRIC_REGISTRY.column_matches(column, terms)
 
 
 def _sum_metric_columns(rows: list[dict], terms: tuple[str, ...]) -> Decimal | None:
@@ -1968,6 +1961,13 @@ def _format_decimal_percent(numerator: Decimal, denominator: Decimal) -> str:
     if denominator == 0:
         return "无法计算"
     return f"{(numerator / denominator * Decimal('100')).quantize(Decimal('0.01'))}%"
+
+
+def _format_optional_decimal(value, suffix: str = "") -> str:
+    amount = _decimal_value(value)
+    if amount is None:
+        return ""
+    return f"{_format_decimal_amount(amount)}{suffix}"
 
 
 def _is_metric_dimension_column(column: str) -> bool:
@@ -2015,12 +2015,12 @@ def _format_complex_business_summary(execution_results: dict[str, dict]) -> str:
 
     unaligned_count = sum(1 for row in final_rows if row.get("merge_status") == "未对齐")
     aligned_count = len(final_rows) - unaligned_count
-    income = _sum_metric_columns(final_rows, ("income", "revenue", "收入"))
-    cost = _sum_metric_columns(final_rows, ("cost", "成本"))
-    expense = _sum_metric_columns(final_rows, ("expense", "费用"))
-    budget = _sum_metric_columns(final_rows, ("budget", "预算"))
-    actual = _sum_metric_columns(final_rows, ("actual", "实际"))
-    collection = _sum_metric_columns(final_rows, ("collection", "settled", "received", "receivable", "回款", "收款", "应收"))
+    income = _sum_metric_columns(final_rows, ("income",))
+    cost = _sum_metric_columns(final_rows, ("cost",))
+    expense = _sum_metric_columns(final_rows, ("expense", "approved_expense"))
+    budget = _sum_metric_columns(final_rows, ("budget",))
+    actual = _sum_metric_columns(final_rows, ("actual",))
+    collection = _sum_metric_columns(final_rows, ("collection",))
 
     lines = [
         "经营关系摘要：",
@@ -2073,6 +2073,16 @@ def _row_metric_sum(row: dict, terms: tuple[str, ...]) -> Decimal | None:
     return total if matched else None
 
 
+def _first_metric_value(row: dict, roles: tuple[str, ...]) -> Decimal | None:
+    for column, value in row.items():
+        if not _column_matches_metric(str(column), roles):
+            continue
+        amount = _decimal_value(value)
+        if amount is not None:
+            return amount
+    return None
+
+
 def _format_row_identity(row: dict, index: int) -> str:
     labels = []
     for key, label in (
@@ -2098,11 +2108,135 @@ def _format_row_identity(row: dict, index: int) -> str:
     return " / ".join(labels) if labels else f"记录 {index + 1}"
 
 
+def _business_dimension_name(row: dict, index: int) -> str:
+    for key in ("cost_center_name", "department_name", "center_name", "department"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return _format_result_value(value)
+    for key, prefix in (("department_id", "部门"), ("cost_center_id", "成本中心")):
+        value = row.get(key)
+        if value not in (None, ""):
+            return f"{prefix}{_format_result_value(value)}"
+    return f"记录 {index + 1}"
+
+
+def _first_row_value(row: dict, names: tuple[str, ...], normalized_terms: tuple[str, ...] = ()):
+    for name in names:
+        if name in row and row.get(name) not in (None, ""):
+            return row.get(name)
+    for column, value in row.items():
+        if value in (None, ""):
+            continue
+        normalized = _normalize_merge_name(str(column))
+        if any(term in normalized for term in normalized_terms):
+            return value
+    return None
+
+
+def _has_budget_expense_metrics(rows: list[dict]) -> bool:
+    has_budget = any(_row_metric_sum(row, ("budget",)) is not None for row in rows)
+    has_expense = any(
+        _row_metric_sum(row, ("approved_expense",)) is not None
+        for row in rows
+    )
+    return has_budget and has_expense
+
+
+def _format_missing_dimension_diagnostics(rows: list[dict]) -> list[str]:
+    diagnostics = []
+    for index, row in enumerate(rows):
+        missing = str(row.get("missing_merge_keys") or "").strip()
+        if not missing:
+            continue
+        diagnostics.append(f"- {_business_dimension_name(row, index)}：缺少字段：{missing}。")
+        if len(diagnostics) >= 3:
+            break
+    if not diagnostics:
+        return []
+    missing_fields = []
+    for row in rows:
+        for item in str(row.get("missing_merge_keys") or "").split(","):
+            field = item.strip()
+            if field and field not in missing_fields:
+                missing_fields.append(field)
+    lines = ["数据诊断：", *diagnostics]
+    if len(diagnostics) < sum(1 for row in rows if row.get("missing_merge_keys")):
+        lines.append("- 仅展示前 3 条诊断。")
+    if missing_fields:
+        joined = "、".join(missing_fields)
+        lines.append(f"- 建议在预算和报销费用查询结果中同时输出 {joined}，以便系统按同一部门/成本中心口径合并。")
+    return lines
+
+
+def _infer_year_from_context(plan: dict, execution_results: dict[str, dict]) -> str:
+    text_parts = [json.dumps(plan, ensure_ascii=False)]
+    for entry in execution_results.values():
+        if isinstance(entry, dict):
+            text_parts.extend(str(entry.get(key) or "") for key in ("goal", "sql", "answer"))
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", "\n".join(text_parts))
+    return match.group(1) if match else ""
+
+
+def _format_budget_expense_comparison_answer(
+    plan: dict,
+    execution_results: dict[str, dict],
+    rows: list[dict],
+) -> str:
+    aligned_rows = [row for row in rows if row.get("merge_status") != "未对齐"]
+    display_rows = aligned_rows or rows
+    if not _has_budget_expense_metrics(display_rows):
+        return ""
+
+    steps = plan.get("steps") or []
+    total_steps = len(steps) or len(execution_results)
+    processed_steps = (
+        sum(1 for step in steps if str(step.get("step")) in execution_results)
+        if steps else len(execution_results)
+    )
+    lines = [
+        "预算执行率与已审批报销费用对比：",
+        f"- 已完成 {processed_steps}/{total_steps} 个步骤。下表按可合并的部门/成本中心口径展示。",
+        "",
+        "| 年度 | 部门 | 预算执行率 | 已审批报销费用 | 预算 | 已审批报销费用与预算差异 |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
+    ]
+    default_year = _infer_year_from_context(plan, execution_results)
+    for index, row in enumerate(display_rows[:10]):
+        year = _first_row_value(row, ("budget_year", "year", "年度"), ("year", "年度")) or default_year
+        budget = _row_metric_sum(row, ("budget",))
+        expense = _row_metric_sum(row, ("approved_expense",))
+        if expense is None and budget is not None:
+            expense = Decimal("0")
+        execution_rate = _first_metric_value(row, ("execution_rate",))
+        variance = expense - budget if expense is not None and budget is not None else None
+        lines.append(
+            "| "
+            f"{_format_result_value(year)} | "
+            f"{_business_dimension_name(row, index)} | "
+            f"{_format_optional_decimal(execution_rate, '%')} | "
+            f"{_format_decimal_amount(expense) if expense is not None else ''} | "
+            f"{_format_decimal_amount(budget) if budget is not None else ''} | "
+            f"{_format_decimal_amount(variance) if variance is not None else ''} |"
+        )
+    if len(display_rows) > 10:
+        lines.append("")
+        lines.append(f"- 仅展示前 10 条，共 {len(display_rows)} 条。")
+
+    diagnostics = _format_missing_dimension_diagnostics(rows)
+    if diagnostics:
+        lines.append("")
+        lines.extend(diagnostics)
+
+    lines.append("")
+    lines.append("执行概况：SQL 已通过语义校验、安全检查、权限检查并执行。")
+    return "\n".join(lines)
+
+
 def _top_budget_variance_lines(rows: list[dict], max_rows: int = 3) -> list[str]:
     candidates = []
     for index, row in enumerate(rows):
-        actual = _row_metric_sum(row, ("actual", "实际"))
-        budget = _row_metric_sum(row, ("budget", "预算"))
+        actual = _row_metric_sum(row, ("actual",))
+        budget = _row_metric_sum(row, ("budget",))
         if actual is None or budget is None:
             continue
         variance = actual - budget
@@ -2139,14 +2273,18 @@ def _format_complex_relationship_answer(
     if not rows:
         return ""
 
+    budget_expense_answer = _format_budget_expense_comparison_answer(plan, execution_results, rows)
+    if budget_expense_answer:
+        return budget_expense_answer
+
     unaligned_count = sum(1 for row in rows if row.get("merge_status") == "未对齐")
     aligned_count = len(rows) - unaligned_count
-    income = _sum_metric_columns(rows, ("income", "revenue", "收入"))
-    cost = _sum_metric_columns(rows, ("cost", "成本"))
-    expense = _sum_metric_columns(rows, ("expense", "费用"))
-    budget = _sum_metric_columns(rows, ("budget", "预算"))
-    actual = _sum_metric_columns(rows, ("actual", "实际"))
-    collection = _sum_metric_columns(rows, ("collection", "settled", "received", "receivable", "回款", "收款", "应收"))
+    income = _sum_metric_columns(rows, ("income",))
+    cost = _sum_metric_columns(rows, ("cost",))
+    expense = _sum_metric_columns(rows, ("expense", "approved_expense"))
+    budget = _sum_metric_columns(rows, ("budget",))
+    actual = _sum_metric_columns(rows, ("actual",))
+    collection = _sum_metric_columns(rows, ("collection",))
 
     steps = plan.get("steps") or []
     total_steps = len(steps) or len(execution_results)

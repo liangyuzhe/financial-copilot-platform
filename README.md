@@ -261,6 +261,7 @@ financial-copilot-platform/
 │   │   │   ├── sql_shape.py        # sqlglot AST 结构提取
 │   │   │   ├── sql_validation.py   # schema/table/column/join validation
 │   │   │   ├── metric_registry.py  # 可配置指标口径注册表（当前内置净利润）
+│   │   │   ├── metric_column_rules.json # 结果列到业务指标角色的可配置规则
 │   │   │   ├── semantic_check.py   # SQL Quality Gate pipeline report
 │   │   │   ├── verified_query_repository.py # 已验证 SQL 回归资产
 │   │   │   └── error_codes.py      # 错误码分类 + is_retryable()
@@ -743,7 +744,7 @@ curl -X POST http://localhost:8080/api/document/insert \
 
 - `semantic_check` 使用 `sqlglot` 解析 SQL AST，提取表、别名、字段、JOIN、过滤、聚合和 CASE 表达式。
 - `sql_validation` 基于语义模型验证表/字段是否存在、别名是否声明、JOIN 关系是否来自 schema graph。
-- `metric_registry` 先内置净利润/亏损口径校验，后续可扩展为 DB/config backed 指标注册表。
+- `metric_registry` 先内置净利润/亏损口径校验，结果列识别通过 `metric_column_rules.json` 配置业务指标角色，避免在 formatter 中写死“预算/差异/执行率”等列名判断；后续可扩展为 DB/config backed 指标注册表。
 - SQL 安全检查只允许安全 `SELECT/WITH`，拦截 DROP、TRUNCATE、DELETE、UPDATE 和 always-true 条件等高风险语句。
 - 权限门禁在选表后、补表前、审批前和复杂计划 SQL step 中执行，拒绝时只展示业务数据域名称并写入审计事件。
 - `dry_run_sql` 在用户审批前执行 EXPLAIN：MySQL/Postgres 使用 `EXPLAIN <sql>`，SQLite 使用 `EXPLAIN QUERY PLAN <sql>`；当 MCP wrapper 拒绝 EXPLAIN 时，MySQL 会使用直连 EXPLAIN fallback，但仍不执行用户 SQL。
@@ -753,6 +754,7 @@ curl -X POST http://localhost:8080/api/document/insert \
 - 审批卡展示 `quality_gate.semantic`、`quality_gate.safety`、`quality_gate.authorization`、`quality_gate.dry_run`，让不懂 SQL 的用户也能看到系统校验结论。
 - 审批恢复使用 SSE 展示“执行中 → 异常检测 → 反思生成修正 SQL → 等待确认”的过程，避免用户误以为重复审批同一条 SQL
 - `query` 和 `rewritten_query` 使用 `latest_non_empty` reducer，允许新一轮非空 query 覆盖旧 checkpoint，approve/resume 没有新值时保留当前值，避免 LangGraph 并发更新错误
+- 复杂计划 `python_merge/report` 的最终答案优先输出业务表格；内部合并诊断只在底部“数据诊断”说明缺少哪些维度，以及应在 SQL step 中补哪些字段。
 
 ### 5. AgentScope Skill 与 Token 预算管理
 

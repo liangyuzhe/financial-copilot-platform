@@ -1,0 +1,58 @@
+{
+  "rules": [
+    {
+      "role": "budget",
+      "aliases": ["预算"],
+      "include_terms": ["budget", "预算"],
+      "exclude_terms": ["variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "actual",
+      "aliases": ["实际", "实际发生"],
+      "include_terms": ["actual", "实际"],
+      "exclude_terms": ["variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "income",
+      "aliases": ["revenue", "收入"],
+      "include_terms": ["income", "revenue", "收入"],
+      "exclude_terms": ["variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "cost",
+      "aliases": ["成本"],
+      "include_terms": ["cost", "成本"],
+      "exclude_terms": ["variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "expense",
+      "aliases": ["费用"],
+      "include_terms": ["expense", "费用"],
+      "exclude_terms": ["budget", "预算", "variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "approved_expense",
+      "aliases": ["approved", "审批", "已审批", "报销"],
+      "include_terms": ["approved", "审批", "报销"],
+      "exclude_terms": ["budget", "预算", "variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "collection",
+      "aliases": ["settled", "received", "receivable", "回款", "收款", "应收"],
+      "include_terms": ["collection", "settled", "received", "receivable", "回款", "收款", "应收"],
+      "exclude_terms": ["variance", "差异", "偏差", "rate", "ratio", "执行率"]
+    },
+    {
+      "role": "variance",
+      "aliases": ["差异", "偏差"],
+      "include_terms": ["variance", "差异", "偏差"],
+      "exclude_terms": []
+    },
+    {
+      "role": "execution_rate",
+      "aliases": ["rate", "ratio", "执行率"],
+      "include_terms": ["rate", "ratio", "执行率"],
+      "exclude_terms": []
+    }
+  ]
+}

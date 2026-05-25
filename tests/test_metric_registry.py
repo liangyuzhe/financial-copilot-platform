@@ -98,3 +98,57 @@ def test_semantic_check_reports_generic_metric_error_for_non_hardcoded_metric():
     assert report.passed is False
     assert report.problems[0].code == "MISSING_METRIC_EXPRESSION"
     assert "净利润" not in report.problems[0].title
+
+
+def test_metric_registry_matches_columns_by_configured_rules():
+    from agents.tool.sql_tools.metric_registry import default_metric_registry
+
+    registry = default_metric_registry()
+
+    assert registry.column_matches("total_budget", ("budget",))
+    assert not registry.column_matches("budget_variance", ("budget",))
+    assert registry.column_matches("budget_variance", ("variance",))
+    assert not registry.column_matches("execution_rate", ("budget",))
+    assert registry.column_matches("execution_rate", ("execution_rate",))
+    assert registry.column_matches("total_approved_amount", ("approved_expense",))
+
+
+def test_metric_column_rules_can_load_from_external_file(tmp_path):
+    import json
+
+    from agents.tool.sql_tools.metric_registry import MetricDefinition, MetricExpression, MetricRegistry, load_metric_column_rules
+
+    rule_file = tmp_path / "metric_rules.json"
+    rule_file.write_text(
+        json.dumps({
+            "rules": [
+                {
+                    "role": "custom_amount",
+                    "aliases": ["自定义金额"],
+                    "include_terms": ["custom_amount"],
+                    "exclude_terms": ["rate"],
+                }
+            ]
+        }),
+        encoding="utf-8",
+    )
+
+    registry = MetricRegistry(
+        metrics=[
+            MetricDefinition(
+                metric_id="custom_metric",
+                business_names=["自定义"],
+                expression=MetricExpression(
+                    expression_type="sum_difference",
+                    aggregation="SUM",
+                    left_column="left_amount",
+                    right_column="right_amount",
+                    operator="-",
+                ),
+            )
+        ],
+        column_rules=load_metric_column_rules(rule_file),
+    )
+
+    assert registry.column_matches("custom_amount", ("自定义金额",))
+    assert not registry.column_matches("custom_amount_rate", ("自定义金额",))
