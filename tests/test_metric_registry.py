@@ -111,6 +111,11 @@ def test_metric_registry_matches_columns_by_configured_rules():
     assert not registry.column_matches("execution_rate", ("budget",))
     assert registry.column_matches("execution_rate", ("execution_rate",))
     assert registry.column_matches("total_approved_amount", ("approved_expense",))
+    assert not registry.column_matches("expense_count", ("expense",))
+    assert registry.column_matches("expense_count", ("expense_count",))
+    assert registry.column_matches("net_profit", ("net_profit",))
+    assert registry.column_matches("net_margin", ("net_margin",))
+    assert registry.column_matches("gross_margin", ("gross_margin",))
 
 
 def test_metric_column_rules_can_load_from_external_file(tmp_path):

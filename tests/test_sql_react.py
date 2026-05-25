@@ -2033,6 +2033,45 @@ GROUP BY period"""
             "total_approved_amount": "26238.19",
         }]
 
+    def test_merge_dependency_rows_ignores_merge_key_with_only_null_values(self):
+        from agents.flow.sql_react import _merge_dependency_rows
+
+        step = {
+            "type": "python_merge",
+            "depends_on": [1, 2],
+            "merge_keys": ["parent_id", "department_id", "cost_center_id"],
+        }
+        rows, reason = _merge_dependency_rows(step, {
+            "1": {
+                "result": (
+                    '[{"parent_id":null,"department_id":2,"cost_center_id":2,'
+                    '"net_profit":"-1239964.99","net_margin":"-238.45"}]'
+                ),
+                "error": None,
+            },
+            "2": {
+                "result": (
+                    '[{"parent_id":1,"department_id":2,"cost_center_id":2,'
+                    '"department_name":"技术部","cost_center_name":"财务部",'
+                    '"total_expenses":"63452.18","expense_count":3}]'
+                ),
+                "error": None,
+            },
+        })
+
+        assert reason == ""
+        assert rows == [{
+            "department_id": 2,
+            "cost_center_id": 2,
+            "parent_id": 1,
+            "net_profit": "-1239964.99",
+            "net_margin": "-238.45",
+            "department_name": "技术部",
+            "cost_center_name": "财务部",
+            "total_expenses": "63452.18",
+            "expense_count": 3,
+        }]
+
     def test_merge_dependency_rows_ignores_merge_keys_absent_from_all_dependencies(self):
         from agents.flow.sql_react import _merge_dependency_rows
 
@@ -2229,6 +2268,113 @@ GROUP BY period"""
         assert "建议在预算和报销费用查询结果中同时输出 department_id、cost_center_id" in answer
         assert "merge_status" not in answer
         assert "未对齐" not in answer
+
+    def test_complex_execution_answer_renders_profitability_expense_table_without_internal_fields(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "steps": [
+                {"step": 1, "type": "sql", "goal": "统计2025年净利润、净利率、毛利率"},
+                {"step": 2, "type": "sql", "goal": "统计2025年部门费用"},
+                {
+                    "step": 3,
+                    "type": "python_merge",
+                    "goal": "按部门和成本中心合并盈利与费用",
+                    "merge_keys": ["parent_id", "department_id", "cost_center_id"],
+                },
+                {"step": 4, "type": "report", "goal": "生成业务可读报告", "depends_on": [3]},
+            ]
+        }
+        execution_results = {
+            "4": {
+                "step": 4,
+                "type": "report",
+                "goal": "生成业务可读报告",
+                "answer": "报告步骤已完成本地合并，共 2 行。",
+                "result": [
+                    {
+                        "department_id": 2,
+                        "cost_center_id": 2,
+                        "department_name": "技术部",
+                        "cost_center_name": "财务部",
+                        "net_profit": "-1239964.99",
+                        "net_margin": "-238.454806",
+                        "gross_margin": "0",
+                        "total_expenses": "63452.18",
+                        "expense_count": 3,
+                    },
+                    {
+                        "department_id": 6,
+                        "cost_center_id": 6,
+                        "net_profit": "893791.56",
+                        "net_margin": "32.740737",
+                        "gross_margin": "0",
+                        "merge_status": "未对齐",
+                        "source_step": 1,
+                        "missing_merge_keys": "department_name, cost_center_name",
+                    },
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert answer.startswith("盈利能力与费用对比：")
+        assert "| 年度 | 部门 | 净利润 | 净利率 | 毛利率 | 费用合计 | 费用笔数 |" in answer
+        assert "| 2025 | 财务部 | -1239964.99 | -238.45% | 0.00% | 63452.18 | 3 |" in answer
+        assert "数据诊断：" in answer
+        assert "建议在各步骤查询结果中同时输出" in answer
+        assert "department_id" not in answer
+        assert "cost_center_id" not in answer
+        assert "merge_status" not in answer
+        assert "source_step" not in answer
+        assert "未对齐" not in answer
+
+    def test_complex_execution_generic_preview_hides_internal_columns(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "steps": [
+                {"step": 1, "type": "sql", "goal": "统计各部门实际金额和预算金额"},
+                {"step": 2, "type": "report", "goal": "生成报告", "depends_on": [1]},
+            ]
+        }
+        execution_results = {
+            "2": {
+                "step": 2,
+                "type": "report",
+                "goal": "生成报告",
+                "answer": "报告步骤已完成本地汇总，共 1 行。",
+                "result": [
+                    {
+                        "parent_id": 1,
+                        "department_id": 2,
+                        "cost_center_id": 2,
+                        "department_name": "技术部",
+                        "cost_center_name": "财务部",
+                        "actual_amount": "365975.71",
+                        "budget_amount": "373754.83",
+                        "merge_status": "已对齐",
+                        "source_step": 1,
+                    }
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert "结果明细：" in answer
+        assert "department_id" not in answer
+        assert "cost_center_id" not in answer
+        assert "parent_id" not in answer
+        assert "merge_status" not in answer
+        assert "source_step" not in answer
+        assert "技术部" in answer
+        assert "财务部" in answer
+        assert "365975.71" in answer
+        assert "373754.83" in answer
 
     def test_report_step_with_merge_keys_produces_local_merge_preview(self):
         from agents.flow.sql_react import _format_complex_execution_answer, _run_local_complex_step

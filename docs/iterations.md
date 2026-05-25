@@ -4998,3 +4998,80 @@ bce37d9 Preserve complex step dimension context
 - 复杂计划 step 执行时，质量门上下文必须来自“计划范围 + SQL 实际引用 + 安全权限策略”的交集。
 - 业务展示层不能直接泄露内部状态字段，例如 `merge_status`、`source_step`、raw execution row。
 - LangSmith 排障时必须同时看审批前 run 和 approve 后 resume run，避免把审批暂停误判为执行失败。
+
+### Bug Fix 4：盈利/费用复杂计划最终回答仍暴露 raw id 和内部 merge 状态
+
+真实 case：
+
+```text
+2025年按部门分析盈利率，亏损，成本
+```
+
+旧输出问题：
+
+```text
+关系分析结果：
+- 本次按计划完成 4/4 个步骤，合并得到 4 条可对齐记录。
+- 另有 8 条记录缺少合并维度，未纳入关系判断。
+- 费用合计：121089.27。
+结果明细：
+- parent_id：1，department_id：3，cost_center_id：3，department_name：产品部...
+- cost_center_id：2，department_id：2，parent_id：无数据，净利润：-1239964.99...
+```
+
+业务问题：
+
+- 用户问的是“按部门分析盈利率、亏损、成本”，最终回复却优先展示 `parent_id / department_id / cost_center_id / merge_status / source_step`。
+- “未对齐”是工程诊断，不是业务结论，不能作为主结果给业务用户。
+- 查询结果没有按用户关心的字段组织成表格，例如年度、部门、净利润、净利率、毛利率、费用合计、费用笔数。
+- step 1 盈利 SQL 输出了 `NULL AS parent_id`，step 2 费用 SQL 输出了非空 `parent_id`，合并器仍把 `parent_id` 当有效 key，导致本可按 `department_id + cost_center_id` 合并的行被误判为未对齐。
+- 指标列规则把 `expense_count` 也识别成费用金额，存在把笔数加进费用合计的风险。
+
+根因：
+
+- `_merge_dependency_rows()` 只判断某个合并键的列是否存在，没有判断该列在依赖结果中是否有非空值。
+- 复杂计划 formatter 缺少“盈利能力 + 费用”这一类结果的业务表格输出，只能落到通用“关系分析结果”。
+- 通用 `_format_result_rows_for_answer()` 使用原始 row preview，直接暴露数据库 id 和内部 merge 字段。
+- metric column rules 对金额类费用和笔数类费用没有区分。
+
+修复：
+
+- 合并键有效性改为“每个依赖结果都至少能提供一个非空值”，全空的 `parent_id` 会被自动降级，不再阻断 `department_id + cost_center_id` 合并。
+- 增加盈利/费用业务表格 formatter：
+  - 年度
+  - 部门
+  - 净利润
+  - 净利率
+  - 毛利率
+  - 费用合计
+  - 费用笔数
+- 数据质量问题下沉到“数据诊断”，说明缺少哪些业务维度字段，以及建议各步骤 SQL 同时输出哪些维度用于合并。
+- `metric_column_rules.json` 增加 `net_profit / net_margin / gross_margin / expense_count` 角色，并让费用金额规则排除 `count/cnt/num/number/数量/笔数`。
+- 通用 row preview 过滤内部字段：
+  - `parent_id`
+  - `department_id`
+  - `cost_center_id`
+  - `merge_status`
+  - `source_step`
+- 通用展示字段加业务标签映射，例如 `department_name -> 部门`、`cost_center_name -> 成本中心`、`actual_amount -> 实际发生`、`budget_amount -> 预算`。
+
+新增回归：
+
+- `test_merge_dependency_rows_ignores_merge_key_with_only_null_values`
+- `test_complex_execution_answer_renders_profitability_expense_table_without_internal_fields`
+- `test_complex_execution_generic_preview_hides_internal_columns`
+- `test_metric_registry_matches_columns_by_configured_rules`
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_sql_react.py tests/test_metric_registry.py tests/test_final_api.py tests/test_api.py
+# 191 passed, 2 warnings
+```
+
+踩坑：
+
+- “列存在”不等于“合并维度有效”。LLM 有时会为了对齐计划结构输出 `NULL AS parent_id`，这种字段必须被视为无效合并键。
+- 专用业务 formatter 只能解决当前意图族；还需要通用 preview 兜底过滤内部字段，否则下一个复杂 case 仍可能泄露工程列。
+- 指标规则要区分金额和数量。`expense_count` 这样的字段不能参与费用金额求和。
+- 主结果应该面向业务问题，技术诊断只能作为附属说明，并明确告诉用户缺什么维度、怎么补数据。

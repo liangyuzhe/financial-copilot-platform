@@ -1793,6 +1793,29 @@ def _resolve_canonical_merge_key_column(row: dict, merge_key: str, prefer_label:
     return _resolve_merge_key_column(row, merge_key)
 
 
+def _has_merge_value(value) -> bool:
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
+def _row_has_resolvable_merge_value(row: dict, merge_key: str) -> bool:
+    for resolver in (_resolve_merge_key_column, _resolve_merge_label_column):
+        column = resolver(row, merge_key)
+        if column is not None and _has_merge_value(row.get(column)):
+            return True
+    return False
+
+
+def _is_excluded_empty_merge_column(
+    column: str,
+    value,
+    excluded_merge_key_norms: set[str],
+) -> bool:
+    if _has_merge_value(value):
+        return False
+    normalized = _normalize_merge_name(column)
+    return bool(normalized and normalized in excluded_merge_key_norms)
+
+
 def _merge_dependency_rows(
     step: dict,
     execution_results: dict[str, dict],
@@ -1822,13 +1845,14 @@ def _merge_dependency_rows(
         if rows_by_dep
         and all(
             any(
-                _resolve_merge_key_column(row, str(merge_key)) is not None
-                or _resolve_merge_label_column(row, str(merge_key)) is not None
+                _row_has_resolvable_merge_value(row, str(merge_key))
                 for row in rows
             )
             for rows in rows_by_dep.values()
         )
     ]
+    excluded_merge_keys = {str(key) for key in merge_keys} - set(effective_merge_keys)
+    excluded_merge_key_norms = {_normalize_merge_name(key) for key in excluded_merge_keys}
     if not effective_merge_keys:
         return [
             {
@@ -1859,11 +1883,11 @@ def _merge_dependency_rows(
                 for k in effective_merge_keys
             }
             key = tuple(row.get(key_columns[k]) if key_columns[k] else None for k in effective_merge_keys)
-            if any(v is None for v in key):
+            if any(not _has_merge_value(v) for v in key):
                 missing_keys = [
                     str(k)
                     for k in effective_merge_keys
-                    if key_columns[k] is None or row.get(key_columns[k]) is None
+                    if key_columns[k] is None or not _has_merge_value(row.get(key_columns[k]))
                 ]
                 unaligned_rows.append({
                     **row,
@@ -1879,6 +1903,8 @@ def _merge_dependency_rows(
                     bucket[merge_key] = row.get(column)
             for col, value in row.items():
                 if col in key_columns.values():
+                    continue
+                if _is_excluded_empty_merge_column(str(col), value, excluded_merge_key_norms):
                     continue
                 out_col = col
                 if out_col in bucket and bucket[out_col] != value:
@@ -1982,6 +2008,16 @@ def _format_optional_decimal(value, suffix: str = "") -> str:
     if amount is None:
         return ""
     return f"{_format_decimal_amount(amount)}{suffix}"
+
+
+def _format_count_value(value) -> str:
+    amount = _decimal_value(value)
+    if amount is None:
+        return ""
+    integral = amount.to_integral_value()
+    if amount == integral:
+        return str(int(integral))
+    return _format_decimal_amount(amount)
 
 
 def _is_metric_dimension_column(column: str) -> bool:
@@ -2102,13 +2138,13 @@ def _format_row_identity(row: dict, index: int) -> str:
     for key, label in (
         ("department_name", "部门"),
         ("department", "部门"),
-        ("department_id", "部门"),
         ("cost_center_name", "成本中心"),
         ("center_name", "成本中心"),
-        ("cost_center_id", "成本中心"),
         ("period", "期间"),
         ("account_name", "科目"),
         ("account_code", "科目"),
+        ("department_id", "部门"),
+        ("cost_center_id", "成本中心"),
     ):
         value = row.get(key)
         if value is None or value == "":
@@ -2120,6 +2156,49 @@ def _format_row_identity(row: dict, index: int) -> str:
         if len(labels) >= 3:
             break
     return " / ".join(labels) if labels else f"记录 {index + 1}"
+
+
+def _is_internal_result_column(column: str) -> bool:
+    normalized = _normalize_merge_name(column)
+    if not normalized:
+        return False
+    if normalized in {"id", "parentid", "departmentid", "costcenterid", "merge_status", "mergestatus", "source_step", "sourcestep"}:
+        return True
+    return bool(normalized.endswith("id") and any(marker in normalized for marker in ("department", "costcenter", "parent")))
+
+
+def _format_display_column_label(column: str) -> str:
+    labels = {
+        "department_name": "部门",
+        "department": "部门",
+        "cost_center_name": "成本中心",
+        "center_name": "成本中心",
+        "actual_amount": "实际发生",
+        "budget_amount": "预算",
+        "income_amount": "收入",
+        "cost_amount": "成本",
+        "expense_amount": "费用",
+        "collection_amount": "回款",
+        "total_expenses": "费用合计",
+        "period": "期间",
+    }
+    return labels.get(str(column), str(column))
+
+
+def _format_row_preview(row: dict, max_columns: int = 8) -> str:
+    display_items = [
+        (column, value)
+        for column, value in row.items()
+        if not _is_internal_result_column(str(column))
+    ]
+    items = display_items or list(row.items())
+    rendered = "，".join(
+        f"{_format_display_column_label(str(key))}：{_format_result_value(value)}"
+        for key, value in items[:max_columns]
+    )
+    if len(items) > max_columns:
+        rendered += "，..."
+    return rendered
 
 
 def _business_dimension_name(row: dict, index: int) -> str:
@@ -2156,7 +2235,24 @@ def _has_budget_expense_metrics(rows: list[dict]) -> bool:
     return has_budget and has_expense
 
 
-def _format_missing_dimension_diagnostics(rows: list[dict]) -> list[str]:
+def _has_profitability_expense_metrics(rows: list[dict]) -> bool:
+    has_profit = any(_first_metric_value(row, ("net_profit",)) is not None for row in rows)
+    has_profitability_rate = any(
+        _first_metric_value(row, ("net_margin", "gross_margin")) is not None
+        for row in rows
+    )
+    has_expense = any(
+        _row_metric_sum(row, ("expense", "approved_expense")) is not None
+        for row in rows
+    )
+    return has_profit and (has_profitability_rate or has_expense)
+
+
+def _format_missing_dimension_diagnostics(
+    rows: list[dict],
+    *,
+    suggestion_context: str = "预算和报销费用查询结果",
+) -> list[str]:
     diagnostics = []
     for index, row in enumerate(rows):
         missing = str(row.get("missing_merge_keys") or "").strip()
@@ -2178,8 +2274,63 @@ def _format_missing_dimension_diagnostics(rows: list[dict]) -> list[str]:
         lines.append("- 仅展示前 3 条诊断。")
     if missing_fields:
         joined = "、".join(missing_fields)
-        lines.append(f"- 建议在预算和报销费用查询结果中同时输出 {joined}，以便系统按同一部门/成本中心口径合并。")
+        lines.append(f"- 建议在{suggestion_context}中同时输出 {joined}，以便系统按同一部门/成本中心口径合并。")
     return lines
+
+
+def _format_profitability_expense_answer(
+    plan: dict,
+    execution_results: dict[str, dict],
+    rows: list[dict],
+) -> str:
+    aligned_rows = [row for row in rows if row.get("merge_status") != "未对齐"]
+    display_rows = aligned_rows or rows
+    if not _has_profitability_expense_metrics(display_rows):
+        return ""
+
+    steps = plan.get("steps") or []
+    total_steps = len(steps) or len(execution_results)
+    processed_steps = (
+        sum(1 for step in steps if str(step.get("step")) in execution_results)
+        if steps else len(execution_results)
+    )
+    lines = [
+        "盈利能力与费用对比：",
+        f"- 已完成 {processed_steps}/{total_steps} 个步骤。下表按可合并的部门/成本中心口径展示。",
+        "",
+        "| 年度 | 部门 | 净利润 | 净利率 | 毛利率 | 费用合计 | 费用笔数 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    default_year = _infer_year_from_context(plan, execution_results)
+    for index, row in enumerate(display_rows[:10]):
+        year = _first_row_value(row, ("budget_year", "year", "年度"), ("year", "年度")) or default_year
+        net_profit = _first_metric_value(row, ("net_profit",))
+        net_margin = _first_metric_value(row, ("net_margin",))
+        gross_margin = _first_metric_value(row, ("gross_margin",))
+        expense = _row_metric_sum(row, ("expense", "approved_expense"))
+        expense_count = _first_metric_value(row, ("expense_count",))
+        lines.append(
+            "| "
+            f"{_format_result_value(year)} | "
+            f"{_business_dimension_name(row, index)} | "
+            f"{_format_decimal_amount(net_profit) if net_profit is not None else ''} | "
+            f"{_format_optional_decimal(net_margin, '%')} | "
+            f"{_format_optional_decimal(gross_margin, '%')} | "
+            f"{_format_decimal_amount(expense) if expense is not None else ''} | "
+            f"{_format_count_value(expense_count)} |"
+        )
+    if len(display_rows) > 10:
+        lines.append("")
+        lines.append(f"- 仅展示前 10 条，共 {len(display_rows)} 条。")
+
+    diagnostics = _format_missing_dimension_diagnostics(rows, suggestion_context="各步骤查询结果")
+    if diagnostics:
+        lines.append("")
+        lines.extend(diagnostics)
+
+    lines.append("")
+    lines.append("执行概况：SQL 已通过语义校验、安全检查、权限检查并执行。")
+    return "\n".join(lines)
 
 
 def _infer_year_from_context(plan: dict, execution_results: dict[str, dict]) -> str:
@@ -2286,6 +2437,10 @@ def _format_complex_relationship_answer(
     rows = _final_complex_rows(execution_results)
     if not rows:
         return ""
+
+    profitability_expense_answer = _format_profitability_expense_answer(plan, execution_results, rows)
+    if profitability_expense_answer:
+        return profitability_expense_answer
 
     budget_expense_answer = _format_budget_expense_comparison_answer(plan, execution_results, rows)
     if budget_expense_answer:
@@ -2513,17 +2668,6 @@ def _looks_like_sql_text(value: str) -> bool:
     if not text:
         return False
     return bool(re.match(r"^(--[^\n]*\n\s*)*(with|select)\b", text))
-
-
-def _format_row_preview(row: dict, max_columns: int = 8) -> str:
-    items = list(row.items())
-    rendered = "，".join(
-        f"{key}：{_format_result_value(value)}"
-        for key, value in items[:max_columns]
-    )
-    if len(items) > max_columns:
-        rendered += "，..."
-    return rendered
 
 
 def _format_structured_rows_preview(rows: list[dict], max_rows: int = 3) -> str:
