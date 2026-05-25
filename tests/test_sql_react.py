@@ -2697,6 +2697,120 @@ class TestSemanticCheck:
         assert step_result["result_sanity_report"]["decision"] == "accepted"
 
     @pytest.mark.asyncio
+    async def test_complex_plan_step_keeps_merge_dimension_tables_for_semantic_check(self):
+        """Dimension tables needed to emit merge keys should stay in the step semantic context."""
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        semantic_model = {
+            "t_journal_item": {
+                "entry_id": {"column_name": "entry_id"},
+                "account_code": {"column_name": "account_code"},
+                "cost_center_id": {"column_name": "cost_center_id"},
+                "credit_amount": {"column_name": "credit_amount"},
+                "debit_amount": {"column_name": "debit_amount"},
+            },
+            "t_journal_entry": {
+                "id": {"column_name": "id"},
+                "entry_date": {"column_name": "entry_date"},
+                "status": {"column_name": "status"},
+            },
+            "t_account": {
+                "account_code": {"column_name": "account_code"},
+                "account_type": {"column_name": "account_type"},
+                "balance_direction": {"column_name": "balance_direction"},
+            },
+            "t_cost_center": {
+                "id": {"column_name": "id"},
+                "department_id": {"column_name": "department_id"},
+                "center_name": {"column_name": "center_name"},
+            },
+            "t_department": {
+                "id": {"column_name": "id"},
+                "parent_id": {"column_name": "parent_id"},
+                "name": {"column_name": "name"},
+            },
+        }
+
+        sql = """
+        SELECT
+            d.parent_id,
+            d.id AS department_id,
+            cc.id AS cost_center_id,
+            SUM(ji.credit_amount - ji.debit_amount) AS net_profit
+        FROM t_journal_item ji
+        JOIN t_journal_entry je ON ji.entry_id = je.id
+        JOIN t_account a ON ji.account_code = a.account_code
+        LEFT JOIN t_cost_center cc ON ji.cost_center_id = cc.id
+        LEFT JOIN t_department d ON cc.department_id = d.id
+        WHERE je.entry_date >= '2025-01-01'
+          AND je.entry_date <= '2025-12-31'
+          AND a.account_type = '损益'
+        GROUP BY d.parent_id, d.id, cc.id
+        """
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {
+                "docs": [
+                    Document(page_content=f"表名: {table_name}", metadata={"table_name": table_name})
+                    for table_name in step_state["semantic_model"]
+                ],
+                "semantic_model": step_state["semantic_model"],
+            }
+
+        async def fake_sql_generate(step_state, config=None):
+            return {"is_sql": True, "sql": sql, "answer": sql}
+
+        async def fake_execute_sql(step_state):
+            return {
+                "result": '[{"parent_id":1,"department_id":2,"cost_center_id":2,"net_profit":"100.00"}]',
+                "answer": "查询已执行完成。\nnet_profit：100.00",
+                "error": None,
+                "execution_history": [{"sql": step_state["sql"], "result": "[]", "error": None}],
+            }
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql):
+            result = await execute_complex_plan_step({
+                "query": "2025年按部门分析盈利率，亏损，成本",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {
+                            "step": 1,
+                            "type": "sql",
+                            "goal": "按公共粒度统计净利润、净利率、毛利率",
+                            "tables": ["t_journal_entry", "t_journal_item", "t_account"],
+                            "depends_on": [],
+                            "merge_keys": ["parent_id", "department_id", "cost_center_id"],
+                        },
+                        {"step": 2, "type": "report", "goal": "输出结论", "tables": [], "depends_on": [1]},
+                    ],
+                },
+                "plan_approved": True,
+                "selected_tables": [
+                    "t_journal_entry",
+                    "t_journal_item",
+                    "t_account",
+                    "t_cost_center",
+                    "t_department",
+                ],
+                "semantic_model": semantic_model,
+                "table_relationships": [],
+                "security_context": {"allowed_tables": list(semantic_model.keys())},
+                "evidence": ["术语: 净利润\n公式: 收入 - 成本 - 费用"],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] is None
+        assert result["plan_execution_results"]["1"]["error"] is None
+        assert "t_cost_center" in result["plan_execution_results"]["1"]["tables"]
+        assert "t_department" in result["plan_execution_results"]["1"]["tables"]
+
+    @pytest.mark.asyncio
     @patch("agents.tool.sql_tools.mcp_client.execute_sql")
     async def test_dry_run_explains_sql_without_executing_user_query(self, mock_mcp_execute):
         """dry_run_sql should call MCP with EXPLAIN and keep the original SQL untouched."""

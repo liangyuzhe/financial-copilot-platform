@@ -1621,6 +1621,20 @@ def _expand_step_tables_by_relationship_paths(
     )
 
 
+def _expand_step_tables_for_generated_sql(
+    step_tables: list[str],
+    sql: str,
+    selected_tables: list[str],
+) -> list[str]:
+    """Keep generated-SQL tables that belong to the approved complex-plan scope."""
+    expanded = list(step_tables)
+    approved_scope = set(selected_tables or step_tables)
+    for table in _tables_from_sql(sql):
+        if table in approved_scope and table not in expanded:
+            expanded.append(table)
+    return expanded
+
+
 def _short_text(value, limit: int = 500) -> str:
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     text = (text or "").strip()
@@ -3067,6 +3081,21 @@ async def _execute_complex_sql_step(
         while True:
             generation = await sql_generate(step_state, config=config)
             step_state.update(generation)
+            tables = _expand_step_tables_for_generated_sql(
+                tables,
+                step_state.get("sql", ""),
+                state.get("selected_tables") or [],
+            )
+            table_set = set(tables)
+            step_state.update({
+                "selected_tables": tables,
+                "table_relationships": _filter_relationships_for_tables(state.get("table_relationships", []), table_set),
+                "semantic_model": {
+                    table: (state.get("semantic_model") or {}).get(table, {})
+                    for table in tables
+                    if table in (state.get("semantic_model") or {})
+                },
+            })
             result = await _run_complex_sql_harness(step_state, step, tables, callbacks=callbacks)
             error_msg = str(result.get("error") or "")
             if not error_msg:
