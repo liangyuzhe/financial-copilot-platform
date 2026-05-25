@@ -675,8 +675,10 @@ async def test_package_runner_prompts_with_toolkit_function_names_for_data_analy
     assert "analysis_plan_submit" not in schema_names
     assert seen["max_iters"] == 5
     assert len(json.dumps(schemas, ensure_ascii=False)) < 2500
+    assert len(seen["sys_prompt"]) < 900
     assert all(len(schema["function"].get("description", "")) < 180 for schema in schemas)
     assert "finance_relation_analysis" in seen["sys_prompt"]
+    assert "merge_keys" in seen["sys_prompt"]
     assert "business_knowledge_search" not in seen["sys_prompt"]
     assert "sql_examples_search" not in seen["sys_prompt"]
     assert "finance_relation_analysis" in seen["message_text"]
@@ -734,7 +736,9 @@ async def test_package_runner_exposes_finance_relation_skill_instead_of_primitiv
     assert "analysis_plan_submit" not in schema_names
     assert seen["max_iters"] == 5
     assert len(json.dumps(schemas, ensure_ascii=False)) < 2500
+    assert len(seen["sys_prompt"]) < 900
     assert "finance_relation_analysis" in seen["sys_prompt"]
+    assert "merge_keys" in seen["sys_prompt"]
     assert "schema_select_candidates" not in seen["sys_prompt"]
     assert "finance_relation_analysis" in seen["message_text"]
 

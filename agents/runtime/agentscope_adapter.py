@@ -53,6 +53,8 @@ agent: data_analysis_agent
 默认只使用已暴露的 skill，不直接调用底层 schema、semantic_model、SQL 预检查或 analysis_plan handoff 工具。
 不要直接执行 SQL；安全检查、权限校验、审批、执行和报告生成都属于后续 SQL Harness。
 如果信息不足以规划，返回 clarification_questions；如果足以规划，调用合适的业务 skill，让 skill 提交 mode=analysis_plan 且 steps 非空的计划。
+调用 finance_relation_analysis 时，LLM/Planner 需要根据用户语义推断分析粒度；若用户表达了按部门、成本中心、期间、项目等粒度分析，在 skill input 中传入 grain。
+如果能从语义和 schema 关系推断步骤结果的行对齐键，在 skill input 中传入 merge_keys；不要把 id、parent_id、entry_id 这类主键、层级键或凭证连接键作为默认 merge key。
 最终回复只输出简洁 answer、analysis_plan 或 clarification_questions；不要回写 tool_trace、events、state_patch 或完整 AgentRunResult。
 """
 

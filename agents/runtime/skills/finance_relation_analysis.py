@@ -6,6 +6,7 @@ orchestrating the primitive ToolCatalog evidence flow internally.
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,7 +53,18 @@ class FinanceRelationAnalysisSkill:
                 },
                 "grain": {
                     "type": "string",
-                    "description": "Optional analysis grain, such as department, month, or project.",
+                    "description": (
+                        "Optional business analysis grain inferred by the planner, "
+                        "such as department, month, project, or overall."
+                    ),
+                },
+                "merge_keys": {
+                    "type": "array",
+                    "description": (
+                        "Optional row-alignment keys inferred by the planner for plan_execute, "
+                        "for example department_id, cost_center_id, period, or project_code."
+                    ),
+                    "items": {"type": "string"},
                 },
             },
             "required": ["query"],
@@ -73,6 +85,8 @@ class FinanceRelationAnalysisSkill:
 
     async def run(self, payload: JsonDict, context: Any) -> SkillResult:
         query = str(payload.get("query") or context.query or "").strip()
+        requested_grain = payload.get("grain")
+        requested_merge_keys = self._string_items(payload.get("merge_keys"))
         if self._needs_clarification(query):
             return SkillResult(
                 status="needs_clarification",
@@ -185,6 +199,8 @@ class FinanceRelationAnalysisSkill:
                 feasibility.output,
                 recall_context,
                 relationship_rows,
+                requested_grain=requested_grain,
+                requested_merge_keys=requested_merge_keys,
             )
             if execution_mode == "plan_execute"
             else self._single_sql_plan(query, selected_tables, evidence)
@@ -476,6 +492,9 @@ class FinanceRelationAnalysisSkill:
         feasibility_output: Any,
         recall_context: dict[str, Any],
         relationships: list[dict[str, Any]],
+        *,
+        requested_grain: Any = "",
+        requested_merge_keys: list[str] | None = None,
     ) -> JsonDict:
         subject_groups = self._subject_groups_from_evidence(
             query=query,
@@ -487,7 +506,15 @@ class FinanceRelationAnalysisSkill:
         if not subject_groups:
             subject_groups = self._subject_groups_from_components(selected_tables, relationships)
         subject_groups = self._limit_subject_groups(subject_groups, max_sql_steps=3)
-        merge_keys = self._merge_keys_from_relationships(relationships)
+        merge_keys = self._merge_keys_from_relationships(
+            relationships,
+            requested_merge_keys=requested_merge_keys or [],
+        )
+        grain_label = self._grain_label_for_merge_keys(
+            merge_keys,
+            requested_grain=requested_grain,
+        )
+        step_table_limit = 8
 
         steps: list[JsonDict] = []
         for index, group in enumerate(subject_groups, start=1):
@@ -498,13 +525,19 @@ class FinanceRelationAnalysisSkill:
                 if isinstance(table, str) and table in selected_tables
             ]
             if not tables:
-                tables = selected_tables[:5]
+                tables = selected_tables[:step_table_limit]
+            tables = self._expand_tables_for_merge_keys(
+                tables,
+                selected_tables,
+                relationships,
+                merge_keys,
+            )
             steps.append(
                 {
                     "step": index,
                     "type": "sql",
-                    "goal": f"按公共粒度统计{label}",
-                    "tables": tables[:5],
+                    "goal": f"按{grain_label}统计{label}",
+                    "tables": tables[:step_table_limit],
                     "grain": merge_keys,
                     "depends_on": [],
                     "merge_keys": merge_keys,
@@ -518,7 +551,7 @@ class FinanceRelationAnalysisSkill:
                 {
                     "step": merge_step,
                     "type": "python_merge",
-                    "goal": "按公共维度合并各指标组结果并计算对比指标",
+                    "goal": f"按{grain_label}合并各指标组结果并计算对比指标",
                     "tables": [],
                     "depends_on": list(range(1, merge_step)),
                     "merge_keys": merge_keys,
@@ -788,15 +821,207 @@ class FinanceRelationAnalysisSkill:
             },
         ]
 
-    def _merge_keys_from_relationships(self, relationships: list[dict[str, Any]]) -> list[str]:
-        keys: list[str] = []
+    def _merge_keys_from_relationships(
+        self,
+        relationships: list[dict[str, Any]],
+        *,
+        requested_merge_keys: list[str],
+    ) -> list[str]:
+        validated = [
+            key
+            for key in requested_merge_keys
+            if self._is_valid_requested_merge_key(key, relationships)
+        ]
+        if validated:
+            return self._unique(validated)[:3]
+
+        candidate_counts: dict[str, set[str]] = {}
         for rel in relationships:
-            for column_key in ("from_column", "to_column"):
-                column = str(rel.get(column_key) or "").strip()
-                if not column or column == "id" or column in keys:
+            if self._is_hierarchy_relationship(rel):
+                continue
+            column = str(rel.get("from_column") or "").strip()
+            if not self._is_dimension_relationship(rel):
+                continue
+            from_table = str(rel.get("from_table") or "").strip()
+            candidate_counts.setdefault(column, set()).add(from_table)
+
+        candidates = [
+            column
+            for column, source_tables in candidate_counts.items()
+            if column and len(source_tables) > 1
+        ]
+        return self._order_merge_keys_by_relationship_grain(candidates, relationships)[:3]
+
+    def _is_valid_requested_merge_key(self, key: str, relationships: list[dict[str, Any]]) -> bool:
+        if key == "period":
+            return True
+        if not self._is_business_merge_column(key):
+            return False
+        return any(
+            str(rel.get("from_column") or "").strip() == key
+            and self._is_dimension_relationship(rel)
+            for rel in relationships
+        )
+
+    def _is_hierarchy_relationship(self, rel: dict[str, Any]) -> bool:
+        left = str(rel.get("from_table") or "").strip()
+        right = str(rel.get("to_table") or "").strip()
+        return bool(left and left == right)
+
+    def _is_business_merge_column(self, column: str) -> bool:
+        if not column or column == "id":
+            return False
+        return column.endswith("_id") or column.endswith("_code") or column in {"period"}
+
+    def _is_dimension_relationship(self, rel: dict[str, Any]) -> bool:
+        if self._is_hierarchy_relationship(rel):
+            return False
+        column = str(rel.get("from_column") or "").strip()
+        target_column = str(rel.get("to_column") or "").strip()
+        target_table = str(rel.get("to_table") or "").strip()
+        if not self._is_business_merge_column(column):
+            return False
+        column_base = self._merge_key_base(column)
+        table_base = self._table_base(target_table)
+        if column.endswith("_id") and target_column == "id":
+            return column_base == table_base
+        if column.endswith("_code") and target_column.endswith("_code"):
+            return column_base == table_base
+        return False
+
+    def _grain_label_for_merge_keys(self, merge_keys: list[str], *, requested_grain: Any = "") -> str:
+        grain = str(requested_grain or "").strip()
+        if grain:
+            return grain if grain.endswith("维度") else f"{grain}维度"
+        if "period" in set(merge_keys):
+            return "期间维度"
+        return "公共维度"
+
+    def _merge_key_base(self, key: str) -> str:
+        text = str(key or "").strip()
+        for suffix in ("_id", "_code"):
+            if text.endswith(suffix):
+                return text[: -len(suffix)]
+        return text
+
+    def _table_base(self, table: str) -> str:
+        text = str(table or "").strip()
+        return text[2:] if text.startswith("t_") else text
+
+    def _dimension_tables_for_merge_key(
+        self,
+        merge_key: str,
+        selected_tables: set[str],
+        relationships: list[dict[str, Any]],
+    ) -> list[str]:
+        tables: list[str] = []
+        for rel in relationships:
+            if str(rel.get("from_column") or "").strip() != merge_key:
+                continue
+            if not self._is_dimension_relationship(rel):
+                continue
+            target = str(rel.get("to_table") or "").strip()
+            if target in selected_tables and target not in tables:
+                tables.append(target)
+        return tables
+
+    def _order_merge_keys_by_relationship_grain(
+        self,
+        merge_keys: list[str],
+        relationships: list[dict[str, Any]],
+    ) -> list[str]:
+        ordered = self._unique(merge_keys)
+        for parent_key in list(ordered):
+            for child_key in list(ordered):
+                if parent_key == child_key:
                     continue
-                keys.append(column)
-        return keys[:3]
+                child_dimensions = {
+                    str(rel.get("to_table") or "").strip()
+                    for rel in relationships
+                    if str(rel.get("from_column") or "").strip() == child_key
+                    and self._is_dimension_relationship(rel)
+                }
+                is_parent_of_child = any(
+                    str(rel.get("from_table") or "").strip() in child_dimensions
+                    and str(rel.get("from_column") or "").strip() == parent_key
+                    for rel in relationships
+                )
+                if is_parent_of_child and ordered.index(parent_key) > ordered.index(child_key):
+                    ordered.remove(parent_key)
+                    ordered.insert(ordered.index(child_key), parent_key)
+        return ordered
+
+    def _expand_tables_for_merge_keys(
+        self,
+        tables: list[str],
+        selected_tables: list[str],
+        relationships: list[dict[str, Any]],
+        merge_keys: list[str],
+    ) -> list[str]:
+        result = self._unique([table for table in tables if table in selected_tables])
+        selected = set(selected_tables)
+        grain_tables = self._dimension_tables_for_merge_keys(merge_keys, selected, relationships)
+        for table in grain_tables:
+            if table in selected and table not in result:
+                result = self._connect_tables(result, table, selected_tables, relationships)
+        return self._unique([table for table in result if table in selected])
+
+    def _dimension_tables_for_merge_keys(
+        self,
+        merge_keys: list[str],
+        selected_tables: set[str],
+        relationships: list[dict[str, Any]],
+    ) -> list[str]:
+        tables: list[str] = []
+        for merge_key in merge_keys:
+            for table in self._dimension_tables_for_merge_key(merge_key, selected_tables, relationships):
+                if table not in tables:
+                    tables.append(table)
+        return tables
+
+    def _connect_tables(
+        self,
+        tables: list[str],
+        target_table: str,
+        selected_tables: list[str],
+        relationships: list[dict[str, Any]],
+    ) -> list[str]:
+        if target_table in tables:
+            return tables
+        selected = set(selected_tables)
+        seeds = [table for table in tables if table in selected]
+        if not seeds:
+            return self._unique([*tables, target_table])
+        graph: dict[str, set[str]] = {table: set() for table in selected}
+        for rel in relationships:
+            left = str(rel.get("from_table") or "").strip()
+            right = str(rel.get("to_table") or "").strip()
+            if left in selected and right in selected:
+                graph.setdefault(left, set()).add(right)
+                graph.setdefault(right, set()).add(left)
+
+        queue: deque[str] = deque(seeds)
+        previous: dict[str, str | None] = {seed: None for seed in seeds}
+        while queue:
+            current = queue.popleft()
+            if current == target_table:
+                break
+            for neighbor in graph.get(current, set()):
+                if neighbor in previous:
+                    continue
+                previous[neighbor] = current
+                queue.append(neighbor)
+
+        if target_table not in previous:
+            return self._unique([*tables, target_table])
+
+        path: list[str] = []
+        cursor: str | None = target_table
+        while cursor is not None:
+            path.append(cursor)
+            cursor = previous.get(cursor)
+        path.reverse()
+        return self._unique([*tables, *path])
 
     def _unique(self, values: list[str]) -> list[str]:
         rows = []

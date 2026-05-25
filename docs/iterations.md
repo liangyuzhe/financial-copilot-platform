@@ -5075,3 +5075,84 @@ bce37d9 Preserve complex step dimension context
 - 专用业务 formatter 只能解决当前意图族；还需要通用 preview 兜底过滤内部字段，否则下一个复杂 case 仍可能泄露工程列。
 - 指标规则要区分金额和数量。`expense_count` 这样的字段不能参与费用金额求和。
 - 主结果应该面向业务问题，技术诊断只能作为附属说明，并明确告诉用户缺什么维度、怎么补数据。
+
+### Bug Fix 5：部门维度复杂计划在 Planner 阶段丢失业务 grain
+
+真实 case：
+
+```text
+2025年按部门分析盈利率，亏损，成本
+LangSmith trace: 019e5eeb-d630-76e2-8c23-305d93879bad
+```
+
+LangSmith MCP 复核结果：
+
+```text
+sql_harness.approve_analysis_plan
+input: 2025年按部门分析盈利率，亏损，成本
+
+step 1:
+goal: 按公共粒度统计净利润、净利率、毛利率
+tables: t_journal_entry, t_journal_item, t_account, t_expense_claim
+merge_keys: parent_id, department_id, cost_center_id
+
+step 2:
+goal: 按公共粒度统计部门费用
+tables: t_expense_claim, t_cost_center, t_department
+merge_keys: parent_id, department_id, cost_center_id
+```
+
+问题：
+
+- 用户明确说“按部门”，但 AgentScope skill 提交给 SQL Harness 的 step goal 仍是“按公共粒度”。
+- 第 1 步没有声明 `t_cost_center / t_department`，但 merge key 却要求 `department_id / cost_center_id`。
+- `_merge_keys_from_relationships()` 从所有关系字段里按顺序取列，导致 `t_department.parent_id -> t_department.id` 里的 `parent_id` 被误当成跨步骤合并键。
+- 后续 SQL Harness 为满足部门维度会自然生成部门/成本中心 JOIN，但 plan step 的 schema 上下文先天缺维表，容易引出 semantic_check unknown table、merge 未对齐和用户不可读输出。
+
+根因：
+
+- Planner 把 `merge_keys` 当成“数据库关系列”，而不是“步骤结果之间的业务对齐粒度”。
+- step goal 文案固定写成“公共粒度”，没有由 grain 推导。
+- 计划生成只按指标证据分组表，没有根据 grain 自动补齐维表和桥表。
+
+修复：
+
+- 去掉 `finance_grain_rules.json` 文件设计，不把业务 grain 选择下沉成静态规则文件。
+- AgentScope prompt 明确要求 LLM/Planner 在调用 `finance_relation_analysis` 时根据用户语义推断：
+  - `grain`：例如部门、成本中心、期间、项目。
+  - `merge_keys`：步骤结果之间的行对齐键，例如 `department_id / cost_center_id / period`。
+- `FinanceRelationAnalysisSkill` 的职责收敛为结构校验和兜底：
+  - 优先使用 LLM/Planner 传入的 `merge_keys`。
+  - 只保留 schema relationship 中存在、且不是层级自关联的业务维度列。
+  - 如果 Planner 没有传 `merge_keys`，再按 relationship graph 选择多个事实/维度组都可输出的公共维度列。
+  - `parent_id` 这类同表层级键不会作为默认跨步骤合并键。
+- SQL step 的 goal 由 Planner 传入的 grain label 推导：
+  - `按部门维度统计净利润、净利率、毛利率`
+  - `按部门维度统计部门费用`
+  - merge step 为 `按部门维度合并各指标组结果并计算对比指标`
+- 每个 SQL step 会根据 merge key 自动补齐所需维表，并通过 relationship graph 补齐从事实表到维表的路径，不依赖单独配置文件。
+
+新增回归：
+
+- `test_finance_relation_skill_plan_execute_keeps_requested_department_grain`
+- `test_finance_relation_skill_filters_invalid_planner_merge_keys_by_schema_graph`
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_skill_runtime.py -k "finance_relation_skill"
+# 8 passed, 3 deselected
+
+.venv/bin/python -m pytest tests/test_skill_runtime.py tests/test_sql_react.py -k "finance_relation or complex_plan_step_keeps_merge_dimension_tables or public or grain"
+# 9 passed, 143 deselected
+
+.venv/bin/python -m pytest tests/test_agentscope_adapter.py -k "finance_relation or complex"
+# 2 passed, 30 deselected
+```
+
+踩坑：
+
+- “按部门”不应该只影响最终展示，也必须进入 Planner 的 grain contract。
+- `merge_keys` 不是外键列表。它必须是所有依赖步骤都能 SELECT/GROUP BY 输出的业务对齐键。
+- `parent_id` 适合做部门层级分析，不适合作为默认合并键；否则会把可按部门/成本中心合并的数据误判成未对齐。
+- 业务 grain 的主判断应该由 LLM/Planner 根据用户语义完成；runtime 只做 schema graph 约束、非法 key 过滤和维表上下文补齐。

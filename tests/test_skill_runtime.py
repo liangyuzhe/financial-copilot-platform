@@ -413,6 +413,126 @@ def test_finance_relation_skill_merges_subject_groups_by_relationship_expansion(
     ]
 
 
+def test_finance_relation_skill_plan_execute_keeps_requested_department_grain():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+    relationships = [
+        {
+            "from_table": "t_journal_item",
+            "from_column": "entry_id",
+            "to_table": "t_journal_entry",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_journal_item",
+            "from_column": "account_code",
+            "to_table": "t_account",
+            "to_column": "account_code",
+        },
+        {
+            "from_table": "t_journal_item",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_cost_center",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_department",
+            "from_column": "parent_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+    ]
+
+    plan = skill._plan_execute_plan(
+        query="2025年按部门分析盈利率，亏损，成本",
+        selected_tables=[
+            "t_journal_entry",
+            "t_journal_item",
+            "t_account",
+            "t_expense_claim",
+            "t_cost_center",
+            "t_department",
+        ],
+        evidence=[
+            "术语: 净利润\n公式: 收入 - 成本 - 费用\n关联表: t_journal_entry,t_journal_item,t_account,t_expense_claim",
+            "术语: 部门费用\n公式: SUM(total_amount) GROUP BY cost_center_id\n关联表: t_expense_claim,t_cost_center,t_department",
+        ],
+        feasibility_output={"feasibility_decision": {"execution_mode": "complex_plan"}},
+        recall_context={"matched_terms": ["净利润", "部门费用"]},
+        relationships=relationships,
+        requested_grain="部门",
+        requested_merge_keys=["parent_id", "department_id", "cost_center_id"],
+    )
+
+    sql_steps = [step for step in plan["steps"] if step["type"] == "sql"]
+
+    assert sql_steps
+    assert all("部门维度" in step["goal"] for step in sql_steps)
+    assert all("公共粒度" not in step["goal"] for step in sql_steps)
+    assert all(step["merge_keys"] == ["department_id", "cost_center_id"] for step in sql_steps)
+    assert all("parent_id" not in step["merge_keys"] for step in sql_steps)
+    assert "t_cost_center" in sql_steps[0]["tables"]
+    assert "t_department" in sql_steps[0]["tables"]
+    assert plan["steps"][-2]["goal"] == "按部门维度合并各指标组结果并计算对比指标"
+
+
+def test_finance_relation_skill_filters_invalid_planner_merge_keys_by_schema_graph():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+
+    merge_keys = skill._merge_keys_from_relationships(
+        [
+            {
+                "from_table": "t_journal_item",
+                "from_column": "entry_id",
+                "to_table": "t_journal_entry",
+                "to_column": "id",
+            },
+            {
+                "from_table": "t_journal_item",
+                "from_column": "cost_center_id",
+                "to_table": "t_cost_center",
+                "to_column": "id",
+            },
+            {
+                "from_table": "t_cost_center",
+                "from_column": "department_id",
+                "to_table": "t_department",
+                "to_column": "id",
+            },
+            {
+                "from_table": "t_department",
+                "from_column": "parent_id",
+                "to_table": "t_department",
+                "to_column": "id",
+            },
+        ],
+        requested_merge_keys=["parent_id", "entry_id", "department_id", "missing_key"],
+    )
+
+    assert merge_keys == ["department_id"]
+
+
 def test_finance_relation_skill_focuses_single_sql_on_best_connected_component():
     from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
 
