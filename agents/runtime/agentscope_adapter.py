@@ -8,6 +8,7 @@ tested without granting AgentScope direct SQL execution.
 from __future__ import annotations
 
 import importlib
+import inspect
 import json
 import os
 import re
@@ -19,6 +20,9 @@ from pydantic import BaseModel, Field
 from agents.config.settings import settings
 from agents.runtime.agentscope_runtime import AgentScopeRunContext
 from agents.runtime.result import AgentRunResult, JsonDict
+from agents.runtime.skill_runtime import SkillRuntime
+from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+from agents.runtime.tool_exposure_policy import DATA_ANALYSIS_PRIMITIVE_STAGES, ToolExposurePolicy
 
 from agentscope.agent import ReActAgent
 from agentscope.formatter import (
@@ -32,6 +36,25 @@ from agentscope.model import (
 )
 from agentscope.tool import Toolkit, ToolResponse
 
+_DATA_ANALYSIS_COMPACT_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "business_knowledge.search": "Recall metric definitions, formulas, synonyms, and related-table hints.",
+    "schema.select_candidates": "Select likely authorized tables for the analysis question.",
+    "semantic_model.search": "Return field semantics for the requested table_names.",
+    "schema.related_tables": "Return relationship edges among candidate tables.",
+    "current_time.now": "Resolve current date/time for relative-date questions.",
+    "analysis_plan.submit": "Submit a structured analysis_plan to SQL Harness for review and execution.",
+}
+
+_DATA_ANALYSIS_PACKAGE_SYSTEM_PROMPT = """\
+agent: data_analysis_agent
+
+你是 Financial Copilot Platform 的轻量数据分析规划 Agent。
+目标是选择并调用少量业务 skill 生成结构化 analysis_plan，并交回 SQL Harness。
+默认只使用已暴露的 skill，不直接调用底层 schema、semantic_model、SQL 预检查或 analysis_plan handoff 工具。
+不要直接执行 SQL；安全检查、权限校验、审批、执行和报告生成都属于后续 SQL Harness。
+如果信息不足以规划，返回 clarification_questions；如果足以规划，调用合适的业务 skill，让 skill 提交 mode=analysis_plan 且 steps 非空的计划。
+最终回复只输出简洁 answer、analysis_plan 或 clarification_questions；不要回写 tool_trace、events、state_patch 或完整 AgentRunResult。
+"""
 
 class AgentScopeAdapterUnavailable(RuntimeError):
     """Raised when the requested AgentScope backend cannot be constructed."""
@@ -49,6 +72,237 @@ class _DataAnalysisPlanOutput(BaseModel):
         default_factory=list,
         description="Questions if a plan cannot be generated.",
     )
+
+
+class _TracingModelProxy:
+    """Bridge real AgentScope model calls into platform LangSmith callbacks."""
+
+    def __init__(
+        self,
+        model: Any,
+        *,
+        context: AgentScopeRunContext,
+        agent_name: str,
+        tool_exposure_policy: ToolExposurePolicy | None = None,
+        expose_primitive_tools: bool = False,
+    ) -> None:
+        self._model = model
+        self._context = context
+        self._agent_name = agent_name
+        self._tool_exposure_policy = tool_exposure_policy or ToolExposurePolicy.from_env()
+        self._expose_primitive_tools = expose_primitive_tools
+        self._call_index = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._model, name)
+
+    async def __call__(
+        self,
+        messages: Any,
+        tools: list[dict] | None = None,
+        tool_choice: str | None = None,
+        structured_model: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self._call_index += 1
+        call_index = self._call_index
+        span_name = f"agentscope.llm.{self._agent_name}.reasoning"
+        visible_tools = self._visible_tools_for_model(tools)
+        active_spans = await self._context.start_llm_span(
+            span_name,
+            self._render_model_input(messages, visible_tools, tool_choice, structured_model, kwargs),
+            metadata={
+                "agent": self._agent_name,
+                "runner_backend": "agentscope",
+                "iteration": call_index,
+                "tool_choice": str(tool_choice or ""),
+                "tool_names": self._tool_names(visible_tools),
+                "structured_model": self._structured_model_name(structured_model),
+            },
+        )
+        try:
+            maybe_response = self._model(
+                messages,
+                tools=visible_tools,
+                tool_choice=tool_choice,
+                structured_model=structured_model,
+                **kwargs,
+            )
+            response = await maybe_response if inspect.isawaitable(maybe_response) else maybe_response
+        except Exception as exc:
+            await self._context.end_llm_span(active_spans, span_name, "", str(exc))
+            raise
+
+        if self._is_async_iterable(response):
+            return self._wrap_stream_response(response, active_spans, span_name)
+
+        await self._context.end_llm_span(
+            active_spans,
+            span_name,
+            self._render_model_output(response),
+        )
+        return response
+
+    async def _wrap_stream_response(
+        self,
+        response: Any,
+        active_spans: list[tuple[Any, Any]],
+        span_name: str,
+    ) -> Any:
+        last_chunk = None
+        try:
+            async for chunk in response:
+                last_chunk = chunk
+                yield chunk
+        except Exception as exc:
+            await self._context.end_llm_span(active_spans, span_name, "", str(exc))
+            raise
+        else:
+            await self._context.end_llm_span(
+                active_spans,
+                span_name,
+                self._render_model_output(last_chunk),
+            )
+
+    def _render_model_input(
+        self,
+        messages: Any,
+        tools: list[dict] | None,
+        tool_choice: str | None,
+        structured_model: Any | None,
+        kwargs: dict[str, Any],
+    ) -> str:
+        payload = {
+            "messages": messages,
+            "tools": self._tool_summaries(tools),
+            "tool_choice": tool_choice,
+            "structured_model": self._structured_model_name(structured_model),
+        }
+        if kwargs:
+            payload["kwargs"] = dict(kwargs)
+        return self._short_json(payload, limit=20000)
+
+    def _render_model_output(self, response: Any) -> str:
+        if response is None:
+            return ""
+        if isinstance(response, str):
+            return response
+        text_getter = self._safe_getattr(response, "get_text_content")
+        if callable(text_getter):
+            return text_getter() or self._short_json(response, limit=20000)
+        content = getattr(response, "content", None)
+        if content is not None:
+            payload = {
+                "id": getattr(response, "id", ""),
+                "content": [self._normalize_content_block(block) for block in content],
+            }
+            usage = getattr(response, "usage", None)
+            if usage is not None:
+                payload["usage"] = usage
+            metadata = getattr(response, "metadata", None)
+            if metadata is not None:
+                payload["metadata"] = metadata
+            return self._short_json(payload, limit=20000)
+        return self._short_json(response, limit=20000)
+
+    def _normalize_content_block(self, block: Any) -> Any:
+        if isinstance(block, dict):
+            block_type = block.get("type")
+            if block_type == "text":
+                return {"type": "text", "text": block.get("text", "")}
+            if block_type == "tool_use":
+                return {
+                    "type": "tool_use",
+                    "id": block.get("id", ""),
+                    "name": block.get("name", ""),
+                    "input": block.get("input", {}),
+                }
+            return dict(block)
+        return str(block)
+
+    def _tool_summaries(self, tools: list[dict] | None) -> list[dict[str, Any]]:
+        summaries = []
+        for tool in tools or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if not isinstance(function, dict):
+                continue
+            summaries.append(
+                {
+                    "name": function.get("name", ""),
+                    "description": function.get("description", ""),
+                }
+            )
+        return summaries
+
+    def _tool_names(self, tools: list[dict] | None) -> list[str]:
+        return [
+            str(summary.get("name") or "")
+            for summary in self._tool_summaries(tools)
+            if str(summary.get("name") or "")
+        ]
+
+    def _visible_tools_for_model(self, tools: list[dict] | None) -> list[dict] | None:
+        if not tools or self._context.task_type != "data_analysis":
+            return tools
+        visible_function_names = set(self._visible_function_names_for_context(tools))
+        return [
+            tool
+            for tool in tools
+            if self._schema_function_name(tool) in visible_function_names
+        ]
+
+    def _visible_function_names_for_context(self, tools: list[dict]) -> list[str]:
+        function_names = self._tool_names(tools)
+        if self._expose_primitive_tools:
+            visible_internal_names = self._tool_exposure_policy.visible_tool_names(
+                task_type=self._context.task_type,
+                base_tool_names=[tool.name for tool in self._context.tools],
+                expose_primitive_tools=True,
+                previous_tool_name=self._previous_successful_tool_name(),
+            )
+            visible_function_names = {
+                self._toolkit_func_name(tool_name)
+                for tool_name in visible_internal_names
+            }
+            return [name for name in function_names if name in visible_function_names]
+        return self._tool_exposure_policy.visible_tool_names(
+            task_type=self._context.task_type,
+            base_tool_names=function_names,
+            expose_primitive_tools=False,
+        )
+
+    def _previous_successful_tool_name(self) -> str:
+        for trace in reversed(self._context.tool_trace):
+            if trace.get("status") == "success":
+                return str(trace.get("tool_name") or "")
+        return ""
+
+    def _schema_function_name(self, tool: dict) -> str:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict):
+            return ""
+        return str(function.get("name") or "")
+
+    def _toolkit_func_name(self, tool_name: str) -> str:
+        return tool_name.replace(".", "_")
+
+    def _structured_model_name(self, structured_model: Any | None) -> str:
+        if structured_model is None:
+            return ""
+        return str(getattr(structured_model, "__name__", structured_model))
+
+    def _is_async_iterable(self, value: Any) -> bool:
+        return self._safe_getattr(value, "__aiter__") is not None
+
+    def _safe_getattr(self, value: Any, name: str) -> Any | None:
+        try:
+            return getattr(value, name)
+        except (AttributeError, KeyError):
+            return None
+
+    def _short_json(self, value: Any, *, limit: int) -> str:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        return text if len(text) <= limit else text[:limit] + "..."
 
 
 def create_agentscope_runner(backend: str | None = None):
@@ -80,10 +334,18 @@ class AgentScopePackageRunner:
     model_factory: Callable[[], Any] | None = None
     formatter_factory: Callable[[], Any] | None = None
     agent_factory: Callable[..., Any] | None = None
+    skill_runtime: SkillRuntime | None = None
+    tool_exposure_policy: ToolExposurePolicy | None = None
+    expose_data_analysis_primitive_tools: bool = False
     max_iters: int = 6
+    data_analysis_max_iters: int = 5
 
     def __post_init__(self) -> None:
         self._ensure_package()
+        if self.skill_runtime is None:
+            self.skill_runtime = SkillRuntime(skills=[FinanceRelationAnalysisSkill()])
+        if self.tool_exposure_policy is None:
+            self.tool_exposure_policy = ToolExposurePolicy.from_env()
 
     def _ensure_package(self) -> None:
         try:
@@ -98,28 +360,25 @@ class AgentScopePackageRunner:
         toolkit = self._build_toolkit(context)
         agent = self._build_agent(context, toolkit)
         input_msg = Msg(name="user", role="user", content=self._build_initial_user_message(context))
-        llm_span_name = f"agentscope.llm.{self._agent_name_for_task(context.task_type)}"
-        llm_span = await context.start_llm_span(
-            llm_span_name,
+        agent_name = self._agent_name_for_task(context.task_type)
+        agent_span_name = f"agentscope.agent.{agent_name}"
+        agent_span = await context.start_chain_span(
+            agent_span_name,
             context.query,
             metadata={
-                "agent": self._agent_name_for_task(context.task_type),
+                "agent": agent_name,
                 "runner_backend": "agentscope",
             },
         )
         try:
             reply = await self._call_agent(agent, input_msg, context)
         except Exception as exc:
-            await context.end_llm_span(llm_span, llm_span_name, "", str(exc))
+            await context.end_chain_span(agent_span, agent_span_name, "error", str(exc))
             return self._adapter_error_result(exc)
-        await context.end_llm_span(
-            llm_span,
-            llm_span_name,
-            reply.get_text_content() if hasattr(reply, "get_text_content") else str(reply),
-        )
         result = self._convert_reply(reply, context=context)
         if context.task_type == "data_analysis":
             await self._submit_structured_analysis_plan(result, context)
+        await context.end_chain_span(agent_span, agent_span_name, self._agent_span_output(result))
         return result
 
     async def _call_agent(
@@ -129,7 +388,16 @@ class AgentScopePackageRunner:
         context: AgentScopeRunContext,
     ) -> Msg:
         reply = await agent(input_msg)
-        if context.task_type != "data_analysis" or not self._data_analysis_needs_evidence_retry(reply, context):
+        if context.task_type != "data_analysis":
+            return reply
+        if self._data_analysis_needs_textual_tool_retry(reply, context):
+            retry_msg = Msg(
+                name="user",
+                role="user",
+                content=self._build_textual_tool_retry_message(context),
+            )
+            return await agent(retry_msg)
+        if not self._data_analysis_needs_evidence_retry(reply, context):
             return reply
         retry_msg = Msg(
             name="user",
@@ -145,24 +413,67 @@ class AgentScopePackageRunner:
     ) -> bool:
         if context.tool_trace:
             return False
+        if self._reply_contains_textual_analysis_plan_handoff(reply):
+            return False
         result = self._convert_reply(reply, context=None)
         plan = result.state_patch.get("analysis_plan")
         if isinstance(plan, dict) and plan.get("steps"):
             return False
         return True
 
+    def _data_analysis_needs_textual_tool_retry(
+        self,
+        reply: Msg,
+        context: AgentScopeRunContext,
+    ) -> bool:
+        if self._has_successful_handoff(context, "analysis_plan.submit"):
+            return False
+        result = self._convert_reply(reply, context=None)
+        plan = result.state_patch.get("analysis_plan")
+        if isinstance(plan, dict) and plan.get("steps"):
+            return False
+        if result.clarification_questions:
+            return False
+        return self._reply_contains_non_handoff_tool_call(reply)
+
+    def _reply_contains_non_handoff_tool_call(self, reply: Msg) -> bool:
+        text = self._message_text(reply)
+        if "<tool_call>" not in text and "<function=" not in text:
+            return False
+        function_names = [
+            name.strip()
+            for name in re.findall(r"<function=([^>\s]+)>", text)
+            if name.strip()
+        ]
+        if function_names:
+            return any(name != "analysis_plan_submit" for name in function_names)
+        return "analysis_plan_submit" not in text
+
+    def _reply_contains_textual_analysis_plan_handoff(self, reply: Msg) -> bool:
+        text = self._message_text(reply)
+        return "analysis_plan_submit" in text and ("<tool_call>" in text or "<function=" in text)
+
+    def _build_textual_tool_retry_message(self, context: AgentScopeRunContext) -> str:
+        return (
+            f"用户问题: {context.query}\n\n"
+            "上一轮回复包含伪 tool_call 文本，但没有通过 AgentScope toolkit 实际执行该工具。"
+            "不要输出伪 tool_call、<function=...> 或 <parameter=...> 文本。\n"
+            "如果需要继续取证，必须实际调用 toolkit 暴露的函数；如果已经足以规划，"
+            "必须实际调用 analysis_plan_submit，提交 mode=analysis_plan 且 steps 非空的结构化计划。"
+            "如果仍需澄清，请返回 clarification_questions。\n"
+            f"{self._tool_name_instruction(context)}"
+        )
+
     def _build_evidence_retry_message(self, context: AgentScopeRunContext) -> str:
+        planning_tools = self._visible_function_names(context)
         return (
             f"用户问题: {context.query}\n\n"
             "上一轮没有任何 ToolCatalog 工具调用，也没有提交可执行 analysis_plan。"
             "这不满足 data_analysis_agent 的证据门槛。\n"
-            "请保留自主决策，但必须先实际调用至少一个与你判断相关的工具，例如 "
-            "query_context_rewrite、business_knowledge_search、sql_examples_search、"
-            "schema_list_tables、schema_select_candidates、semantic_model_search、"
-            "schema_related_tables、plan_assess_feasibility 或 current_time_now。"
+            "请保留自主决策，但必须先实际调用至少一个与你判断相关的业务 skill，例如 "
+            f"{'、'.join(planning_tools)}。"
             "不要只描述应该调用工具。\n"
-            "取得证据后，如果足以规划，调用 analysis_plan_submit 提交 mode=analysis_plan 且 steps 非空的计划；"
-            "如果仍需澄清，请基于已调用工具的证据提出澄清问题。"
+            "skill 会在内部取证并提交 analysis_plan；如果仍需澄清，请基于 skill observation 提出澄清问题。"
         )
 
     def _build_initial_user_message(self, context: AgentScopeRunContext) -> str:
@@ -170,28 +481,48 @@ class AgentScopePackageRunner:
             tool_names = self._tool_name_instruction(context)
             return (
                 f"用户问题: {context.query}\n\n"
-                "你现在是数据分析规划 Agent。请自主决定是否需要 context rewrite、业务知识、SQL 示例、query enhance、"
-                "schema、semantic model、候选表选择、表关系、可行性评估、当前时间或 SQL 本地校验，然后提交 analysis_plan。\n"
-                "不要只描述要调用哪些工具；当工具输出是规划所需证据时必须实际调用工具。\n"
+                "你现在是数据分析规划 Agent。请优先用最少工具获取规划证据，然后提交 analysis_plan。\n"
+                "不要只描述要调用哪些 skill；当 skill 输出是规划所需证据时必须实际调用 skill。\n"
+                "不要直接调用底层 schema/semantic/sql 工具；这些由 skill runtime 内部处理。\n"
                 "analysis_plan 必须包含 mode=analysis_plan 和非空 steps；如果无法规划，只返回澄清问题。\n"
+                "最终回复只输出简洁 answer、analysis_plan 或 clarification_questions；不要回写 tool_trace、events、state_patch 或完整 AgentRunResult。\n"
                 f"{tool_names}"
             )
         return context.query
 
     def _tool_name_instruction(self, context: AgentScopeRunContext) -> str:
-        visible_names = [
-            self._toolkit_func_name(tool.name)
-            for tool in context.tools
-        ]
+        visible_names = self._visible_function_names(context)
         if not visible_names:
             return "当前没有可用工具。"
         lines = [
             "重要：调用工具时必须使用 AgentScope toolkit 暴露的函数名，不要使用带点号的内部工具名。",
             "可用函数名：" + ", ".join(visible_names),
         ]
-        if "analysis_plan_submit" in visible_names:
+        if context.task_type == "data_analysis" and not self._data_analysis_expose_primitive_tools():
+            lines.append("完成规划时必须调用合适的业务 skill；skill 会把结构化 analysis_plan 交给 SQL Harness。")
+        elif "analysis_plan_submit" in visible_names:
             lines.append("完成规划后必须调用 analysis_plan_submit 提交结构化且 steps 非空的 analysis_plan。")
         return "\n".join(lines)
+
+    def _visible_function_names(self, context: AgentScopeRunContext) -> list[str]:
+        if context.task_type == "data_analysis":
+            if not self._data_analysis_expose_primitive_tools():
+                return self._tool_exposure_policy().visible_tool_names(
+                    task_type=context.task_type,
+                    base_tool_names=[skill.contract.name for skill in self._data_analysis_skills()],
+                    expose_primitive_tools=False,
+                )
+            visible_internal_names = self._tool_exposure_policy().visible_tool_names(
+                task_type=context.task_type,
+                base_tool_names=[tool.name for tool in context.tools],
+                expose_primitive_tools=True,
+                previous_tool_name=self._previous_successful_tool_name(context),
+            )
+            return [self._toolkit_func_name(tool_name) for tool_name in visible_internal_names]
+        return [
+            self._toolkit_func_name(tool.name)
+            for tool in self._tools_for_agent(context)
+        ]
 
     def _workflow_context_packet(self, context: AgentScopeRunContext) -> str:
         state = context.workflow_state or {}
@@ -241,20 +572,32 @@ class AgentScopePackageRunner:
         context: AgentScopeRunContext,
         toolkit: Toolkit,
     ) -> Any:
-        model = self._build_model()
+        agent_name = self._agent_name_for_task(context.task_type)
+        model = _TracingModelProxy(
+            self._build_model(),
+            context=context,
+            agent_name=agent_name,
+            tool_exposure_policy=self.tool_exposure_policy,
+            expose_primitive_tools=self._data_analysis_expose_primitive_tools(),
+        )
         formatter = self._build_formatter()
         factory = self.agent_factory or ReActAgent
         agent = factory(
-            name=self._agent_name_for_task(context.task_type),
+            name=agent_name,
             sys_prompt=self._system_prompt_for_agent(context),
             model=model,
             formatter=formatter,
             toolkit=toolkit,
-            max_iters=self.max_iters,
+            max_iters=self._max_iters_for_task(context.task_type),
         )
         if context.task_type == "data_analysis":
             self._guard_structured_finish_until_tool_evidence(agent, context)
         return agent
+
+    def _max_iters_for_task(self, task_type: str) -> int:
+        if task_type == "data_analysis":
+            return self.data_analysis_max_iters
+        return self.max_iters
 
     def _guard_structured_finish_until_tool_evidence(
         self,
@@ -274,10 +617,8 @@ class AgentScopePackageRunner:
                             type="text",
                             text=(
                                 "ToolCatalog evidence is required before structured output. "
-                                "Call at least one available planning tool such as current_time_now, "
-                                "business_knowledge_search, schema_list_tables, schema_select_candidates, "
-                                "semantic_model_search, schema_related_tables, or plan_assess_feasibility, "
-                                "then call generate_response or analysis_plan_submit."
+                                "Call an available business skill such as finance_relation_analysis first; "
+                                "the skill will gather evidence and submit analysis_plan when possible."
                             ),
                         )
                     ],
@@ -285,6 +626,25 @@ class AgentScopePackageRunner:
                         "success": False,
                         "structured_output": {},
                         "error": "missing_toolcatalog_evidence",
+                    },
+                )
+            if not self._data_analysis_finish_is_allowed(context, kwargs):
+                return ToolResponse(
+                    content=[
+                        TextBlock(
+                            type="text",
+                            text=(
+                                "Do not finish data_analysis with a narrative plan only. "
+                                "If planning is possible, call analysis_plan_submit with mode=analysis_plan "
+                                "and a non-empty steps array. If planning is not possible, finish only with "
+                                "clarification_questions explaining the missing user input."
+                            ),
+                        )
+                    ],
+                    metadata={
+                        "success": False,
+                        "structured_output": {},
+                        "error": "missing_analysis_plan_handoff",
                     },
                 )
             return original(**kwargs)
@@ -300,7 +660,32 @@ class AgentScopePackageRunner:
             for trace in context.tool_trace
         )
 
+    def _data_analysis_finish_is_allowed(
+        self,
+        context: AgentScopeRunContext,
+        kwargs: dict[str, Any],
+    ) -> bool:
+        if self._has_successful_handoff(context, "analysis_plan.submit"):
+            return True
+        plan = kwargs.get("analysis_plan")
+        if isinstance(plan, dict) and plan.get("steps"):
+            return True
+        state_patch = kwargs.get("state_patch")
+        if isinstance(state_patch, dict):
+            state_plan = state_patch.get("analysis_plan")
+            if isinstance(state_plan, dict) and state_plan.get("steps"):
+                return True
+        clarification_questions = kwargs.get("clarification_questions")
+        if isinstance(clarification_questions, list) and any(str(item).strip() for item in clarification_questions):
+            return True
+        answer = str(kwargs.get("answer") or "")
+        if any(marker in answer for marker in ("请说明", "请补充", "请明确", "需要澄清", "澄清以下")):
+            return True
+        return False
+
     def _system_prompt_for_agent(self, context: AgentScopeRunContext) -> str:
+        if context.task_type == "data_analysis":
+            return f"{_DATA_ANALYSIS_PACKAGE_SYSTEM_PROMPT}\n\n{self._tool_name_instruction(context)}"
         return f"{context.system_prompt}\n\n{self._tool_name_instruction(context)}"
 
     def _build_model(self) -> Any:
@@ -352,16 +737,35 @@ class AgentScopePackageRunner:
 
     def _build_toolkit(self, context: AgentScopeRunContext) -> Toolkit:
         toolkit = Toolkit()
-        for tool in context.tools:
+        if context.task_type == "data_analysis" and not self._data_analysis_expose_primitive_tools():
+            for skill in self._data_analysis_skills():
+                toolkit.register_tool_function(
+                    self._skill_wrapper(context, skill.contract.name),
+                    func_name=skill.contract.name,
+                    func_description=skill.contract.description,
+                    json_schema={
+                        "type": "function",
+                        "function": {
+                            "name": skill.contract.name,
+                            "description": skill.contract.description,
+                            "parameters": skill.contract.input_schema,
+                        },
+                    },
+                    namesake_strategy="override",
+                    async_execution=False,
+                )
+            return toolkit
+        for tool in self._tools_for_agent(context):
+            description = self._tool_description_for_agent(context, tool.name, tool.description)
             toolkit.register_tool_function(
                 self._tool_wrapper(context, tool.name),
                 func_name=self._toolkit_func_name(tool.name),
-                func_description=tool.description,
+                func_description=description,
                 json_schema={
                     "type": "function",
                     "function": {
                         "name": self._toolkit_func_name(tool.name),
-                        "description": tool.description,
+                        "description": description,
                         "parameters": tool.input_schema,
                     },
                 },
@@ -370,10 +774,63 @@ class AgentScopePackageRunner:
             )
         return toolkit
 
+    def _data_analysis_skills(self) -> list[Any]:
+        if self.skill_runtime is None:
+            return []
+        return self.skill_runtime.list_skills()
+
+    def _tools_for_agent(self, context: AgentScopeRunContext) -> list[Any]:
+        if context.task_type != "data_analysis":
+            return list(context.tools)
+        if self._data_analysis_expose_primitive_tools():
+            allowed = set(self._registered_data_analysis_primitive_tool_names())
+            return [tool for tool in context.tools if tool.name in allowed]
+        return []
+
+    def _registered_data_analysis_primitive_tool_names(self) -> list[str]:
+        stages = self._tool_exposure_policy().data_analysis_primitive_stages or DATA_ANALYSIS_PRIMITIVE_STAGES
+        names: list[str] = []
+        for stage_names in stages.values():
+            for tool_name in stage_names:
+                if tool_name not in names:
+                    names.append(tool_name)
+        return names
+
+    def _tool_exposure_policy(self) -> ToolExposurePolicy:
+        if self.tool_exposure_policy is None:
+            self.tool_exposure_policy = ToolExposurePolicy.from_env()
+        return self.tool_exposure_policy
+
+    def _previous_successful_tool_name(self, context: AgentScopeRunContext) -> str:
+        for trace in reversed(context.tool_trace):
+            if trace.get("status") == "success":
+                return str(trace.get("tool_name") or "")
+        return ""
+
+    def _data_analysis_expose_primitive_tools(self) -> bool:
+        if self.expose_data_analysis_primitive_tools:
+            return True
+        value = os.getenv("AGENTSCOPE_DATA_ANALYSIS_EXPOSE_PRIMITIVE_TOOLS", "")
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _tool_description_for_agent(
+        self,
+        context: AgentScopeRunContext,
+        tool_name: str,
+        default_description: str,
+    ) -> str:
+        if context.task_type == "data_analysis":
+            return _DATA_ANALYSIS_COMPACT_TOOL_DESCRIPTIONS.get(tool_name, default_description)
+        return default_description
+
     def _tool_wrapper(self, context: AgentScopeRunContext, tool_name: str):
         async def _runner(**kwargs: Any) -> ToolResponse:
             result = await context.invoke_tool(tool_name, kwargs)
-            payload = result.output if result.ok else {"error": result.error}
+            payload = (
+                self._tool_observation_for_model(context, tool_name, result.output)
+                if result.ok
+                else {"error": result.error}
+            )
             content = json.dumps(payload, ensure_ascii=False, default=str)
             return ToolResponse(
                 content=[TextBlock(type="text", text=content)],
@@ -388,14 +845,191 @@ class AgentScopePackageRunner:
 
         return _runner
 
+    def _skill_wrapper(self, context: AgentScopeRunContext, skill_name: str):
+        async def _runner(**kwargs: Any) -> ToolResponse:
+            if self.skill_runtime is None:
+                payload: JsonDict = {
+                    "status": "failed",
+                    "skill_name": skill_name,
+                    "summary": "Skill runtime is not configured.",
+                }
+                return ToolResponse(
+                    content=[TextBlock(type="text", text=json.dumps(payload, ensure_ascii=False))],
+                    metadata={"ok": False, "skill_name": skill_name, "output": payload},
+                )
+            result = await self.skill_runtime.invoke_skill(skill_name, kwargs, context)
+            skill = self.skill_runtime.get(skill_name)
+            payload = result.to_observation(
+                max_chars=skill.contract.trace_policy.max_observation_chars,
+                max_evidence_items=skill.contract.trace_policy.max_evidence_items,
+            )
+            return ToolResponse(
+                content=[TextBlock(type="text", text=json.dumps(payload, ensure_ascii=False, default=str))],
+                metadata={
+                    "ok": result.status != "failed",
+                    "skill_name": skill_name,
+                    "output": payload,
+                    "result": result.to_dict(),
+                },
+            )
+
+        return _runner
+
+    def _tool_observation_for_model(
+        self,
+        context: AgentScopeRunContext,
+        tool_name: str,
+        output: Any,
+    ) -> Any:
+        if context.task_type != "data_analysis":
+            return output
+        if not isinstance(output, dict):
+            return output
+        if tool_name == "semantic_model.search":
+            return self._compact_semantic_model_output(output)
+        if tool_name == "schema.select_candidates":
+            return self._compact_select_candidates_output(output)
+        if tool_name == "schema.related_tables":
+            return self._compact_relationship_output(output)
+        if tool_name == "business_knowledge.search":
+            return self._compact_knowledge_output(output)
+        if tool_name == "analysis_plan.submit":
+            return self._compact_analysis_plan_submit_output(output)
+        return output
+
+    def _compact_semantic_model_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        tables = [str(table) for table in output.get("tables", []) if str(table)]
+        semantic_model = output.get("semantic_model")
+        summary: dict[str, Any] = {}
+        if isinstance(semantic_model, dict):
+            for table, columns in semantic_model.items():
+                if not isinstance(columns, dict):
+                    continue
+                compact_columns = []
+                for column_name, meta in list(columns.items())[:10]:
+                    if isinstance(meta, dict):
+                        compact_columns.append(
+                            {
+                                "name": column_name,
+                                "business_name": meta.get("business_name") or meta.get("column_comment") or "",
+                                "type": meta.get("column_type") or "",
+                            }
+                        )
+                    else:
+                        compact_columns.append({"name": column_name})
+                summary[str(table)] = {
+                    "columns": compact_columns,
+                    "column_count": len(columns),
+                }
+        payload: dict[str, Any] = {
+            "tables": tables,
+            "semantic_model_summary": summary,
+        }
+        self._copy_cache_markers(output, payload)
+        return payload
+
+    def _compact_select_candidates_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        selected_tables = [str(table) for table in output.get("selected_tables", []) if str(table)]
+        table_metadata = output.get("table_metadata")
+        compact_metadata = {}
+        if isinstance(table_metadata, dict):
+            for table in selected_tables[:12]:
+                compact_metadata[table] = str(table_metadata.get(table) or "")[:160]
+        candidate_scores = output.get("candidate_scores")
+        compact_scores = []
+        if isinstance(candidate_scores, list):
+            for row in candidate_scores[:12]:
+                if isinstance(row, dict):
+                    compact_scores.append(
+                        {
+                            "table": row.get("table") or row.get("table_name") or "",
+                            "score": row.get("score"),
+                            "matched_terms": row.get("matched_terms", [])[:8]
+                            if isinstance(row.get("matched_terms"), list)
+                            else row.get("matched_terms", []),
+                        }
+                    )
+        payload: dict[str, Any] = {
+            "selected_tables": selected_tables,
+            "table_metadata": compact_metadata,
+            "candidate_scores": compact_scores,
+        }
+        semantic_model = self._compact_semantic_model_output(output)
+        if semantic_model.get("semantic_model_summary"):
+            payload["semantic_model_summary"] = semantic_model["semantic_model_summary"]
+        recall_context = output.get("recall_context")
+        if isinstance(recall_context, dict):
+            payload["recall_context"] = {
+                key: recall_context.get(key)
+                for key in ("business_related_tables", "few_shot_related_tables", "matched_terms")
+                if recall_context.get(key)
+            }
+        return payload
+
+    def _compact_relationship_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        relationships = []
+        raw = output.get("relationships")
+        if isinstance(raw, list):
+            for row in raw[:20]:
+                if not isinstance(row, dict):
+                    continue
+                relationships.append(
+                    {
+                        "from_table": row.get("from_table", ""),
+                        "from_column": row.get("from_column", ""),
+                        "to_table": row.get("to_table", ""),
+                        "to_column": row.get("to_column", ""),
+                    }
+                )
+        payload: dict[str, Any] = {"relationships": relationships}
+        self._copy_cache_markers(output, payload)
+        return payload
+
+    def _compact_knowledge_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        results = []
+        raw = output.get("results")
+        if isinstance(raw, list):
+            for row in raw[:5]:
+                if not isinstance(row, dict):
+                    continue
+                metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+                results.append(
+                    {
+                        "content": str(row.get("content") or "")[:500],
+                        "metadata": {
+                            key: metadata.get(key)
+                            for key in ("source", "doc_id", "related_tables", "score")
+                            if metadata.get(key) is not None
+                        },
+                    }
+                )
+        payload: dict[str, Any] = {"results": results}
+        self._copy_cache_markers(output, payload)
+        return payload
+
+    def _compact_analysis_plan_submit_output(self, output: dict[str, Any]) -> dict[str, Any]:
+        plan = output.get("plan")
+        return {
+            "plan_id": output.get("plan_id", ""),
+            "status": output.get("status", ""),
+            "execution_mode": output.get("execution_mode", "plan_only"),
+            "requires_harness": bool(output.get("requires_harness", True)),
+            "plan": self._analysis_plan_summary(plan) if isinstance(plan, dict) else {},
+        }
+
+    def _copy_cache_markers(self, source: dict[str, Any], target: dict[str, Any]) -> None:
+        for key in ("source", "cache_hit", "from_workflow_state", "fetched"):
+            if key in source:
+                target[key] = source[key]
+
     def _convert_reply(
         self,
         reply: Msg,
         *,
         context: AgentScopeRunContext | None = None,
     ) -> AgentRunResult:
-        answer = reply.get_text_content() or ""
-        metadata = dict(reply.metadata or {})
+        answer = self._message_text(reply)
+        metadata = dict(self._safe_getattr(reply, "metadata") or {})
         result = AgentRunResult.from_value(metadata.get("structured_output") or metadata)
         if not result.answer:
             result.answer = answer
@@ -416,12 +1050,43 @@ class AgentScopePackageRunner:
         if not result.answer:
             result.answer = answer
         result.state_patch.setdefault("agentscope_backend", "agentscope")
-        result.state_patch.setdefault("agentscope_reply_id", getattr(reply, "invocation_id", ""))
+        result.state_patch.setdefault("agentscope_reply_id", self._safe_getattr(reply, "invocation_id") or "")
         if result.sql_drafts:
             result.state_patch.setdefault("requires_harness", True)
         if context is not None:
             self._merge_handoff_from_context(result, context)
         return result
+
+    def _message_text(self, reply: Any) -> str:
+        text_getter = self._safe_getattr(reply, "get_text_content")
+        if callable(text_getter):
+            try:
+                return str(text_getter() or "")
+            except (AttributeError, KeyError, TypeError, ValueError):
+                pass
+        content = self._safe_getattr(reply, "content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+            if parts:
+                return "\n".join(part for part in parts if part)
+        metadata = self._safe_getattr(reply, "metadata")
+        if isinstance(metadata, dict):
+            for key in ("answer", "text", "content"):
+                value = metadata.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value
+        return ""
+
+    def _safe_getattr(self, value: Any, name: str) -> Any | None:
+        try:
+            return getattr(value, name)
+        except (AttributeError, KeyError):
+            return None
 
     def _merge_handoff_from_context(
         self,
@@ -458,6 +1123,8 @@ class AgentScopePackageRunner:
         if not (isinstance(plan, dict) and plan.get("steps")):
             plan = self._recover_analysis_plan_from_failed_handoff(context)
         if not (isinstance(plan, dict) and plan.get("steps")):
+            plan = self._recover_analysis_plan_from_textual_handoff(result.answer, context)
+        if not (isinstance(plan, dict) and plan.get("steps")):
             return
 
         submitted = await context.invoke_tool(
@@ -489,6 +1156,35 @@ class AgentScopePackageRunner:
             for trace in context.tool_trace
         )
 
+    def _analysis_plan_summary(self, plan: JsonDict) -> JsonDict:
+        steps = []
+        for step in plan.get("steps") or []:
+            if not isinstance(step, dict):
+                continue
+            steps.append(
+                {
+                    "step": step.get("step"),
+                    "type": step.get("type"),
+                    "goal": step.get("goal", ""),
+                    "tables": step.get("tables", []),
+                    "has_sql": bool(str(step.get("sql") or "").strip()),
+                }
+            )
+        return {
+            "mode": plan.get("mode", ""),
+            "reason": plan.get("reason", ""),
+            "steps": steps,
+        }
+
+    def _agent_span_output(self, result: AgentRunResult) -> JsonDict:
+        plan = result.state_patch.get("analysis_plan")
+        return {
+            "answer": result.answer,
+            "analysis_plan": self._analysis_plan_summary(plan) if isinstance(plan, dict) else {},
+            "clarification_questions": list(result.clarification_questions),
+            "risk_flags": list(result.risk_flags),
+        }
+
     def _extract_analysis_plan_from_events(self, result: AgentRunResult) -> JsonDict:
         for event in result.events:
             if isinstance(event.get("analysis_plan"), dict):
@@ -511,6 +1207,24 @@ class AgentScopePackageRunner:
                 continue
             return self._recovered_data_analysis_plan(context.query, tables, text)
         return {}
+
+    def _recover_analysis_plan_from_textual_handoff(
+        self,
+        answer: str,
+        context: AgentScopeRunContext,
+    ) -> JsonDict:
+        text = str(answer or "").strip()
+        if "analysis_plan_submit" not in text:
+            return {}
+        tables = self._recover_handoff_tables(context, {"analysis_plan": text}, text)
+        if not tables:
+            return {}
+        return self._recovered_data_analysis_plan(
+            context.query,
+            tables,
+            text,
+            planner_source="recovered_from_textual_tool_call",
+        )
 
     def _handoff_payload_text(self, payload: JsonDict) -> str:
         text = str(payload.get("analysis_plan") or payload.get("plan_text") or "").strip()
@@ -536,14 +1250,17 @@ class AgentScopePackageRunner:
         plan = payload.get("plan")
         if isinstance(plan, dict):
             sources.append(json.dumps(plan, ensure_ascii=False, default=str))
+        selected: list[str] = []
+        traced_tables = self._tables_from_successful_tool_traces(context, visible)
+        for table in traced_tables:
+            if table not in selected:
+                selected.append(table)
         for source in sources:
             tables = self._tables_from_text(source, visible)
-            if tables:
-                return tables
-        traced_tables = self._tables_from_successful_tool_traces(context, visible)
-        if traced_tables:
-            return traced_tables
-        return []
+            for table in tables:
+                if table not in selected:
+                    selected.append(table)
+        return selected[:12]
 
     def _visible_tables(self, context: AgentScopeRunContext) -> list[str]:
         security_context = context.security_context
@@ -566,6 +1283,8 @@ class AgentScopePackageRunner:
                 continue
             if fallback_set and table not in fallback_set:
                 continue
+            if not fallback_set and not table.startswith("t_"):
+                continue
             if table not in selected:
                 selected.append(table)
         if selected:
@@ -578,27 +1297,28 @@ class AgentScopePackageRunner:
         visible_tables: list[str],
     ) -> list[str]:
         visible_set = set(visible_tables)
+
+        feasibility_tables = self._tables_from_tool_trace_output(context, "plan.assess_feasibility", visible_set, "selected_tables")
+        if feasibility_tables:
+            return feasibility_tables
+
+        selected_tables = self._tables_from_tool_trace_output(context, "schema.select_candidates", visible_set, "selected_tables")
+        if selected_tables:
+            return selected_tables
+
         selected: list[str] = []
         for trace in context.tool_trace:
             if trace.get("status") != "success":
                 continue
-            if trace.get("tool_name") not in {"semantic_model.search", "schema.related_tables", "schema.list_tables"}:
+            if trace.get("tool_name") not in {
+                "semantic_model.search",
+                "schema.related_tables",
+            }:
                 continue
             output = trace.get("output")
             if not isinstance(output, dict):
                 continue
-            candidates: list[str] = []
-            if isinstance(output.get("tables"), list):
-                for row in output.get("tables") or []:
-                    if isinstance(row, dict):
-                        candidates.append(str(row.get("table_name") or ""))
-                    else:
-                        candidates.append(str(row))
-            if isinstance(output.get("relationships"), list):
-                for row in output.get("relationships") or []:
-                    if not isinstance(row, dict):
-                        continue
-                    candidates.extend([str(row.get("from_table") or ""), str(row.get("to_table") or "")])
+            candidates = self._trace_output_tables(output, trace.get("tool_name"), visible_set)
             for table in candidates:
                 table_name = table.strip()
                 if not table_name:
@@ -609,7 +1329,73 @@ class AgentScopePackageRunner:
                     selected.append(table_name)
         return selected[:12]
 
-    def _recovered_data_analysis_plan(self, query: str, table_names: list[str], source_text: str) -> JsonDict:
+    def _tables_from_tool_trace_output(
+        self,
+        context: AgentScopeRunContext,
+        tool_name: str,
+        visible_set: set[str],
+        key: str,
+    ) -> list[str]:
+        for trace in context.tool_trace:
+            if trace.get("status") != "success" or trace.get("tool_name") != tool_name:
+                continue
+            output = trace.get("output")
+            if not isinstance(output, dict):
+                continue
+            candidates = self._trace_output_tables(output, tool_name, visible_set, key=key)
+            if candidates:
+                return candidates
+        return []
+
+    def _trace_output_tables(
+        self,
+        output: dict[str, Any],
+        tool_name: str,
+        visible_set: set[str],
+        *,
+        key: str | None = None,
+    ) -> list[str]:
+        candidates: list[str] = []
+        if tool_name == "schema.select_candidates":
+            recall_context = output.get("recall_context")
+            if isinstance(recall_context, dict):
+                for recall_key in ("business_related_tables", "few_shot_related_tables"):
+                    if isinstance(recall_context.get(recall_key), list):
+                        candidates.extend(str(row) for row in recall_context.get(recall_key) or [])
+        if key and isinstance(output.get(key), list):
+            candidates.extend(str(row) for row in output.get(key) or [])
+        if not candidates and isinstance(output.get("selected_tables"), list):
+            candidates.extend(str(row) for row in output.get("selected_tables") or [])
+        if isinstance(output.get("tables"), list):
+            for row in output.get("tables") or []:
+                if isinstance(row, dict):
+                    candidates.append(str(row.get("table_name") or ""))
+                else:
+                    candidates.append(str(row))
+        if isinstance(output.get("relationships"), list):
+            for row in output.get("relationships") or []:
+                if not isinstance(row, dict):
+                    continue
+                candidates.extend([str(row.get("from_table") or ""), str(row.get("to_table") or "")])
+        selected: list[str] = []
+        for table in candidates:
+            table_name = table.strip()
+            if not table_name:
+                continue
+            if visible_set and table_name not in visible_set:
+                continue
+            if table_name not in selected:
+                selected.append(table_name)
+        return selected[:12]
+
+    def _recovered_data_analysis_plan(
+        self,
+        query: str,
+        table_names: list[str],
+        source_text: str,
+        *,
+        planner_source: str = "recovered_from_markdown_handoff",
+    ) -> JsonDict:
         return {
             "mode": "analysis_plan",
             "reason": (
@@ -643,7 +1429,7 @@ class AgentScopePackageRunner:
                 },
             ],
             "requires_user_confirmation": True,
-            "planner_source": "recovered_from_markdown_handoff",
+            "planner_source": planner_source,
             "source_excerpt": source_text[:1200],
         }
 
@@ -692,7 +1478,7 @@ class LocalAgentScopeCompatibleRunner:
 
     async def __call__(self, context: AgentScopeRunContext) -> AgentRunResult:
         if context.task_type == "data_analysis":
-            return await self._run_data_analysis(context)
+            return await self._run_data_analysis_skill(context)
         if context.task_type == "complex_analysis":
             return await self._run_complex_analysis(context)
         if context.task_type == "exploratory_analysis":
@@ -709,7 +1495,90 @@ class LocalAgentScopeCompatibleRunner:
             ]
         )
 
-    async def _run_data_analysis(self, context: AgentScopeRunContext) -> AgentRunResult:
+    async def _run_data_analysis_skill(self, context: AgentScopeRunContext) -> AgentRunResult:
+        skills = SkillRuntime(skills=[FinanceRelationAnalysisSkill()])
+        result = await skills.invoke_skill(
+            "finance_relation_analysis",
+            {"query": context.query},
+            context,
+        )
+        evidence = self._trace_output(context, "business_knowledge.search")
+        semantic = self._trace_output(context, "semantic_model.search")
+        relationships = self._trace_output(context, "schema.related_tables")
+        feasibility = self._trace_output(context, "plan.assess_feasibility")
+        state_patch: JsonDict = {
+            "agentscope_backend": "local_compatible",
+            "requires_harness": bool(result.analysis_plan),
+        }
+        if result.analysis_plan:
+            state_patch["analysis_plan"] = result.analysis_plan
+            state_patch["candidate_tables"] = self._tables_from_plan(result.analysis_plan)
+            state_patch["selected_tables"] = list(state_patch["candidate_tables"])
+            state_patch["evidence"] = self._knowledge_evidence(evidence)
+            state_patch["semantic_model"] = semantic.get("semantic_model", {}) if isinstance(semantic, dict) else {}
+            state_patch["table_relationships"] = relationships.get("relationships", []) if isinstance(relationships, dict) else []
+            if isinstance(feasibility, dict):
+                state_patch["feasibility_decision"] = feasibility.get("feasibility_decision", {})
+                state_patch["complexity_report"] = {
+                    key: value
+                    for key, value in {
+                        "route_rule": feasibility.get("route_rule"),
+                        "recall_route_signal": feasibility.get("recall_route_signal"),
+                        **(feasibility.get("feasibility_decision", {}) if isinstance(feasibility.get("feasibility_decision"), dict) else {}),
+                    }.items()
+                    if value
+                }
+            state_patch["presentation"] = self._build_data_presentation(
+                state_patch["candidate_tables"],
+                {"plan": result.analysis_plan, "plan_id": result.analysis_plan.get("plan_id", "")},
+            )
+        if result.status == "needs_clarification":
+            return AgentRunResult(
+                answer=result.summary,
+                clarification_questions=list(result.clarification_questions),
+                state_patch=state_patch,
+                risk_flags=list(result.risk_flags),
+            )
+        if result.status == "failed":
+            return AgentRunResult(
+                answer=result.summary or "AgentScope 数据分析计划生成失败。",
+                state_patch=state_patch,
+                risk_flags=list(result.risk_flags) or [
+                    {
+                        "code": "local_data_analysis_skill_failed",
+                        "severity": "error",
+                        "message": result.summary,
+                    }
+                ],
+            )
+        return AgentRunResult(
+            answer=self._format_skill_data_analysis_answer(result.analysis_plan),
+            state_patch=state_patch,
+            risk_flags=[
+                {
+                    "code": "local_compatible_runner",
+                    "severity": "info",
+                    "message": "This run used the executable skill runtime through the ToolCatalog-compatible local runner.",
+                }
+            ],
+        )
+
+    def _trace_output(self, context: AgentScopeRunContext, tool_name: str) -> JsonDict:
+        for trace in reversed(context.tool_trace):
+            if trace.get("tool_name") == tool_name and isinstance(trace.get("output"), dict):
+                return dict(trace.get("output") or {})
+        return {}
+
+    def _knowledge_evidence(self, output: Any) -> list[str]:
+        if not isinstance(output, dict):
+            return []
+        return [
+            str(row.get("content") or "").strip()
+            for row in output.get("results", []) or []
+            if isinstance(row, dict) and str(row.get("content") or "").strip()
+        ]
+
+    async def _run_data_analysis_legacy(self, context: AgentScopeRunContext) -> AgentRunResult:
         knowledge = await context.invoke_tool(
             "business_knowledge.search",
             {"query": context.query, "top_k": 5},
@@ -1192,6 +2061,33 @@ class LocalAgentScopeCompatibleRunner:
             "下一步：交回 SQL Harness 完成 validate_analysis_plan、safety_check、authorize_sql、approve、execute_sql、merge_report。\n"
             f"{step_lines}"
         )
+
+    def _format_skill_data_analysis_answer(self, plan: JsonDict) -> str:
+        steps = plan.get("steps", []) if isinstance(plan, dict) else []
+        step_lines = "\n".join(
+            f"{step.get('step')}. {step.get('goal')}（{step.get('type')}：{', '.join(str(table) for table in step.get('tables', []) if str(table))}）"
+            for step in steps
+            if isinstance(step, dict)
+        )
+        reason = str(plan.get("reason") or "").strip()
+        return (
+            "AgentScope 已通过业务 skill 生成数据分析计划，请确认是否交由 SQL Harness 审批执行：\n"
+            f"原因：{reason}\n"
+            f"{step_lines}"
+        ).strip()
+
+    def _tables_from_plan(self, plan: JsonDict) -> list[str]:
+        tables: list[str] = []
+        if not isinstance(plan, dict):
+            return tables
+        for step in plan.get("steps", []) or []:
+            if not isinstance(step, dict):
+                continue
+            for table in step.get("tables", []) or []:
+                table_name = str(table).strip()
+                if table_name and table_name not in tables:
+                    tables.append(table_name)
+        return tables
 
     def _build_draft_sql(
         self,

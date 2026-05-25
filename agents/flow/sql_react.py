@@ -14,11 +14,12 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.documents import Document
 
 from agents.flow.state import SQLReactState
-from agents.flow.complex_query import assess_query_feasibility, validate_complex_plan
+from agents.flow.complex_query import assess_query_feasibility, infer_task_type_from_recall_context, validate_complex_plan
 from agents.model.chat_model import get_chat_model
 from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.runtime import AgentScopeRuntime, create_agentscope_runner
 from agents.tool.sql_tools.safety import SQLSafetyChecker
+from agents.tool.sql_tools.semantic_check import check_sql_semantics
 from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.tool.storage.checkpoint import get_checkpointer
@@ -96,11 +97,6 @@ def _query_asks_quantity(query: str) -> bool:
     return any(marker in query for marker in quantity_markers)
 
 
-def _query_has_relation_analysis_signal(query: str) -> bool:
-    relation_markers = ("关系", "关联", "相关", "对比", "比较", "分析", "影响", "差异", "趋势")
-    return any(marker in query for marker in relation_markers)
-
-
 def _infer_task_type_from_recall_context(
     state: SQLReactState,
     query: str,
@@ -112,46 +108,16 @@ def _infer_task_type_from_recall_context(
     breadth, not by product table names or hardcoded finance table catalogs.
     """
     context = state.get("recall_context") or {}
-    if not isinstance(context, dict):
-        return "", {}
-
-    query_text = " ".join(
-        str(value or "")
-        for value in (
-            query,
-            state.get("enhanced_query"),
-            state.get("rewritten_query"),
-            state.get("query"),
-        )
+    return infer_task_type_from_recall_context(
+        query=query,
+        selected_tables=selected_tables,
+        recall_context=context if isinstance(context, dict) else None,
+        query_variants=[
+            str(state.get("enhanced_query") or ""),
+            str(state.get("rewritten_query") or ""),
+            str(state.get("query") or ""),
+        ],
     )
-    matched_terms = _unique_ordered([
-        str(term).strip()
-        for term in context.get("matched_terms", [])
-        if str(term).strip()
-    ])
-    related_tables = _unique_ordered([
-        str(table).strip()
-        for table in [
-            *(context.get("business_related_tables") or []),
-            *(context.get("few_shot_related_tables") or []),
-        ]
-        if str(table).strip()
-    ])
-    selected_count = len(set(selected_tables or []))
-    related_selected_count = len(set(related_tables) & set(selected_tables or []))
-
-    if (
-        _query_has_relation_analysis_signal(query_text)
-        and len(matched_terms) >= 3
-        and (selected_count >= 4 or related_selected_count >= 3 or len(related_tables) >= 3)
-    ):
-        return "analysis", {
-            "matched_terms": matched_terms,
-            "business_related_tables_count": len(related_tables),
-            "selected_tables_count": selected_count,
-            "reason": "multi-term relation analysis inferred from recall context",
-        }
-    return "", {}
 
 
 def _amount_label_from_query(query: str, matched_terms: list[dict[str, str]]) -> str | None:
@@ -2721,6 +2687,25 @@ async def _run_complex_sql_harness(
             error=step_state.get("error") or step_state.get("answer", "not sql"),
         )
 
+    semantic = await traced_async_tool_call(
+        "sql.semantic_check",
+        str(step_state.get("sql", "")),
+        callbacks,
+        lambda: semantic_check(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    if semantic.get("is_sql") is False:
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=semantic.get("answer", "SQL 语义一致性校验未通过"),
+            error=semantic.get("error") or "semantic_check_failed",
+            semantic_report=semantic.get("semantic_report"),
+        )
+    step_state.update(semantic)
+
     safety = await traced_async_tool_call(
         "sql.safety_check",
         str(step_state.get("sql", "")),
@@ -2759,6 +2744,25 @@ async def _run_complex_sql_harness(
         )
     step_state.update(authorization)
 
+    dry_run = await traced_async_tool_call(
+        "sql.dry_run",
+        str(step_state.get("sql", "")),
+        callbacks,
+        lambda: dry_run_sql(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    if dry_run.get("is_sql") is False:
+        return _complex_sql_step_entry(
+            step_no,
+            step,
+            tables,
+            sql=step_state.get("sql", ""),
+            answer=dry_run.get("answer", "SQL EXPLAIN 预执行未通过"),
+            error=dry_run.get("error") or "sql_dry_run_failed",
+            dry_run_report=dry_run.get("dry_run_report"),
+        )
+    step_state.update(dry_run)
+
     executed = await traced_async_tool_call(
         "sql.execute_sql",
         str(step_state.get("sql", "")),
@@ -2767,6 +2771,14 @@ async def _run_complex_sql_harness(
         {"step": step_no, "node": "execute_complex_plan_step"},
     )
     step_state.update(executed)
+    sanity = await traced_async_tool_call(
+        "sql.result_sanity_check",
+        str(step_state.get("result", "")),
+        callbacks,
+        lambda: result_sanity_check(step_state),
+        {"step": step_no, "node": "execute_complex_plan_step"},
+    )
+    step_state.update(sanity)
     if executed.get("error") is None and executed.get("result") is None and not executed.get("answer"):
         return _complex_sql_step_entry(
             step_no,
@@ -2776,6 +2788,7 @@ async def _run_complex_sql_harness(
             answer="SQL 执行节点返回空结果，已停止当前复杂计划步骤。",
             error="empty execution result",
             execution_history=executed.get("execution_history", []),
+            result_sanity_report=step_state.get("result_sanity_report"),
         )
     if not executed.get("error"):
         return _complex_sql_step_entry(
@@ -2787,6 +2800,9 @@ async def _run_complex_sql_harness(
             answer=executed.get("answer", ""),
             error=None,
             execution_history=executed.get("execution_history", []),
+            semantic_report=step_state.get("semantic_report"),
+            dry_run_report=step_state.get("dry_run_report"),
+            result_sanity_report=step_state.get("result_sanity_report"),
         )
 
     error_msg = str(executed.get("error") or "")
@@ -2799,6 +2815,9 @@ async def _run_complex_sql_harness(
         answer=executed.get("answer", ""),
         error=error_msg,
         execution_history=executed.get("execution_history", []),
+        semantic_report=step_state.get("semantic_report"),
+        dry_run_report=step_state.get("dry_run_report"),
+        result_sanity_report=step_state.get("result_sanity_report"),
     )
 
 
@@ -3307,6 +3326,7 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
 11. 如果上下文中提供了上一轮 SQL，且用户是在追问或省略表达，必须沿用上一轮的时间范围、状态过滤、表连接、指标计算口径和排除条件；除非用户明确要求变更口径
 12. 不要在同一层 SELECT 中嵌套聚合函数，例如 SUM(CASE WHEN SUM(...) THEN ... END)；需要二次聚合时先在子查询中产出净利润/亏损金额，再在外层 SUM(亏损金额)
 13. 外层查询只能引用子查询输出列或子查询别名，不能引用内层表别名（如 a.account_type、ji.debit_amount）
+14. 不得引用未在 FROM/JOIN 中声明的表别名；例如使用 je.entry_date 或 je.status 时，必须先 JOIN t_journal_entry je ON ji.entry_id = je.id
 16. CASE 语法必须选一种，不得混用：
     - 简单 CASE：CASE expr WHEN value1 THEN r1 WHEN value2 THEN r2 ELSE r3 END（WHEN 后是字面值，不是布尔条件）
     - 搜索 CASE：CASE WHEN bool_expr1 THEN r1 WHEN bool_expr2 THEN r2 ELSE r3 END（WHEN 后是布尔条件）
@@ -3320,8 +3340,8 @@ def _build_sql_messages(query: str, docs_text: str, refine_context: str, history
         FROM ...
         WHERE ...
     ) t
-14. 当 is_sql=true 时，answer 只能包含 SQL，不要包含解释性文字
-15. 使用 sql_format_response 工具输出结果"""),
+18. 当 is_sql=true 时，answer 只能包含 SQL，不要包含解释性文字
+19. 使用 sql_format_response 工具输出结果"""),
         HumanMessage(content=query),
     ]
 
@@ -3512,6 +3532,38 @@ async def safety_check(state: SQLReactState) -> dict:
     return {"safety_report": None}
 
 
+async def semantic_check(state: SQLReactState) -> dict:
+    """SQL 语义一致性分析。"""
+    if not state.get("is_sql"):
+        return {"semantic_report": None}
+
+    report = check_sql_semantics(
+        query=_semantic_check_query(state),
+        sql=state.get("sql", ""),
+        semantic_model=state.get("semantic_model") or {},
+        relationships=state.get("table_relationships", []),
+        evidence=state.get("evidence", []),
+    )
+    if not report.passed:
+        return {
+            "semantic_report": report.to_dict(),
+            "answer": f"SQL 语义一致性校验未通过: {report.summary}",
+            "is_sql": False,
+            "error": "semantic_check_failed",
+        }
+    return {"semantic_report": report.to_dict()}
+
+
+def _semantic_check_query(state: SQLReactState) -> str:
+    """Return the focused intent text for SQL semantic checking."""
+    query = state.get("query") or state.get("rewritten_query") or ""
+    marker = "当前步骤目标:"
+    if marker not in query:
+        return query
+    after_marker = query.split(marker, 1)[1]
+    return after_marker.split("\n", 1)[0].strip() or query
+
+
 def _tables_from_sql(sql: str) -> list[str]:
     tables: list[str] = []
     seen: set[str] = set()
@@ -3520,6 +3572,160 @@ def _tables_from_sql(sql: str) -> list[str]:
             seen.add(table)
             tables.append(table)
     return tables
+
+
+def _build_explain_sql(sql: str, dialect: str = "mysql") -> str:
+    clean = (sql or "").strip().rstrip(";")
+    if re.match(r"^\s*EXPLAIN\b", clean, re.IGNORECASE):
+        return clean
+    normalized_dialect = (dialect or "mysql").strip().lower()
+    if normalized_dialect in {"sqlite", "sqlite3"}:
+        return f"EXPLAIN QUERY PLAN {clean}"
+    return f"EXPLAIN {clean}"
+
+
+def _estimate_rows_from_explain(raw_result: str) -> int | None:
+    rows = _parse_sql_result_rows(raw_result)
+    if not isinstance(rows, list):
+        return None
+    total = 0
+    found = False
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get("rows")
+        if value is None:
+            value = row.get("ROWS")
+        try:
+            total += int(float(value))
+            found = True
+        except (TypeError, ValueError):
+            continue
+    return total if found else None
+
+
+def _tables_from_explain(raw_result: str) -> list[str]:
+    rows = _parse_sql_result_rows(raw_result)
+    if not isinstance(rows, list):
+        return []
+    tables: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        table = row.get("table")
+        if table is None:
+            table = row.get("TABLE")
+        table = str(table or "").strip()
+        if not table or table in {"<derived>", "None", "NULL"}:
+            continue
+        if table not in seen:
+            seen.add(table)
+            tables.append(table)
+    return tables
+
+
+def _mcp_blocks_explain(message: str) -> bool:
+    lowered = (message or "").lower()
+    return "only select queries are allowed" in lowered and "explain" not in lowered
+
+
+def _execute_explain_sql_direct(explain_sql: str) -> str:
+    """Run EXPLAIN directly when the MCP read-only wrapper rejects EXPLAIN."""
+    import pymysql
+    from pymysql.cursors import DictCursor
+
+    connection = pymysql.connect(
+        host=settings.mysql.host,
+        port=settings.mysql.port,
+        user=settings.mysql.username,
+        password=settings.mysql.password,
+        database=settings.mysql.database,
+        charset="utf8mb4",
+        cursorclass=DictCursor,
+        read_timeout=settings.resilience.sql_execution_timeout,
+        write_timeout=settings.resilience.sql_execution_timeout,
+    )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(explain_sql)
+            rows = cursor.fetchall()
+        return json.dumps(rows, ensure_ascii=False, default=str)
+    finally:
+        connection.close()
+
+
+async def dry_run_sql(state: SQLReactState) -> dict:
+    """Run a read-only EXPLAIN preflight before asking the user to approve."""
+    if not state.get("is_sql"):
+        return {"dry_run_report": None}
+
+    from agents.tool.sql_tools.mcp_client import execute_sql as mcp_execute
+
+    sql = state.get("sql", "")
+    dialect = str(state.get("sql_dialect") or state.get("dialect") or "mysql").strip().lower() or "mysql"
+    explain_sql = _build_explain_sql(sql, dialect=dialect)
+    fallback = ""
+    try:
+        raw_result = await mcp_execute(explain_sql)
+    except Exception as exc:
+        message = str(exc)
+        if dialect == "mysql" and _mcp_blocks_explain(message):
+            try:
+                raw_result = await asyncio.to_thread(_execute_explain_sql_direct, explain_sql)
+                fallback = "direct_mysql_explain"
+            except Exception as direct_exc:
+                message = f"{message}; direct EXPLAIN fallback failed: {direct_exc}"
+            else:
+                report = {
+                    "passed": True,
+                    "decision": "safe_to_approve",
+                    "summary": "EXPLAIN 预执行通过，SQL 可进入用户审批。",
+                    "explain_sql": explain_sql,
+                    "dialect": dialect,
+                    "fallback": fallback,
+                    "raw_result": raw_result,
+                    "estimated_rows": _estimate_rows_from_explain(raw_result),
+                    "detected_tables": _tables_from_explain(raw_result),
+                    "problems": [],
+                }
+                return {"dry_run_report": report, "is_sql": True}
+        report = {
+            "passed": False,
+            "decision": "revise_sql",
+            "summary": f"EXPLAIN 预执行失败: {message}",
+            "explain_sql": explain_sql,
+            "dialect": dialect,
+            "error": message,
+            "problems": [
+                {
+                    "code": "EXPLAIN_FAILED",
+                    "severity": "high",
+                    "message": message,
+                    "repair_hint": "根据 EXPLAIN 返回的字段、表或语法错误修正 SQL 后再提交审批。",
+                }
+            ],
+        }
+        return {
+            "dry_run_report": report,
+            "answer": report["summary"],
+            "is_sql": False,
+            "error": "sql_dry_run_failed",
+        }
+
+    report = {
+        "passed": True,
+        "decision": "safe_to_approve",
+        "summary": "EXPLAIN 预执行通过，SQL 可进入用户审批。",
+        "explain_sql": explain_sql,
+        "dialect": dialect,
+        "fallback": fallback,
+        "raw_result": raw_result,
+        "estimated_rows": _estimate_rows_from_explain(raw_result),
+        "detected_tables": _tables_from_explain(raw_result),
+        "problems": [],
+    }
+    return {"dry_run_report": report, "is_sql": True}
 
 
 async def authorize_sql(state: SQLReactState, config=None) -> dict:
@@ -3546,6 +3752,41 @@ async def authorize_sql(state: SQLReactState, config=None) -> dict:
     }
 
 
+def _approval_quality_gate_payload(state: SQLReactState) -> dict:
+    semantic = state.get("semantic_report")
+    safety = state.get("safety_report")
+    authorization = state.get("authorization_report")
+    dry_run = state.get("dry_run_report")
+    failed = []
+    warnings = []
+    for name, report in (
+        ("semantic", semantic),
+        ("safety", safety),
+        ("authorization", authorization),
+        ("dry_run", dry_run),
+    ):
+        if not isinstance(report, dict) or not report:
+            continue
+        if report.get("passed") is False or report.get("allowed") is False:
+            failed.append(name)
+        problems = report.get("problems") or report.get("risks") or []
+        if problems and name not in failed:
+            warnings.append(name)
+
+    status = "failed" if failed else ("warning" if warnings else "passed")
+    return {
+        "summary": {
+            "status": status,
+            "failed_checks": failed,
+            "warning_checks": warnings,
+        },
+        "semantic": semantic,
+        "safety": safety,
+        "authorization": authorization,
+        "dry_run": dry_run,
+    }
+
+
 def approve(state: SQLReactState) -> dict:
     """人工审批 SQL。使用 interrupt 暂停图执行，等待用户确认。"""
     is_reflected_sql = bool(state.get("reflection_notice"))
@@ -3561,6 +3802,7 @@ def approve(state: SQLReactState) -> dict:
         "message": message,
         "reflection": is_reflected_sql,
         "approval_type": "sql",
+        "quality_gate": _approval_quality_gate_payload(state),
     })
 
     if result.get("approved"):
@@ -3600,6 +3842,55 @@ async def execute_sql(state: SQLReactState) -> dict:
             "error": error_msg,
             "execution_history": execution_history,
         }
+
+
+async def result_sanity_check(state: SQLReactState) -> dict:
+    """Build an explicit quality gate report for executed SQL results."""
+    if state.get("error"):
+        return {
+            "result_sanity_report": {
+                "passed": False,
+                "decision": "execution_failed",
+                "summary": "SQL 执行失败，跳过结果 sanity check。",
+                "problems": [
+                    {
+                        "code": "SQL_EXECUTION_FAILED",
+                        "severity": "high",
+                        "message": str(state.get("error")),
+                        "repair_hint": "先修复 SQL 执行错误，再检查结果合理性。",
+                    }
+                ],
+            }
+        }
+
+    reason = _result_anomaly_reason(state.get("result"))
+    if reason:
+        return {
+            "result_sanity_report": {
+                "passed": False,
+                "decision": "repair_or_review",
+                "summary": f"执行结果 sanity check 发现异常: {reason}",
+                "problems": [
+                    {
+                        "code": "RESULT_SANITY_ANOMALY",
+                        "severity": "medium",
+                        "message": reason,
+                        "repair_hint": "检查过滤条件、聚合口径、金额方向和空值处理；必要时进入 SQL result_reflection。",
+                    }
+                ],
+                "warnings": [],
+            }
+        }
+
+    return {
+        "result_sanity_report": {
+            "passed": True,
+            "decision": "accepted",
+            "summary": "执行结果 sanity check 未发现明显异常。",
+            "problems": [],
+            "warnings": [],
+        }
+    }
 
 
 def _result_anomaly_reason(result) -> str | None:
@@ -3827,10 +4118,13 @@ def build_sql_react_graph():
     graph.add_node("complex_plan_generate", complex_plan_generate)
     graph.add_node("approve_complex_plan", approve_complex_plan)
     graph.add_node("execute_complex_plan_step", execute_complex_plan_step)
+    graph.add_node("semantic_check", semantic_check)
     graph.add_node("safety_check", safety_check)
     graph.add_node("authorize_sql", authorize_sql)
+    graph.add_node("dry_run_sql", dry_run_sql)
     graph.add_node("approve", approve)
     graph.add_node("execute_sql", execute_sql)
+    graph.add_node("result_sanity_check", result_sanity_check)
     graph.add_node("error_analysis", error_analysis)
     graph.add_node("result_reflection", result_reflection)
 
@@ -3871,7 +4165,14 @@ def build_sql_react_graph():
         return "sql_generate"
 
     graph.add_conditional_edges("check_docs", route_after_check)
-    graph.add_edge("sql_generate", "safety_check")
+    graph.add_edge("sql_generate", "semantic_check")
+
+    def route_after_semantic_check(state: SQLReactState) -> str:
+        if state.get("is_sql"):
+            return "safety_check"
+        return END
+
+    graph.add_conditional_edges("semantic_check", route_after_semantic_check)
 
     def route_after_safety(state: SQLReactState) -> str:
         if state.get("is_sql"):
@@ -3882,10 +4183,17 @@ def build_sql_react_graph():
 
     def route_after_sql_authorization(state: SQLReactState) -> str:
         if state.get("is_sql"):
-            return "approve"
+            return "dry_run_sql"
         return END
 
     graph.add_conditional_edges("authorize_sql", route_after_sql_authorization)
+
+    def route_after_dry_run(state: SQLReactState) -> str:
+        if state.get("is_sql"):
+            return "approve"
+        return END
+
+    graph.add_conditional_edges("dry_run_sql", route_after_dry_run)
 
     def route_after_approve(state: SQLReactState) -> str:
         if state.get("approved"):
@@ -3896,12 +4204,7 @@ def build_sql_react_graph():
 
     def route_after_execute(state: SQLReactState) -> str:
         if not state.get("error"):
-            reason = _result_anomaly_reason(state.get("result"))
-            max_retries = settings.resilience.max_sql_retries
-            if reason and state.get("retry_count", 0) < max_retries:
-                logger.info("route_after_execute: suspicious result, retrying via reflection: %s", reason)
-                return "result_reflection"
-            return END
+            return "result_sanity_check"
         # SQL 生成类错误进入 LLM 修复；权限/认证等不可由 SQL 改写修复的错误直接结束。
         if not _should_repair_sql_error(state["error"]):
             logger.info("route_after_execute: non-retryable error, ending: %s", state["error"][:200])
@@ -3915,8 +4218,20 @@ def build_sql_react_graph():
         return END
 
     graph.add_conditional_edges("execute_sql", route_after_execute)
+
+    def route_after_result_sanity_check(state: SQLReactState) -> str:
+        report = state.get("result_sanity_report") or {}
+        if report.get("passed") is False and report.get("decision") == "repair_or_review":
+            max_retries = settings.resilience.max_sql_retries
+            if state.get("retry_count", 0) < max_retries:
+                reason = (report.get("problems") or [{}])[0].get("message", "执行结果疑似异常")
+                logger.info("route_after_result_sanity_check: retrying via reflection: %s", reason)
+                return "result_reflection"
+        return END
+
+    graph.add_conditional_edges("result_sanity_check", route_after_result_sanity_check)
     graph.add_edge("error_analysis", "sql_generate")
-    graph.add_edge("result_reflection", "safety_check")
+    graph.add_edge("result_reflection", "semantic_check")
 
     checkpointer = get_checkpointer()
     return graph.compile(checkpointer=checkpointer)

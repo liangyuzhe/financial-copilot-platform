@@ -102,3 +102,81 @@ def test_skill_output_format_is_serializable_and_fixed():
         "异常点",
         "后续追查建议",
     ]
+
+
+def test_skill_registry_can_register_executable_runtime_skill_definition():
+    from agents.runtime.skill_registry import SkillDefinition, SkillRegistry
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    runtime_skill = FinanceRelationAnalysisSkill().contract
+    executable = SkillDefinition.from_runtime_skill(
+        runtime_skill,
+        keywords=("收入", "成本", "预算", "回款", "费用", "亏损"),
+    )
+    registry = SkillRegistry(
+        skills=[
+            SkillDefinition(
+                name="revenue_cost_relation",
+                description="prompt-only skill",
+                task_types=("complex_analysis",),
+                keywords=("收入", "成本"),
+                prompt="收入成本关系 prompt",
+                tool_allowlist=("business_knowledge.search",),
+            ),
+            executable,
+        ]
+    )
+
+    matched = registry.match(
+        task_type="data_analysis",
+        query="分析收入成本预算回款费用之间的关系",
+    )
+
+    assert [skill.name for skill in matched] == ["finance_relation_analysis"]
+    assert matched[0].kind == "executable"
+    assert matched[0].runtime_contract == runtime_skill
+    assert matched[0].tool_allowlist == runtime_skill.allowed_tools
+    assert matched[0].prompt == ""
+    assert matched[0].to_dict()["runtime_contract"]["name"] == "finance_relation_analysis"
+
+
+def test_executable_skill_allowlist_still_intersects_base_tools():
+    from agents.runtime.skill_registry import SkillDefinition, SkillRegistry
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    registry = SkillRegistry(
+        skills=[
+            SkillDefinition.from_runtime_skill(
+                FinanceRelationAnalysisSkill().contract,
+                keywords=("亏损",),
+            )
+        ]
+    )
+
+    allowed = registry.allowed_tool_names(
+        task_type="data_analysis",
+        base_tool_names=[
+            "business_knowledge.search",
+            "analysis_plan.submit",
+            "sql.execute",
+        ],
+        skills=registry.match(task_type="data_analysis", query="去年亏损"),
+    )
+
+    assert allowed == ["business_knowledge.search", "analysis_plan.submit"]
+
+
+def test_builtin_registry_includes_finance_relation_executable_skill():
+    from agents.runtime.skill_registry import SkillRegistry
+
+    registry = SkillRegistry.builtin()
+    skill = registry.get("finance_relation_analysis")
+
+    assert skill.kind == "executable"
+    assert skill.runtime_contract is not None
+    assert skill.runtime_contract.name == "finance_relation_analysis"
+    assert "analysis_plan.submit" in skill.tool_allowlist
+    assert skill in registry.match(
+        task_type="data_analysis",
+        query="去年亏损",
+    )

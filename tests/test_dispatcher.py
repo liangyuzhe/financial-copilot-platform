@@ -408,6 +408,103 @@ async def test_dispatcher_routes_agentscope_analysis_plan_to_harness_approval():
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_approves_finance_skill_plan_execute_without_sql_execution_before_approval():
+    """finance_relation_analysis_skill plan_execute output should stop at approval before SQL Harness execution."""
+    from agents.flow.dispatcher import build_final_graph
+    from agents.runtime.result import AgentRunResult
+
+    _RecordingAgentScopeRuntime.calls = []
+    _RecordingAgentScopeRuntime.result = AgentRunResult(
+        answer="已提交财务关系分析计划。",
+        state_patch={
+            "analysis_plan": {
+                "mode": "analysis_plan",
+                "execution_mode": "plan_execute",
+                "reason": "多事实域财务关系分析，需分步执行。",
+                "steps": [
+                    {
+                        "step": 1,
+                        "type": "sql",
+                        "goal": "统计收入成本费用",
+                        "tables": ["t_journal_item", "t_account"],
+                        "depends_on": [],
+                        "merge_keys": ["period", "cost_center_id"],
+                    },
+                    {
+                        "step": 2,
+                        "type": "sql",
+                        "goal": "统计预算",
+                        "tables": ["t_budget"],
+                        "depends_on": [],
+                        "merge_keys": ["period", "cost_center_id"],
+                    },
+                    {
+                        "step": 3,
+                        "type": "sql",
+                        "goal": "统计回款",
+                        "tables": ["t_receivable_payable"],
+                        "depends_on": [],
+                        "merge_keys": ["period", "cost_center_id"],
+                    },
+                    {
+                        "step": 4,
+                        "type": "python_merge",
+                        "goal": "合并关系指标",
+                        "tables": [],
+                        "depends_on": [1, 2, 3],
+                        "merge_keys": ["period", "cost_center_id"],
+                    },
+                    {
+                        "step": 5,
+                        "type": "report",
+                        "goal": "输出关系分析报告",
+                        "tables": [],
+                        "depends_on": [4],
+                        "merge_keys": [],
+                    },
+                ],
+            }
+        },
+    )
+
+    with (
+        patch("agents.flow.dispatcher.get_checkpointer", return_value=MemorySaver()),
+        patch("agents.flow.dispatcher.AgentScopeRuntime", _RecordingAgentScopeRuntime),
+        patch("agents.flow.dispatcher.create_agentscope_runner", return_value=object()),
+        patch("agents.flow.dispatcher.execute_complex_plan_step", new_callable=AsyncMock) as mock_execute,
+        patch("agents.flow.dispatcher.interrupt", return_value={"approved": False}) as mock_interrupt,
+    ):
+        app = build_final_graph()
+        result = await app.ainvoke(
+            {
+                "query": "收入成本预算回款费用之间的关系",
+                "route": "data",
+                "rewritten_query": "收入成本预算回款费用之间的关系",
+                "session_id": "s-finance-skill-plan",
+                "chat_history": [],
+                "security_context": {
+                    "allowed_tables": [
+                        "t_journal_item",
+                        "t_account",
+                        "t_budget",
+                        "t_receivable_payable",
+                    ]
+                },
+            },
+            config={"configurable": {"thread_id": "s-finance-skill-plan:turn:1"}},
+        )
+
+    payload = mock_interrupt.call_args.args[0]
+    assert payload["approval_type"] == "complex_plan"
+    assert payload["analysis_plan"]["execution_mode"] == "plan_execute"
+    assert payload["complex_plan"]["mode"] == "complex_plan"
+    assert payload["complex_plan"]["steps"][3]["type"] == "python_merge"
+    mock_execute.assert_not_called()
+    assert result["plan_approved"] is False
+    assert "取消" in result["answer"]
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_preserves_agentscope_context_into_analysis_execution():
     """Approved analysis execution should reuse planner context instead of clearing it."""
     from agents.flow.dispatcher import execute_analysis_plan
@@ -451,6 +548,68 @@ async def test_dispatcher_preserves_agentscope_context_into_analysis_execution()
     assert complex_state["recall_context"]["business_related_tables"] == ["t_budget"]
     assert complex_state["enhanced_query"] == "分析预算金额"
     assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_emits_sql_harness_approval_and_execution_spans():
+    """AgentScope plans should show a clear SQL Harness boundary in trace."""
+    from agents.flow.dispatcher import approve_analysis_plan, execute_analysis_plan
+
+    traced = []
+
+    async def fake_traced_async_tool_call(name, input_str, callbacks, func, metadata=None):
+        traced.append((name, input_str, metadata or {}))
+        return await func()
+
+    plan = {
+        "mode": "analysis_plan",
+        "execution_mode": "single_sql",
+        "steps": [
+            {
+                "step": 1,
+                "type": "sql",
+                "goal": "统计亏损",
+                "tables": ["t_journal_item"],
+                "depends_on": [],
+                "merge_keys": [],
+            }
+        ],
+    }
+    state = {
+        "analysis_plan": plan,
+        "query": "去年亏损",
+        "session_id": "trace-harness-session",
+        "security_context": {"allowed_tables": ["t_journal_item"]},
+    }
+
+    with (
+        patch("agents.flow.dispatcher.traced_async_tool_call", side_effect=fake_traced_async_tool_call),
+        patch("agents.flow.dispatcher.interrupt", return_value={"approved": True}),
+        patch("agents.flow.dispatcher.execute_complex_plan_step", new_callable=AsyncMock) as mock_execute,
+    ):
+        approved = await approve_analysis_plan(state, config={"callbacks": ["handler"]})
+        mock_execute.return_value = {
+            "answer": "ok",
+            "is_sql": False,
+            "error": None,
+            "plan_current_step": 1,
+            "plan_execution_results": {},
+        }
+        executed = await execute_analysis_plan({**state, **approved}, config={"callbacks": ["handler"]})
+
+    assert [item[0] for item in traced] == [
+        "sql_harness.approve_analysis_plan",
+        "sql_harness.execute_analysis_plan",
+    ]
+    assert traced[0][2]["span_layer"] == "sql_harness"
+    assert traced[0][2]["real_call"] is True
+    assert traced[0][2]["stage"] == "approval"
+    assert traced[0][2]["approval_type"] == "complex_plan"
+    assert traced[0][2]["step_count"] == 1
+    assert traced[1][2]["span_layer"] == "sql_harness"
+    assert traced[1][2]["stage"] == "execution"
+    assert traced[1][2]["approved"] is True
+    assert executed["status"] == "completed"
 
 
 def test_arbitration_uses_llm_route_when_no_rule_signal():

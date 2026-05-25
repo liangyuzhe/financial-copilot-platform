@@ -6,8 +6,10 @@ from argparse import Namespace
 
 import pytest
 
+from agents.eval.cli import cmd_export_verified_queries
 from agents.eval.cli import cmd_run_nl2sql
 from agents.eval.cli import cmd_run_online_nl2sql
+from agents.tool.sql_tools.verified_query_repository import VerifiedQueryRecord, VerifiedQueryRepository
 
 
 def test_run_nl2sql_missing_dataset_prints_actionable_error(tmp_path, capsys):
@@ -66,3 +68,23 @@ def test_run_online_nl2sql_init_template_writes_dataset(tmp_path, capsys):
 
     assert dataset.exists()
     assert "Wrote online NL2SQL evaluation template" in capsys.readouterr().out
+
+
+def test_export_verified_queries_writes_regression_dataset(tmp_path, capsys):
+    repository_path = tmp_path / "verified_queries.jsonl"
+    repository = VerifiedQueryRepository(repository_path)
+    repository.save(
+        VerifiedQueryRecord(
+            question="去年亏损多少",
+            sql="SELECT SUM(credit_amount - debit_amount) AS net_profit FROM t_journal_item",
+            tables=["t_journal_item"],
+            intent="profit_loss",
+            verification_status="human_verified",
+        )
+    )
+    output = tmp_path / "regression.jsonl"
+
+    cmd_export_verified_queries(Namespace(repository=str(repository_path), output=str(output), limit=None))
+
+    assert output.exists()
+    assert "Exported 1 verified query regression cases" in capsys.readouterr().out

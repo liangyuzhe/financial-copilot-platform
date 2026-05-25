@@ -22,6 +22,7 @@ from agents.runtime.shadow_benchmark import (
 )
 from agents.runtime.skill_registry import SkillDefinition, SkillRegistry
 from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+from agents.runtime.tool_exposure_policy import ToolExposurePolicy
 from agents.runtime.tool_contracts import (
     RuntimeTool,
     ToolCallResult,

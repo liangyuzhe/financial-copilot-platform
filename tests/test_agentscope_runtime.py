@@ -132,6 +132,37 @@ async def test_runtime_passes_only_read_only_exploratory_tools_to_runner():
 
 
 @pytest.mark.asyncio
+async def test_runtime_injects_tool_exposure_policy_into_runner_object():
+    from agents.runtime.agentscope_runtime import AgentScopeRuntime
+    from agents.runtime.result import AgentRunResult
+    from agents.runtime.tool_exposure_policy import ToolExposurePolicy
+
+    policy = ToolExposurePolicy(data_analysis_skill_names=("finance_relation_analysis", "custom_skill"))
+
+    class Runner:
+        tool_exposure_policy = None
+
+        async def __call__(self, context):
+            return AgentRunResult(answer="ok")
+
+    runner = Runner()
+    runtime = AgentScopeRuntime(
+        tool_catalog=_catalog_with_static_schema(),
+        tool_exposure_policy=policy,
+        runner=runner,
+    )
+
+    await runtime.run(
+        task_type="data_analysis",
+        query="去年亏损",
+        session_id="s-policy",
+        security_context={},
+    )
+
+    assert runner.tool_exposure_policy is policy
+
+
+@pytest.mark.asyncio
 async def test_runtime_auto_matches_skill_and_injects_skill_prompt():
     from agents.runtime.agentscope_runtime import AgentScopeRuntime
 
@@ -733,6 +764,220 @@ async def test_runtime_emits_langsmith_spans_for_runner_and_tools():
         "schema.related_tables",
         "current_time.now",
     ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_tool_span_end_preserves_structured_output_for_callbacks():
+    from agents.runtime.agentscope_runtime import AgentScopeRuntime
+
+    class RecordingHandler:
+        def __init__(self):
+            self.tool_outputs = []
+
+        async def on_tool_start(self, serialized, input_str, **kwargs):
+            return None
+
+        async def on_tool_end(self, output, **kwargs):
+            self.tool_outputs.append(output)
+
+    async def fake_runner(context):
+        await context.invoke_tool("schema.list_tables", {})
+        return {"answer": "已读取 schema。"}
+
+    handler = RecordingHandler()
+    runtime = AgentScopeRuntime(
+        tool_catalog=_catalog_with_static_schema(),
+        runner=fake_runner,
+        callbacks=[handler],
+    )
+
+    await runtime.run(
+        task_type="exploratory_analysis",
+        query="有哪些表？",
+        session_id="s-trace-output",
+        security_context={"allowed_tables": ["t_orders", "t_customer"]},
+        workflow_state={"thread_id": "th-trace-output"},
+    )
+
+    assert handler.tool_outputs
+    assert isinstance(handler.tool_outputs[0], dict)
+    assert handler.tool_outputs[0]["tables"][0]["table_name"] == "t_orders"
+
+
+@pytest.mark.asyncio
+async def test_runtime_direct_tracer_style_tool_callbacks_get_run_id_and_output():
+    from agents.runtime.agentscope_runtime import AgentScopeRuntime
+
+    class DirectTracerLikeHandler:
+        def __init__(self):
+            self.started = set()
+            self.ended = {}
+
+        async def on_tool_start(self, serialized, input_str, *, run_id, **kwargs):
+            self.started.add(run_id)
+
+        async def on_tool_end(self, output, *, run_id, **kwargs):
+            assert run_id in self.started
+            self.ended[run_id] = output
+
+    async def fake_runner(context):
+        await context.invoke_tool("schema.list_tables", {})
+        return {"answer": "已读取 schema。"}
+
+    handler = DirectTracerLikeHandler()
+    runtime = AgentScopeRuntime(
+        tool_catalog=_catalog_with_static_schema(),
+        runner=fake_runner,
+        callbacks=[handler],
+    )
+
+    await runtime.run(
+        task_type="exploratory_analysis",
+        query="有哪些表？",
+        session_id="s-direct-tracer",
+        security_context={"allowed_tables": ["t_orders", "t_customer"]},
+        workflow_state={"thread_id": "th-direct-tracer"},
+    )
+
+    assert len(handler.ended) == 1
+    output = next(iter(handler.ended.values()))
+    assert output["tables"][0]["table_name"] == "t_orders"
+
+
+@pytest.mark.asyncio
+async def test_runtime_start_callbacks_receive_name_kwarg_for_handler_run_maps():
+    from agents.runtime.agentscope_runtime import AgentScopeRuntime
+
+    class RunMapStyleHandler:
+        def __init__(self):
+            self.started = {}
+            self.ended = []
+
+        async def on_chain_start(self, serialized, inputs, **kwargs):
+            assert kwargs["name"] == serialized["name"]
+            self.started[kwargs["run_id"]] = ("chain", kwargs["name"])
+
+        async def on_chain_end(self, outputs, **kwargs):
+            assert kwargs["run_id"] in self.started
+            self.ended.append(("chain", outputs.get("name")))
+
+        async def on_tool_start(self, serialized, input_str, **kwargs):
+            assert kwargs["name"] == serialized["name"]
+            self.started[kwargs["run_id"]] = ("tool", kwargs["name"])
+
+        async def on_tool_end(self, output, **kwargs):
+            assert kwargs["run_id"] in self.started
+            self.ended.append(("tool", output))
+
+        async def on_llm_start(self, serialized, prompts, **kwargs):
+            assert kwargs["name"] == serialized["name"]
+            self.started[kwargs["run_id"]] = ("llm", kwargs["name"])
+
+        async def on_llm_end(self, response, **kwargs):
+            assert kwargs["run_id"] in self.started
+            self.ended.append(("llm", response.generations[0][0].text))
+
+    async def fake_runner(context):
+        llm_span = await context.start_llm_span("agentscope.llm.test", "prompt")
+        await context.end_llm_span(llm_span, "agentscope.llm.test", "completion")
+        await context.invoke_tool("schema.list_tables", {})
+        return {"answer": "已读取 schema。"}
+
+    handler = RunMapStyleHandler()
+    runtime = AgentScopeRuntime(
+        tool_catalog=_catalog_with_static_schema(),
+        runner=fake_runner,
+        callbacks=[handler],
+    )
+
+    await runtime.run(
+        task_type="exploratory_analysis",
+        query="有哪些表？",
+        session_id="s-run-map-style",
+        security_context={"allowed_tables": ["t_orders", "t_customer"]},
+        workflow_state={"thread_id": "th-run-map-style"},
+    )
+
+    assert ("chain", "agentscope.runtime.exploratory_analysis") in handler.ended
+    assert ("llm", "completion") in handler.ended
+    assert any(kind == "tool" and isinstance(output, dict) for kind, output in handler.ended)
+
+
+@pytest.mark.asyncio
+async def test_runtime_prefers_run_manager_end_and_finish_over_direct_end_callbacks():
+    from agents.runtime.agentscope_runtime import AgentScopeRuntime
+
+    class EndOnlyRunManager:
+        def __init__(self):
+            self.calls = []
+
+        def end(self, *, outputs=None, error=None, **kwargs):
+            self.calls.append((outputs, error))
+
+    class FinishOnlySpan:
+        def __init__(self):
+            self.tags = []
+            self.finished = 0
+
+        def set_tags(self, tag_kvs):
+            self.tags.append(dict(tag_kvs))
+
+        def finish(self):
+            self.finished += 1
+
+    class Callback:
+        def __init__(self):
+            self.tool_end_called = False
+            self.llm_end_called = False
+            self.tool_managers = []
+            self.llm_spans = []
+
+        async def on_tool_start(self, serialized, input_str, **kwargs):
+            manager = EndOnlyRunManager()
+            self.tool_managers.append(manager)
+            return manager
+
+        async def on_tool_end(self, output, **kwargs):
+            self.tool_end_called = True
+
+        async def on_llm_start(self, serialized, prompts, **kwargs):
+            span = FinishOnlySpan()
+            self.llm_spans.append(span)
+            return span
+
+        async def on_llm_end(self, response, **kwargs):
+            self.llm_end_called = True
+
+    async def fake_runner(context):
+        llm_span = await context.start_llm_span("agentscope.llm.test", "prompt")
+        await context.end_llm_span(llm_span, "agentscope.llm.test", "completion")
+        await context.invoke_tool("schema.list_tables", {})
+        return {"answer": "已读取 schema。"}
+
+    handler = Callback()
+    runtime = AgentScopeRuntime(
+        tool_catalog=_catalog_with_static_schema(),
+        runner=fake_runner,
+        callbacks=[handler],
+    )
+
+    await runtime.run(
+        task_type="exploratory_analysis",
+        query="有哪些表？",
+        session_id="s-run-manager-end",
+        security_context={"allowed_tables": ["t_orders", "t_customer"]},
+        workflow_state={"thread_id": "th-run-manager-end"},
+    )
+
+    assert handler.tool_end_called is False
+    assert handler.llm_end_called is False
+    assert len(handler.tool_managers) == 1
+    tool_outputs, tool_error = handler.tool_managers[0].calls[0]
+    assert tool_error is None
+    assert tool_outputs["output"]["tables"][0]["table_name"] == "t_orders"
+    assert len(handler.llm_spans) == 1
+    assert handler.llm_spans[0].finished == 1
+    assert handler.llm_spans[0].tags == [{"output": "completion"}]
 
 
 @pytest.mark.asyncio

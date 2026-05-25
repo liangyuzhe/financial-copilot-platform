@@ -29,6 +29,146 @@ AgentScopePlanner -> analysis_plan.submit -> validate -> safety -> authorize -> 
 - 单测验证 `analysis_plan.submit` 只做 handoff，不执行 SQL。
 - 真实 query 验证 tool trace 和 LangSmith span：`dispatcher.classify_route.llm`、`agentscope.runtime.data_analysis`、`agentscope.tool.*`、`analysis_plan.submit`。
 
+### 2026-05-24 设计记录：AgentScope SQL Draft 与 SQL Harness 边界
+
+LangSmith trace 排查确认，当前 `data_analysis` 链路的真实行为是：
+
+```text
+AgentScope data planner LLM 生成 analysis_plan，并可在 SQL step 中提前生成 SQL draft
+-> agentscope.tool.sql.normalize / safety_check / authorize_draft 做草稿级预检
+-> agentscope.tool.analysis_plan.submit 提交 plan_only handoff
+-> approve_analysis_plan 做计划审批
+-> execute_analysis_plan 进入 SQL Harness
+-> SQL Harness 使用已提交 SQL 或在缺失 SQL 时调用 sql.sql_generate.llm
+-> safety_check / authorize_sql / execute_sql / error_analysis / repair
+```
+
+这说明 `approve_analysis_plan` 之前已经可能存在 SQL。若 `analysis_plan.steps[*].sql` 已存在，`execute_analysis_plan` 会走“使用已提交 SQL”的分支，不再调用 `sql.sql_generate.llm`；只有 step 中没有 SQL 时，才进入 SQL Harness 的 `sql.sql_generate.llm` 生成 SQL。
+
+接受当前设计：**AgentScope 可以提前生成 SQL draft，但它生成的是草稿，不是最终执行事实。SQL Harness 仍是正式复核、审批、授权、执行和修复边界。**
+
+当前 SQL Harness 在 trace 中体现为分散节点：
+
+- `approve_analysis_plan`：校验 plan、提取引用表、做计划级授权，并通过 `interrupt(...)` 等待用户审批。
+- `execute_analysis_plan`：将 approved `analysis_plan` 转成 `complex_plan` 并进入复杂计划执行。
+- `execute_complex_plan_step` 内部：执行正式 `sql.safety_check`、`sql.authorize_sql`、`sql.execute_sql`；失败时再调用 `sql.error_analysis.llm` 和 `sql.sql_generate.llm` 做修复。
+
+当前 trace 命名的问题：
+
+- `agentscope.llm.data_analysis_agent` 实际包住了整个 AgentScope agent run，不是纯 LLM call，容易误导为所有 tool 都发生在 LLM 内部。
+- `agentscope.tool.sql.safety_check` 和后续 `sql.safety_check` 名称相近，但职责不同：前者只是 planner draft preflight，后者是 Harness 执行前正式安全门。
+- SQL Harness 没有统一的 `sql_harness.*` wrapper，导致审批、授权、执行边界在 LangSmith 中不够直观。
+
+目标 trace 结构：
+
+```text
+agentscope_data_planner
+  agentscope.agent.data_analysis_agent
+    agentscope.llm.data_analysis_agent.reasoning
+    agentscope.tool.query.context_rewrite
+    agentscope.tool.schema.select_candidates
+    agentscope.llm.data_analysis_agent.reasoning
+    agentscope.preflight.sql.normalize
+    agentscope.preflight.sql.safety_check
+    agentscope.preflight.sql.authorize_draft
+    agentscope.handoff.analysis_plan.submit
+
+approve_analysis_plan
+  sql_harness.validate_analysis_plan
+  sql_harness.authorize_plan_tables
+  sql_harness.request_approval
+
+execute_analysis_plan
+  sql_harness.execute_plan
+    sql_harness.step.1.prepare_submitted_sql
+    sql_harness.step.1.safety_check
+    sql_harness.step.1.authorize_sql
+    sql_harness.step.1.execute_sql
+    sql_harness.step.1.repair_sql_generate   # only on failure
+    sql_harness.merge_report
+```
+
+关于重复 safety check 的取舍：
+
+- 必须保留 SQL Harness 阶段的正式 `sql.safety_check` / `sql.authorize_sql`，这是执行前最终 gate。
+- AgentScope 阶段的 `sql.safety_check` / `sql.authorize_draft` 不是最终 gate，只能定位为 advisory preflight。
+- 若保留 AgentScope 预检，trace 必须改名为 `agentscope.preflight.*`，避免与 Harness 正式检查混淆。
+- 更清晰的方案是 AgentScope 阶段只保留轻量 SQL 格式规范化，安全和授权统一交给 SQL Harness；若为了提前拦截明显错误而保留预检，也不能把它展示成最终安全结论。
+
+后续实现建议：
+
+- 将 `agentscope.llm.data_analysis_agent` 改为 `agentscope.agent.data_analysis_agent`，真实 LLM call 单独打 span。
+- 不再基于最终 `tool_trace` 后补 `agentscope.react.*` 或 `agentscope.plan.*` 伪节点；SQL draft/plan 的生成应体现在真实 `agentscope.llm.data_analysis_agent.reasoning` 输出中。
+- 将 AgentScope 提交前校验命名为 `agentscope.preflight.*`。
+- 给审批和执行阶段补充 `sql_harness.*` wrapper/span，让 Harness 在 LangSmith 中成为一眼可见的阶段。
+- 不让 LLM 最终回复回写完整 `AgentRunResult.tool_trace/events/state_patch`；这些应由 runtime 组装，LLM 只输出 answer、analysis_plan 或澄清问题。
+
+### 2026-05-24 调查记录：AgentRunResult 组装与 ReAct 内部 Trace 缺失
+
+针对 LangSmith 中 `agentscope.llm.data_analysis_agent` output 出现大段 JSON 的现象，确认当前机制如下：
+
+```text
+1. AgentScopeRuntime 创建 AgentScopeRunContext
+2. AgentScopePackageRunner 注册 Toolkit
+3. ReActAgent 开始内部循环
+4. LLM 决定调用某个 tool
+5. AgentScope 调度 toolkit function
+6. ToolCatalog 执行 tool，runtime 记录 context.tool_trace / context.events
+7. LLM 读取 tool observation 并继续决策
+8. LLM 生成 SQL draft / analysis_plan
+9. LLM 调 analysis_plan_submit
+10. ToolCatalog 保存 plan_only handoff
+11. LLM 输出最终 assistant 文本
+12. AgentScopePackageRunner._convert_reply(...) 将最终 reply 归一化为 AgentRunResult
+13. AgentScopeRuntime.run(...) 合并 context.tool_trace / context.events 到 AgentRunResult
+14. Dispatcher 读取 result.state_patch.analysis_plan 继续进入 approve_analysis_plan
+```
+
+结论：
+
+- `AgentRunResult` 不是每次 tool 调用后都组装。
+- 每次 tool 调用只会记录真实 `ToolTrace` 到 `context.tool_trace`，不会生成完整 `AgentRunResult`。
+- `AgentRunResult` 的组装发生在 AgentScope 最终 reply 返回之后，由 adapter/runtime 完成。
+- LLM 不应该理解或输出完整 `AgentRunResult`，只需要输出简洁 `answer`、`analysis_plan` 或 `clarification_questions`。
+- 之前 LangSmith 看到的大 JSON，是因为 prompt 要求“输出必须能被平台转换为 AgentRunResult，包括 tool_trace/events/state_patch”，导致模型把 observation 自己整理进最终 assistant 文本。
+
+LangSmith 缺少以下节点：
+
+```text
+LLM 调 tool
+LLM 继续看 observation
+LLM 生成 SQL draft / plan
+LLM 调 analysis_plan_submit
+```
+
+原因不是这些动作没有发生，而是此前可观测性只记录了：
+
+- 一个手工包裹的 `agentscope.llm.data_analysis_agent` span；
+- 每个 ToolCatalog 执行 span；
+- 没有记录 ReAct 内部“决策/观察/生成/提交意图”的中间 span。
+
+最终修复方向：
+
+- 将 `agentscope.llm.data_analysis_agent` 改为 `agentscope.agent.data_analysis_agent`，避免把整个 agent run 伪装成单次 LLM call。
+- 在 AgentScope model 对象外包一层 `_TracingModelProxy`，把每次真实 `model(...)` 调用桥接到 LangSmith LLM callback，命名为 `agentscope.llm.data_analysis_agent.reasoning`。
+- 不基于最终 `tool_trace` 生成后补 span。后补 `agentscope.react.tool_call.*`、`agentscope.react.observation.*`、`agentscope.plan.sql_draft_generate` 会让 LangSmith 看起来像发生了额外真实调用，已放弃。
+- 收窄 data_analysis prompt，明确最终回复不要回写 `tool_trace/events/state_patch` 或完整 `AgentRunResult`。
+
+实现状态：
+
+- 已新增 `AgentScopeRunContext.start_chain_span/end_chain_span`，用于真实 AgentScope agent wrapper。
+- 已将 package runner 的外层 span 从 `agentscope.llm.data_analysis_agent` 改为 `agentscope.agent.data_analysis_agent`。
+- 已新增 `_TracingModelProxy`，真实 AgentScope ReAct reasoning 每次调用模型时产生 `agentscope.llm.data_analysis_agent.reasoning`。
+- 已移除后补的 `agentscope.react.*` 和 `agentscope.plan.*` 合成 span。
+- 已更新 prompt，要求最终回复只输出简洁 answer、analysis_plan 或 clarification_questions。
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_agentscope_adapter.py::test_package_runner_emits_real_llm_spans_for_data_analysis_without_synthetic_react_nodes -q
+# 1 passed
+```
+
 ### 2026-05-19 修复记录：真实 AgentScope 计划提交失败
 
 真实查询 `收入成本预算回款费用之间的关系` 暴露了两个问题：
@@ -3649,3 +3789,972 @@ POST /api/query/approve
 ### 当前限制
 
 当前环境 `CHAT_MODEL_TYPE=ark`，Ark 调用返回 `AccountOverdueError`；`OPENAI_CHAT_MODEL` 和 `QWEN_CHAT_MODEL` 仍是占位值 `your-chat-model`。因此本轮只能验证到错误收敛和审批链路正常，不能在当前模型配置下验证 SQL 真正生成并执行成功。
+
+## Iteration：AgentScope 工具暴露与 token 成本控制
+
+日期：2026-05-24
+
+### 背景
+
+LangSmith 里 `agentscope.llm.data_analysis_agent.reasoning` 调用次数和单次 input token 都偏高。排查后确认，真实 AgentScope package runner 走 ReActAgent，每轮模型调用都会携带当前可见工具 schema；如果一次性把 data_analysis 的全量规划、schema、SQL 预检查和 handoff 工具都暴露给模型，工具描述、参数 schema 和历史 observation 会持续放大上下文成本。
+
+此前已做紧急止血：真实 AgentScope data_analysis runner 只注册 6 个规划必要工具，并压缩工具描述和大 observation，`data_analysis_max_iters` 降到 5。这能降低成本，但它仍是静态过滤，不表达“当前阶段/上一工具调用之后到底允许看哪些工具”。
+
+### 本轮设计
+
+- 引入可配置的 `ToolExposurePolicy`，工具可见性按交集计算：
+
+```text
+runtime/security allowlist ∩ stage/previous-tool policy ∩ skill allowlist
+```
+
+- data_analysis 默认策略：
+  - start：`current_time.now`、`business_knowledge.search`、`schema.select_candidates`
+  - after `current_time.now`：`business_knowledge.search`、`schema.select_candidates`
+  - after `business_knowledge.search`：`schema.select_candidates`
+  - after `schema.select_candidates`：`semantic_model.search`、`schema.related_tables`、`analysis_plan.submit`
+  - after `semantic_model.search`：`schema.related_tables`、`analysis_plan.submit`
+  - after `schema.related_tables`：`analysis_plan.submit`
+  - after `analysis_plan.submit`：不再暴露工具
+- AgentScope toolkit 可以注册策略允许的 data_analysis 规划工具全集，但每次 LLM call 只在 `_TracingModelProxy` 中把当前阶段可见的 tool schema 传给模型，从而减少每轮 input token。
+- 非 data_analysis 任务保持原行为，避免扩大改动面。
+
+### SQL Harness 边界
+
+AgentScope Planner 只负责取证和提交 `analysis_plan`。SQL safety、authorize、approve、execute 仍属于 SQL Harness：
+
+- `agentscope.tool.analysis_plan.submit` 是 handoff，不是执行。
+- Planner 不再把 `sql.safety_check`、`sql.authorize_draft` 暴露给真实 package ReActAgent。
+- 后续 `approve_analysis_plan`、SQL 生成、SQL 安全检查、权限检查、执行和结果组织仍由 `agents/flow/sql_react.py` 与 dispatcher 负责。
+
+### 后续改进
+
+1. 把工具描述分成 runtime/internal 与 LLM compact 两种 contract，避免 prompt 手写漂移。
+2. 把 observation 压缩策略沉淀成工具级 contract，例如 `summary/raw/hidden`、`max_items`、`max_chars`。
+3. 在 LangSmith trace 中区分真实调用与平台合成节点，避免 `agentscope.plan.*` 这类 span 被误解为独立 LLM 调用。
+4. 继续检查 DataAgent 的 toolkit/callback 机制，确认是否也按阶段缩窄工具 schema，而不是每轮携带全量工具。
+
+## Iteration Plan：Skill 作为 ReActAgent 的能力调用单元
+
+日期：2026-05-24
+
+### 目标
+
+把真实 AgentScope ReActAgent 从“直接编排底层 tools”上移为“选择和调用业务 skill”。底层 ToolCatalog 仍存在，但默认只暴露给 skill runtime；ReActAgent 看到的是少量稳定业务能力，而不是 15 个以上 primitive tools。
+
+这不是把 DataAgent 简化成 NL2SQL。DataAgent 的能力范围应覆盖指标口径、数据发现、表字段取证、权限感知规划、复杂计划拆解、SQL Harness handoff、执行结果解释和报告生成。skill 是这些能力的稳定 contract。
+
+### 核心概念
+
+```text
+tool:
+  原子能力，例如 schema.select_candidates、semantic_model.search、schema.related_tables。
+
+skill:
+  面向业务任务的固定或半固定流程，例如 finance_relation_analysis_skill。
+  skill 内部可以调用多个 tool，也可以做局部复杂度判断和计划拆解。
+
+ReActAgent:
+  默认只看到 skill 列表，负责选择哪个 skill，而不是逐个选择底层 tool。
+
+SQL Harness:
+  仍负责 approve、sql_generate、sql.safety_check、authorize、execute、repair、merge/report。
+```
+
+### 设计原则
+
+1. skill 不是“大 prompt 包装”。skill 必须是：
+
+```text
+contract + allowed_tools + workflow/state machine + compact output + trace policy
+```
+
+2. ReActAgent 负责选择能力，skill runtime 负责可靠执行流程。
+3. skill 内部 observation 返回给 LLM 时只给摘要，不把完整 tool output、完整 semantic model、完整 trace 全塞回上下文。
+4. primitive tools 仍可在开发/debug/探索模式下受控开放，但生产 data_analysis 默认走 skill 级暴露。
+5. SQL 执行边界不迁移到 AgentScope。skill 只能提交 plan/handoff，不能直接执行 SQL。
+
+### `finance_relation_analysis_skill` 设计
+
+适用问题：
+
+```text
+收入成本预算回款费用之间的关系
+分析当前公司收入、成本、预算、回款、费用
+按部门分析收入成本费用预算执行和回款效率
+```
+
+建议输入：
+
+```json
+{
+  "query": "用户原始问题",
+  "session_id": "会话 ID",
+  "security_context": {},
+  "workflow_state": {},
+  "constraints": {
+    "time_range": "可选",
+    "grain": "可选，例如 department/month/project",
+    "budget_status": "可选，例如 已审批/执行中",
+    "cash_vs_accrual": "可选"
+  }
+}
+```
+
+内部阶段：
+
+```text
+1. resolve_context
+   - current_time.now
+   - 解析相对时间、本年/去年/当前等表达
+
+2. business_grounding
+   - business_knowledge.search
+   - 召回净利润、净利率、预算差异、预算执行率、应收周转/回款效率等口径
+
+3. schema_grounding
+   - schema.select_candidates
+   - semantic_model.search
+   - schema.related_tables
+   - 获取候选表、字段语义、表关系
+
+4. complexity_assessment
+   - plan.assess_feasibility 或等价的 skill 内部复杂度判断
+   - 判断 single_sql、plan_execute、needs_clarification
+
+5. plan_building
+   - simple case: 生成单步 analysis_plan
+   - complex case: 生成多步 decomposition analysis_plan
+   - unclear case: 返回 clarification_questions
+
+6. handoff
+   - analysis_plan.submit
+   - 提交给 SQL Harness，进入审批/执行链路
+```
+
+建议输出：
+
+```json
+{
+  "status": "plan_ready | needs_clarification | failed",
+  "skill_name": "finance_relation_analysis_skill",
+  "skill_version": "2026-05-24",
+  "execution_mode": "single_sql | plan_execute | clarification",
+  "summary": "给外层 Agent 的简短摘要",
+  "evidence": [
+    "使用了哪些业务口径",
+    "选择了哪些核心表",
+    "关键关系或缺口"
+  ],
+  "analysis_plan": {},
+  "clarification_questions": [],
+  "trace_refs": []
+}
+```
+
+### 复杂查询分流
+
+复杂财务关系查询不能让 LLM 一次性写大 SQL join。`finance_relation_analysis_skill` 必须先做复杂度判断：
+
+```text
+if 缺少必要时间/主体/粒度/口径:
+  execution_mode = clarification
+
+elif 候选表少、join 风险低、指标口径简单:
+  execution_mode = single_sql
+
+else:
+  execution_mode = plan_execute
+```
+
+复杂度判断输入：
+
+```text
+- 用户问题
+- 业务知识召回结果
+- selected_tables
+- semantic_model_summary
+- relationships
+- 安全上下文允许范围
+- 是否涉及多指标、多粒度、多事实表、多口径合并
+```
+
+复杂度判断输出：
+
+```json
+{
+  "can_single_sql": false,
+  "can_decompose": true,
+  "execution_mode": "plan_execute",
+  "reasons": [
+    "收入、预算、回款、费用来自不同事实表",
+    "需要按共同粒度合并",
+    "一次性多表 join 容易产生字段和关系幻觉"
+  ],
+  "risky_joins": [],
+  "missing_fields": [],
+  "recommended_grain": ["period", "cost_center_id"]
+}
+```
+
+### Plan Execute React 模式
+
+当 `execution_mode=plan_execute` 时，skill 输出多步 `analysis_plan`，而不是输出大 join SQL。每个 SQL step 应尽量控制表数量和粒度：
+
+```json
+{
+  "mode": "analysis_plan",
+  "execution_mode": "plan_execute",
+  "steps": [
+    {
+      "step": 1,
+      "type": "sql",
+      "goal": "按部门和期间统计收入",
+      "tables": ["t_journal_entry", "t_journal_item", "t_account", "t_cost_center"],
+      "grain": ["period", "cost_center_id"],
+      "depends_on": [],
+      "merge_keys": ["period", "cost_center_id"]
+    },
+    {
+      "step": 2,
+      "type": "sql",
+      "goal": "按部门和期间统计成本与费用",
+      "tables": ["t_journal_entry", "t_journal_item", "t_account", "t_expense_claim", "t_cost_center"],
+      "grain": ["period", "cost_center_id"],
+      "depends_on": [],
+      "merge_keys": ["period", "cost_center_id"]
+    },
+    {
+      "step": 3,
+      "type": "sql",
+      "goal": "按部门和期间统计预算与实际",
+      "tables": ["t_budget", "t_cost_center"],
+      "grain": ["budget_year", "budget_month", "cost_center_id"],
+      "depends_on": [],
+      "merge_keys": ["period", "cost_center_id"]
+    },
+    {
+      "step": 4,
+      "type": "python_merge",
+      "goal": "合并收入、成本、费用、预算、回款并计算关系指标",
+      "depends_on": [1, 2, 3],
+      "merge_keys": ["period", "cost_center_id"]
+    },
+    {
+      "step": 5,
+      "type": "report",
+      "goal": "输出关系分析结论、异常点和后续追查建议",
+      "depends_on": [4]
+    }
+  ]
+}
+```
+
+后续执行仍由 SQL Harness 完成：
+
+```text
+approve_analysis_plan
+  -> per-step sql_generate
+  -> sql.normalize
+  -> sql.safety_check
+  -> authorize_sql
+  -> execute_sql
+  -> repair retry
+  -> merge/report
+```
+
+### Trace 形态目标
+
+LangSmith/平台 trace 应能区分真实调用层级：
+
+```text
+agentscope.llm.data_analysis_agent.reasoning
+  -> agentscope.skill.finance_relation_analysis
+       -> agentscope.tool.current_time.now
+       -> agentscope.tool.business_knowledge.search
+       -> agentscope.tool.schema.select_candidates
+       -> agentscope.tool.semantic_model.search
+       -> agentscope.tool.schema.related_tables
+       -> agentscope.skill.complexity_assess
+       -> agentscope.tool.analysis_plan.submit
+  -> route_after_agentscope_data_planner
+  -> approve_analysis_plan
+  -> sql_harness.*
+```
+
+trace 要求：
+
+- skill span 是真实 runtime 执行，不伪装成 LLM。
+- tool span 保留完整结构化 output 给平台排障。
+- 返给 ReActAgent 的 observation 是 compact summary。
+- `analysis_plan.submit` 之后的 SQL 相关节点归 SQL Harness，不归 AgentScope Planner。
+
+### 实施计划
+
+#### 阶段 1：Skill Contract 与 Registry
+
+目标：定义 skill 作为一等 runtime contract。
+
+建议文件：
+
+```text
+agents/runtime/skill_contracts.py
+agents/runtime/skill_registry.py
+tests/test_skill_registry.py
+```
+
+任务：
+
+1. 增加 `RuntimeSkill`、`SkillInput`、`SkillResult`、`SkillTracePolicy`。
+2. 扩展现有 `SkillDefinition`，区分 prompt-only skill 与 executable skill。
+3. 支持 skill 的 `allowed_tools`、`input_schema`、`output_schema`、`version`、`execution_mode_hints`。
+4. 测试 skill allowlist 只能收窄工具，不能扩大安全上下文允许范围。
+
+依赖：无。可独立开发。
+
+#### 阶段 2：Skill Runtime / Tool Workflow 执行器
+
+目标：让 skill 内部能按固定流程调用 ToolCatalog，并记录 child tool trace。
+
+建议文件：
+
+```text
+agents/runtime/skill_runtime.py
+agents/runtime/agentscope_runtime.py
+tests/test_skill_runtime.py
+tests/test_agentscope_runtime.py
+```
+
+任务：
+
+1. 实现 `SkillRuntime.invoke_skill(skill_name, payload, context)`。
+2. skill 内部通过现有 `AgentScopeRunContext.invoke_tool()` 调用工具，复用缓存、权限和 LangSmith callback。
+3. skill 返回 compact observation 给外层 ReActAgent。
+4. child tool trace 保留在 `result.tool_trace` 和 LangSmith span 中。
+
+依赖：阶段 1。
+
+#### 阶段 3：`finance_relation_analysis_skill`
+
+目标：沉淀收入、成本、预算、回款、费用关系分析的固定取证流程。
+
+建议文件：
+
+```text
+agents/runtime/skills/finance_relation_analysis.py
+tests/test_finance_relation_analysis_skill.py
+```
+
+任务：
+
+1. 实现 context/time/business/schema/relationship 取证流程。
+2. 使用 compact semantic model，不把全量字段模型传回 LLM。
+3. 信息不足时返回 `needs_clarification`，不伪造 plan。
+4. 信息充分时进入复杂度判断。
+
+依赖：阶段 1、阶段 2。可与阶段 4 并行开发接口草案，但最终集成依赖阶段 2。
+
+#### 阶段 4：复杂度判断与 Plan Execute 分流
+
+目标：在 skill 内部保留“是否复杂 SQL”的判断，复杂场景走 Plan Execute React。
+
+建议文件：
+
+```text
+agents/runtime/skills/complexity.py
+agents/runtime/skills/finance_relation_analysis.py
+tests/test_finance_relation_analysis_skill.py
+tests/test_sql_react.py
+```
+
+任务：
+
+1. 将 `plan.assess_feasibility` 或等价逻辑封装为 skill 内部 `complexity_assess` 阶段。
+2. 输出 `single_sql`、`plan_execute`、`clarification` 三种模式。
+3. 对多事实表、多口径、多粒度合并默认倾向 `plan_execute`。
+4. 对 `plan_execute` 生成多步 `analysis_plan`，每个 step 控制表数量、grain 和 merge_keys。
+5. 增加回归用例：`收入成本预算回款费用之间的关系` 必须走 `plan_execute`，不能生成单条大 join SQL。
+
+依赖：阶段 3。可先独立写纯函数和测试。
+
+#### 阶段 5：AgentScope ReActAgent 暴露 skill，而不是 primitive tools
+
+目标：真实 package runner 的 data_analysis agent 默认只看到 executable skills。
+
+建议文件：
+
+```text
+agents/runtime/agentscope_adapter.py
+agents/runtime/tool_exposure_policy.py
+tests/test_agentscope_adapter.py
+```
+
+任务：
+
+1. 把 `finance_relation_analysis_skill` 注册成 AgentScope toolkit function，例如 `finance_relation_analysis`。
+2. 默认不向 data_analysis ReActAgent 暴露 `schema.select_candidates`、`semantic_model.search` 等 primitive tools。
+3. 保留受控 debug 配置：允许临时暴露 primitive tools，用于开发排障。
+4. `_TracingModelProxy` 记录每轮可见 skill/tool names，方便验证 token 缩减。
+5. 测试工具 schema JSON 长度、每轮可见 function names、`analysis_plan.submit` 不直接暴露给外层 Agent。
+
+依赖：阶段 1、阶段 2。可与阶段 3/4 并行开发 adapter 外壳。
+
+#### 阶段 6：SQL Harness 边界回归
+
+目标：确认 skill 化不会绕过 SQL Harness。
+
+建议文件：
+
+```text
+agents/flow/dispatcher.py
+agents/flow/sql_react.py
+tests/test_dispatcher.py
+tests/test_sql_react.py
+```
+
+任务：
+
+1. 验证 `finance_relation_analysis_skill` 只提交 `analysis_plan`，不执行 SQL。
+2. 验证审批前 API 返回 `pending_approval`。
+3. 验证审批后仍走 per-step SQL generate/safety/authorize/execute。
+4. 验证 SQL repair 仍发生在 SQL Harness，不发生在 skill runtime。
+
+依赖：阶段 3、阶段 4。可提前补测试夹具。
+
+#### 阶段 7：Trace 与成本验收
+
+目标：让 LangSmith 中能看懂真实 skill/tool/SQL Harness 边界，并量化 token 降幅。
+
+建议文件：
+
+```text
+agents/tool/trace/tracing.py
+agents/runtime/agentscope_adapter.py
+tests/test_tracing.py
+tests/test_agentscope_adapter.py
+```
+
+任务：
+
+1. 增加 `agentscope.skill.*` span。
+2. 标记 span metadata：`real_call=true`、`span_layer=skill|tool|sql_harness`、`visible_functions=[...]`。
+3. 移除或重命名容易误解的合成 span，例如把非真实 LLM 的 `agentscope.plan.*` 标为 `synthetic=true`。
+4. 增加本地 token/schema size 统计脚本或测试断言。
+5. 用真实 query `去年亏损` 和 `收入成本预算回款费用之间的关系` 做 LangSmith 验证。
+
+依赖：阶段 5。可与阶段 6 并行。
+
+### 可并行开发拆分
+
+```text
+Track A: Skill Contract + Runtime
+  阶段 1 -> 阶段 2
+
+Track B: Finance Relation Skill
+  阶段 3 -> 阶段 4
+  可先基于 mock SkillRuntime 写纯单测
+
+Track C: AgentScope Adapter
+  阶段 5
+  可先实现 toolkit 暴露 skill function 的外壳，再接真实 skill runtime
+
+Track D: SQL Harness Regression
+  阶段 6
+  可先补审批、执行边界测试
+
+Track E: Trace/Cost
+  阶段 7
+  可先补 span metadata 和 schema size 验收，再接真实链路
+```
+
+推荐执行顺序：
+
+```text
+1. Track A 先完成最小 contract/runtime
+2. Track B 和 Track C 并行
+3. Track D 在 B 的 plan output 稳定后接入
+4. Track E 全程跟随，最后用真实 LangSmith query 验收
+```
+
+### 验收标准
+
+1. data_analysis 真实 AgentScope package runner 首轮不再暴露全量 primitive tools。
+2. `finance_relation_analysis_skill` 能对 `收入成本预算回款费用之间的关系` 产出 `execution_mode=plan_execute` 的多步 plan。
+3. skill 返回给 LLM 的 observation 是 compact summary，完整 tool output 只进入 trace/artifact。
+4. `analysis_plan.submit` 后仍进入 SQL Harness 的审批和执行链路。
+5. LangSmith 中能看到清晰层级：Agent reasoning -> skill -> child tools -> SQL Harness。
+6. 单测覆盖 skill contract、skill runtime、finance relation plan_execute、AgentScope visible functions、SQL Harness boundary。
+
+### 2026-05-24 小方案执行状态
+
+本轮先完成可观测性和 SQL Harness 边界命名，不继续扩大到 `skill_registry` 与 `ToolExposurePolicy` 统一重构。
+
+已完成：
+
+1. `agentscope.skill.finance_relation_analysis` span 增加 `span_layer=skill`、`real_call=true`、`visible_functions=["finance_relation_analysis"]` 和 `allowed_tools` 元数据。
+2. `approve_analysis_plan` 增加 `sql_harness.approve_analysis_plan` span，标记 `span_layer=sql_harness`、`real_call=true`、`stage=approval`、`approval_type=complex_plan`、`step_count`。
+3. `execute_analysis_plan` 增加 `sql_harness.execute_analysis_plan` span，标记 `span_layer=sql_harness`、`real_call=true`、`stage=execution`、`approved`、`step_count`。
+4. 保持业务行为不变：AgentScope skill 仍只提交 `analysis_plan`，审批后才进入 SQL Harness 分步执行。
+
+验证：
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_skill_runtime.py::test_skill_runtime_span_metadata_includes_visible_functions \
+  tests/test_dispatcher.py::test_dispatcher_emits_sql_harness_approval_and_execution_spans -q
+# 2 passed
+```
+
+下一阶段：
+
+1. 统一旧 `SkillRegistry` 与 executable `RuntimeSkill`，明确 prompt-only skill 与 executable skill 的注册边界。
+2. 实现可配置 `ToolExposurePolicy`，支持按 task/stage/previous-tool/skill allowlist 计算每轮可见工具。
+3. 将 schema size / visible function names 的统计固化为测试或诊断脚本。
+
+### 2026-05-24 Registry 与 ToolExposurePolicy 小步统一
+
+本轮在小方案验证通过后，继续完成 `skill_registry` 和 `ToolExposurePolicy` 的最小统一，不引入完整 skill marketplace 或复杂动态路由。
+
+已完成：
+
+1. `SkillDefinition` 增加 `kind="prompt" | "executable"` 与 `runtime_contract`，保留原有 prompt-only skill 行为。
+2. 新增 `SkillDefinition.from_runtime_skill(...)`，将 `RuntimeSkill.allowed_tools/input_schema/output_schema/execution_modes` 统一映射到 registry 可序列化定义。
+3. `SkillRegistry.builtin()` 已纳入 `finance_relation_analysis` executable skill。旧的 `budget_variance_analysis`、`revenue_cost_relation` 仍保持 prompt-only skill。
+4. 新增 `ToolExposurePolicy`：
+   - 生产默认 `data_analysis` 只暴露 `finance_relation_analysis`。
+   - debug primitive 模式按阶段暴露有限工具，而不是全量 15 个 data_analysis tools。
+   - 阶段例子：start 暴露 `current_time.now`、`business_knowledge.search`、`schema.select_candidates`；after `business_knowledge.search` 只暴露 `schema.select_candidates`。
+5. `AgentScopePackageRunner` 接入 `ToolExposurePolicy`：
+   - 默认 toolkit 只注册 skill function。
+   - debug primitive toolkit 注册有限 primitive 工具集合。
+   - `_TracingModelProxy` 在每次真实模型调用前按 `context.tool_trace` 的上一成功工具过滤 tool schema，LangSmith LLM span metadata 中的 `tool_names` 反映本轮真实可见函数。
+6. `finance_relation_analysis` executable skill allowlist 补充 `schema.list_tables`，保证 registry allowlist 收窄后本地兼容 runner 仍能做可见表发现；skill 默认执行流程未新增该工具调用。
+7. `ToolExposurePolicy` 支持从 `AGENTSCOPE_TOOL_EXPOSURE_POLICY_JSON` 加载最小配置，`scripts/diagnose_tool_exposure.py` 可输出 skill-only / primitive-debug 的 schema 大小对比和近似 token 统计。
+8. `AgentScopeRuntime` 会把自身 `tool_exposure_policy` 注入支持该字段的 runner，避免 runtime 层配置和 package runner 实际执行策略脱节。
+
+当前边界：
+
+- `ToolExposurePolicy` 已控制真实模型调用前的 schema 可见性。
+- 真实 ReActAgent 内部下一步可调用范围通过模型代理层过滤传入 `tools` 参数实现；toolkit 注册集合仍需要包含 debug/recovery 流程可能直接调用的函数。
+- 非 `data_analysis` 任务保持旧逻辑，避免扩大行为面。
+- policy 配置失败时回退默认值，不中断启动。
+
+验证：
+
+```bash
+.venv/bin/python -m pytest \
+  tests/test_tool_exposure_policy.py \
+  tests/test_skill_registry.py \
+  tests/test_skill_runtime.py \
+  tests/test_agentscope_adapter.py -q
+# 46 passed
+```
+
+诊断脚本实测输出：
+
+```text
+skill_only: function_count=1, schema_chars=652, estimated_tokens=152
+primitive_debug_start_visible: function_count=3, schema_chars=1603, estimated_tokens=368
+primitive_debug_registered: function_count=6, schema_chars=2820, estimated_tokens=642
+```
+
+真实 query 验证：
+
+```text
+去年亏损 -> pending_approval, execution_mode=single_sql
+收入成本预算回款费用之间的关系 -> pending_approval, execution_mode=plan_execute
+```
+
+LangSmith 最新 trace 确认：
+
+```text
+agentscope.llm.data_analysis_agent.reasoning 可见函数为 finance_relation_analysis
+agentscope.skill.finance_relation_analysis 真实执行并记录 child_tool_count=7
+sql_harness.approve_analysis_plan 在 analysis_plan.submit 后出现
+```
+
+### 2026-05-24 文档补齐记录：当前实现与可观测边界
+
+本轮把实现说明补进长期文档，目标是让后续排障的人只看文档就能回答三个问题：
+
+1. 生产默认到底暴露了哪些工具。
+2. `AgentRunResult` 在什么时候组装。
+3. LangSmith 里哪些节点是真实调用，哪些只是平台边界。
+
+这次文档补齐的核心结论如下：
+
+- 生产默认 `data_analysis` 只向外层 ReActAgent 暴露 `finance_relation_analysis` 一个 executable skill。
+- `finance_relation_analysis` 是代码状态机，不是大 prompt；它内部通过 `current_time.now`、`business_knowledge.search`、`schema.select_candidates`、`semantic_model.search`、`schema.related_tables`、`plan.assess_feasibility`、`analysis_plan.submit` 完成财务关系分析取证。
+- `AgentRunResult` 不是每次 tool 调用后都组装，而是在 agent 最终 reply 返回后，由 runtime 把 `tool_trace`、`events`、`state_patch` 合并进去。
+- SQL safety / authorize / execute 的正式边界仍然在 SQL Harness，不在 AgentScope skill。
+- debug primitive 模式只是一种受控排障视图，不代表生产默认暴露 15 个 primitive tools。
+
+对应实现落点：
+
+- `agents/runtime/skill_contracts.py`
+- `agents/runtime/skill_runtime.py`
+- `agents/runtime/skills/finance_relation_analysis.py`
+- `agents/runtime/tool_exposure_policy.py`
+- `agents/runtime/skill_registry.py`
+- `agents/runtime/agentscope_runtime.py`
+- `agents/runtime/agentscope_adapter.py`
+- `agents/flow/dispatcher.py`
+- `scripts/diagnose_tool_exposure.py`
+
+文档更新后的验证仍沿用当前已完成的单测和真实 query 结果，不新增业务行为。
+
+### 2026-05-24 SQL Quality Gate：SQL 正确性治理前移
+
+当前 `approve_analysis_plan` 只解决了“业务是否接受继续执行”，还没有解决“SQL 本身是否真的对”。如果用户不懂 SQL，只靠 approve 很容易把错误 SQL 放进执行链路。这里需要把 SQL 正确性治理前移到 SQL Harness 内部，形成系统级的 `SQL Quality Gate`。
+
+#### 参考实现：DataAgent
+
+DataAgent 的主流程不是“生成 SQL 后直接执行”，而是：
+
+```text
+Planner -> PlanExecutor validate -> Human review -> SqlGenerateNode -> SemanticConsistencyNode -> SqlExecuteNode
+```
+
+也就是说，SQL 生成后、执行前有一层语义一致性校验，不通过就回到生成阶段。它还提供了 SQL 重试、优化次数和分数阈值等配置，说明业界实践已经把“SQL 是否靠谱”当成独立治理问题，而不是只交给用户 approve。
+
+DataAgent 的 `SqlVerifyExplainService` 也表明了这种思路：先解析 SQL，再检查聚合、分组、时间过滤、时间窗口、排序、limit、distinct、排序方向，以及人工反馈约束等规则；校验结果不是简单 pass/fail，而是 `safe_to_execute` / `revise_sql` + 规则解释 + 修复建议。
+
+#### 业界共识
+
+- **Semantic model / governed metrics**：把指标、维度、时间口径、表关系先建模，减少 LLM 自由猜口径。
+- **Verified queries**：沉淀已验证的问题- SQL 对，作为高可信回归集和提示样本。
+- **Execution-guided / self-correction**：先解析、再执行、再根据错误或空结果修复，不把第一次生成当最终答案。
+- **Query checker**：在执行前做结构、语义、权限和口径一致性检查。
+
+#### 我们要落的方案
+
+把一个系统级 `sql.semantic_check` 放进 SQL Harness，而不是放进 AgentScope skill：
+
+```text
+analysis_plan approve
+  -> sql_generate / submitted_sql
+  -> sql.parse_and_shape
+  -> sql.semantic_check
+  -> sql.safety_check
+  -> sql.authorize_sql
+  -> sql.dry_run / explain
+  -> execute_sql
+  -> result_sanity_check
+  -> report
+```
+
+`sql.semantic_check` 的职责建议包括：
+
+1. intent 对齐：用户问收入、成本、预算、回款、费用，SQL 是否真的覆盖这些指标。
+2. 时间对齐：去年、本月、当前期间是否映射到正确日期字段或 period。
+3. 粒度对齐：按部门、按月、按项目时，GROUP BY 是否匹配。
+4. 指标口径：净利润、预算差异、回款效率等是否符合既定公式。
+5. 关系校验：join 是否来自已知 relationship，禁止未经聚合的 fact-to-fact 直连。
+6. 结果风险：空结果、重复放大、异常 row count、金额方向反了等。
+
+#### UI / 产品变化
+
+用户侧不应再只看到“请 approve SQL”，而应看到一张可解释的校验卡片：
+
+```text
+计划回答：2025 年公司亏损情况
+使用指标：收入、成本、费用、净利润
+时间口径：2025-01 至 2025-12
+数据来源：t_journal_entry, t_journal_item, t_account
+系统校验：通过 8 项，警告 1 项
+风险：未发现预算/回款字段，本问题仅判断损益亏损，不分析现金回款
+```
+
+#### 分阶段落地
+
+第一阶段优先做确定性规则，不先上复杂 LLM judge：
+
+1. AST 解析和 SQL shape 抽取。
+2. query intent / analysis_plan 的结构化比对。
+3. `sql.semantic_check` 输出 `pass / warn / fail + score + problems + repair_hints`。
+4. 失败自动进入现有 SQL repair，超过次数则停止执行。
+5. approval 页面展示业务口径摘要和系统校验结果。
+
+第二阶段再补治理闭环：
+
+- Verified Query Repository：沉淀已确认 SQL 和口径。
+- SQL eval dataset：把失败、修复、用户反馈沉淀为回归集。
+- semantic model 强化：补指标、维度、时间字段、状态枚举和 join cardinality。
+- 高风险查询可用双 SQL 候选或 validator LLM，但 validator 只能给建议，不能绕过确定性规则。
+
+#### 结论
+
+`approve_analysis_plan` 解决的是“人是否同意继续”，`sql.semantic_check` 解决的是“SQL 是否值得继续”。两者不能互相替代。我们这里更适合采用“规则校验 + 修复循环 + verified queries 回归”的组合，而不是继续把正确性责任压给用户。
+
+#### 2026-05-24 V1 实现记录
+
+已完成第一阶段的最小可用 `SQL Quality Gate`：
+
+1. 新增 `agents/tool/sql_tools/semantic_check.py`。
+   - 定义 `SemanticCheckProblem`、`SemanticCheckReport`。
+   - 提供 `check_sql_semantics(...)`，返回 `safe_to_execute` / `revise_sql`、score、problems、fix_suggestions、detected_tables。
+2. 新增 SQL Harness 节点 `semantic_check`。
+   - 简单 SQL 主链路从 `sql_generate -> safety_check` 改成 `sql_generate -> semantic_check -> safety_check`。
+   - 复杂计划 step 的内部 harness 从 `safety_check -> authorize_sql -> execute_sql` 改成 `semantic_check -> safety_check -> authorize_sql -> execute_sql`。
+3. V1 规则先覆盖确定性高的场景：
+   - 亏损金额问题必须有净利润/亏损金额公式。
+   - 净利润问题允许 `SUM(credit_amount - debit_amount)` 这类净利润公式，不强制必须有亏损金额 `CASE`。
+   - 预算、回款、费用、收入意图有基础字段覆盖检查。
+   - 时间和分组是 warning，不在 V1 中默认阻断。
+4. generic 查询不会因为低分被误杀。只有明确业务意图且出现 high problem 时才阻断，避免在权限检查前拦截“查用户”等普通查询。
+5. LangSmith/trace 中复杂计划内部会出现 `sql.semantic_check`，位于 `sql.safety_check` 之前。
+
+#### 2026-05-25 V2 实现记录
+
+在 V1 的 `sql.semantic_check` 后继续补齐执行前治理链路：
+
+1. 新增 SQL Harness 节点 `dry_run_sql`。
+   - 简单 SQL 主链路从 `semantic_check -> safety_check -> authorize_sql -> approve` 改成：
+     `semantic_check -> safety_check -> authorize_sql -> dry_run_sql -> approve`。
+   - `dry_run_sql` 使用 `EXPLAIN <sql>` 做只读预执行，不执行用户 SQL。
+   - EXPLAIN 成功时输出 `dry_run_report`，包含 `safe_to_approve`、`explain_sql`、原始 explain 结果、估算行数和 explain 中识别的表。
+   - EXPLAIN 失败时阻断到用户审批前，返回 `sql_dry_run_failed` 和修复建议。
+2. 复杂计划 SQL step 的正式 Harness 顺序改成：
+
+```text
+sql.semantic_check
+-> sql.safety_check
+-> sql.authorize_sql
+-> sql.dry_run
+-> sql.execute_sql
+```
+
+   成功或执行失败的 step result 中都会保留 `semantic_report` 和 `dry_run_report`，便于前端展示和 LangSmith 排障。
+3. `approve(...)` 的 interrupt payload 增加 `quality_gate`：
+   - `quality_gate.semantic`
+   - `quality_gate.safety`
+   - `quality_gate.authorization`
+   - `quality_gate.dry_run`
+   - `quality_gate.summary.status`
+
+   这让用户即使不懂 SQL，也能看到系统校验结论，而不是只看到“是否执行 SQL”。
+4. 新增本地 `VerifiedQueryRepository` 骨架：
+   - 文件：`agents/tool/sql_tools/verified_query_repository.py`
+   - 存储：JSONL，本地文件路径由调用方传入。
+   - 能力：保存 `question + sql + tables + intent + verification_status + result_signature + quality_score + metadata`，按 fingerprint 去重，并支持按问题、intent、表交集查询。
+   - 当前定位：治理资产和回归/eval fixture，不作为生成时权威 SQL 来源，也不绕过 SQL Harness。
+
+当前仍未完成：
+
+- Verified Query Repository 还没有接入运行时自动沉淀或前端人工确认入口。
+
+#### 长期目标：专业版 SQL Quality Gate
+
+目标是把当前正则版 `semantic_check` 升级为结构化、可配置、可回归的 SQL 治理流水线：
+
+```text
+sql.parse
+-> sql.ast_shape_extract
+-> sql.schema_validate
+-> sql.semantic_metric_validate
+-> sql.relationship_validate
+-> sql.policy_authorize
+-> sql.explain_dry_run
+-> sql.result_sanity_check
+-> verified_query_regression
+```
+
+核心原则：
+
+- 不再在代码里写 `intent == "profit_loss"` 这类业务 hardcode。
+- SQL 正确性判断分成“SQL 结构事实”和“业务语义规则”两层。
+- SQL 结构事实来自 AST，不靠字符串正则猜。
+- 业务语义规则来自可配置 `MetricDefinition` / semantic model，不写死在 Python 分支里。
+- 每个 gate 都输出统一 `QualityGateReport`，包含 `passed / decision / score / problems / warnings / extracted_facts / repair_hints`。
+- LLM 只能生成候选 SQL，不能绕过 SQL Harness。
+
+目标组件：
+
+1. `sql.parse`
+   - 使用 `sqlglot` 解析 MySQL SQL。
+   - 解析失败直接输出 `SQL_PARSE_FAILED`。
+   - 保留原始 SQL、规范化 SQL、dialect、AST dump。
+2. `sql.ast_shape_extract`
+   - 从 AST 提取 `SqlShape`：
+     - tables / aliases
+     - columns / qualified columns
+     - joins / join conditions
+     - filters / date filters / status filters
+     - aggregations
+     - case expressions
+     - group_by / having / order_by / limit
+   - 这个阶段只描述 SQL 写了什么，不判断业务对错。
+3. `sql.schema_validate`
+   - 用 semantic model 校验表和字段存在。
+   - 做 alias resolution，例如 `ji.credit_amount -> t_journal_item.credit_amount`。
+   - 阻断未知表、未知字段、歧义字段。
+4. `sql.semantic_metric_validate`
+   - 引入 `MetricDefinition`：
+
+```yaml
+metric_id: net_profit
+business_names: ["净利润", "利润", "盈亏", "亏损"]
+expression:
+  type: aggregate
+  op: sum
+  formula: "credit_amount - debit_amount"
+required_tables:
+  - t_journal_item
+  - t_journal_entry
+  - t_account
+required_filters:
+  - field: t_account.account_type
+    op: "="
+    value: "损益"
+  - field: t_journal_entry.status
+    op: "="
+    value: "已过账"
+time_field: t_journal_entry.entry_date
+```
+
+   - 用户问题先匹配到 metric，再用 AST shape 比对 SQL 是否覆盖 metric expression、过滤条件、时间字段和粒度。
+5. `sql.relationship_validate`
+   - JOIN 必须能映射到 `table_relationships`。
+   - 禁止未经聚合的 fact-to-fact 直连。
+   - 对桥表、维表、成本中心等关系给出解释。
+6. `sql.policy_authorize`
+   - 保留当前正式权限 gate。
+   - 表权限、列权限、行级策略、数据域策略都在这里统一判断。
+7. `sql.explain_dry_run`
+   - 保留当前 `EXPLAIN <sql>`。
+   - 后续抽象为 dialect adapter，支持不同数据库。
+8. `sql.result_sanity_check`
+   - 对执行结果做空结果、NULL、金额方向、重复放大、异常行数等检查。
+   - 高风险结果进入 SQL repair / human review。
+9. `verified_query_regression`
+   - Verified Query Repository 从“本地骨架”升级为治理资产。
+   - 已验证 SQL 用于回归/eval，不直接绕过 Harness。
+
+拆分任务：
+
+- [x] Task 1：引入 `sqlglot`，新增 `SqlShape` 数据结构和 `extract_sql_shape(sql, dialect="mysql")`。
+- [x] Task 2：用 `SqlShape` 修复当前表别名误判：`SUM(ji.credit_amount - ji.debit_amount)` 应能识别为净利润表达式。
+- [x] Task 3：新增 `MetricDefinition` / `MetricRegistry`，把 `net_profit` 从 hardcode 分支迁移到配置。
+- [x] Task 4：实现 `semantic_metric_validate(shape, metric_defs, query_intent)`，替换 `intent == "profit_loss"` 主分支。
+- [x] Task 5：实现 schema/table/column validation，支持 alias resolution 和未知字段阻断。
+- [x] Task 6：实现 relationship/join validation，接入现有 `table_relationships`。
+- [x] Task 7：把 `semantic_check.py` 改成 pipeline orchestrator，聚合各 gate report。
+- [x] Task 8：把 Verified Query Repository 接入 eval/regression，不进入执行绕过路径。
+- [x] Task 9：补前端 approval 卡片需要的 payload 字段和展示文档。
+- [x] Task 10：新增 `sql.result_sanity_check` gate，输出独立 report，并接入简单 SQL 与复杂计划 SQL step。
+- [x] Task 11：为 `dry_run_sql` 增加 dialect adapter，默认 MySQL 行为不变，并补端到端验证记录。
+
+当前剩余任务边界：
+
+- Task 7 只做 SQL Quality Gate 内部结构化，不改变 `check_sql_semantics(...)` 对外返回主字段，避免影响 SQL Harness 调用链。
+- Task 8 只把 Verified Query Repository 作为回归/eval 数据源接入，不把历史 SQL 当成执行白名单，也不绕过 `semantic_check / safety_check / authorize_sql / dry_run`。
+- Task 9 只展示 approval payload 中已有的质量门结果，用户仍然只是在确认是否继续执行，不承担 SQL 正确性判断责任。
+
+Task 9 落地说明：
+
+- SQL approval interrupt payload 继续使用现有 `quality_gate`：
+  - `quality_gate.summary.status`
+  - `quality_gate.semantic`
+  - `quality_gate.safety`
+  - `quality_gate.authorization`
+  - `quality_gate.dry_run`
+- `agents/static/index.html` 的 SQL 审批卡片展示“SQL 质量门”，按语义、安全、权限、预执行四类显示通过、关注或阻断。
+- 该卡片是系统治理结果展示，不改变审批语义：用户确认的是是否继续执行，SQL 正确性仍由 Harness gates 先行阻断。
+
+Task 10/11 落地说明：
+
+- `sql.result_sanity_check` 已成为独立 SQL Harness gate：
+  - 简单 SQL 图中位于 `execute_sql -> result_sanity_check -> result_reflection/END`。
+  - 复杂计划 SQL step 中位于 `sql.execute_sql` 之后，并在 trace 中显示为 `sql.result_sanity_check`。
+  - 输出 `result_sanity_report`，包含 `passed / decision / summary / problems / warnings`。
+- `dry_run_sql` 已支持 dialect adapter：
+  - 默认 `mysql/postgres` 使用 `EXPLAIN <sql>`。
+  - `sqlite` 使用 `EXPLAIN QUERY PLAN <sql>`。
+  - 当 MCP 只读 wrapper 拒绝 `EXPLAIN` 时，MySQL 路径会回退到直连 MySQL 执行 `EXPLAIN`，但仍不执行用户 SQL。
+- 端到端真实 HTTP 验证发现并修复两类问题：
+  - SQL 引用未声明表别名 `je` 时，schema gate 会以 `UNKNOWN_TABLE_ALIAS` 阻断。
+  - SQL 生成 prompt 明确要求引用 `je.entry_date/status` 前必须 `JOIN t_journal_entry je ON ji.entry_id = je.id`。
+
+端到端验证记录：
+
+```bash
+APP_HOST=127.0.0.1 APP_PORT=8081 AGENTSCOPE_RUNTIME_BACKEND=local LANGCHAIN_TRACING_V2=false STARTUP_CHECK_TIMEOUT=1 .venv/bin/python -m agents.main
+
+curl -sS http://127.0.0.1:8081/health
+# {"status":"ok"}
+
+curl -sS -X POST http://127.0.0.1:8081/api/query/invoke \
+  -H 'Content-Type: application/json' \
+  -H 'X-Allowed-Tables: t_journal_entry,t_journal_item,t_account' \
+  --data '{"query":"去年亏损","session_id":"e2e-sql-quality-gate-2","route":"data","intent":"data","rewritten_query":"去年公司亏损情况"}'
+# pending_approval=true, approval_type=complex_plan
+
+curl -sS -N -X POST http://127.0.0.1:8081/api/query/approve/stream \
+  -H 'Content-Type: application/json' \
+  --data '{"session_id":"e2e-sql-quality-gate-2","approved":true,"feedback":""}'
+# status=completed，返回亏损金额 617000.00
+```
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_sql_react.py::TestSemanticCheck -q
+# 4 passed
+
+.venv/bin/python -m pytest tests/test_sql_react.py tests/test_verified_query_repository.py -q
+# 130 passed
+
+.venv/bin/python -m pytest tests/test_sql_shape.py tests/test_sql_react.py::TestSemanticCheck -q
+# SQL AST shape extractor + semantic check alias regression passed
+```
+
+## Iteration：AgentScope 财务分析 skill 去硬编码与证据驱动收敛
+
+### 背景
+
+真实 case 暴露出两个问题：
+
+1. `finance_relation_analysis_skill` 曾用 Python 关键词元组判断“是否复杂关系查询”，这会把复杂 SQL 路由重新写回 hardcode。
+2. 单指标查询“去年亏损”会被业务知识里的辅助关联表污染，复杂案例也可能固定生成收入/回款等用户未问到的 step。
+
+### 本轮调整
+
+- 复杂度判断改为三层证据：
+  - 可配置 `t_query_route_rule`，置信度 `>= 0.8` 时作为 `task_type`。
+  - `recall_context` 中命中的业务术语、相关表和通用分析动作信号。
+  - schema relationship graph 的连通性和 JOIN 风险。
+- `business_knowledge` 的 `formula` 不再参与“业务术语是否命中 query”的表范围判断，只保留为口径说明，避免公式里的“费用/预算”等词污染选表。
+- `finance_relation_analysis_skill` 的单 SQL 路径新增 focused scope：
+  - 选择和用户 query 直接命中的主业务证据组。
+  - 在该组内保留最佳可执行连通组件。
+  - “去年亏损”真实 API 计划表收敛为 `t_journal_entry, t_journal_item, t_account`。
+- `plan_execute` 路径改为证据驱动分组：
+  - 按业务术语 `关联表` 的主事实表分组。
+  - 同一事实表上的多个指标合并为一个 SQL step。
+  - 只补直接相连的维表/桥表，不跨事实组扩展。
+- skill 内部工具顺序调整为先取关系图再加载字段语义：`schema.select_candidates -> schema.related_tables -> focused scope -> semantic_model.search -> plan.assess_feasibility`，减少被剪枝表进入后续 observation。
+
+### 真实验证
+
+```text
+去年亏损
+-> pending_approval=true
+-> approval_type=complex_plan
+-> plan step tables: t_journal_entry, t_journal_item, t_account
+
+2025年按部门分析预算执行率，并对比已审批报销费用与预算差异
+-> pending_approval=true
+-> approval_type=complex_plan
+-> steps:
+   1. 预算执行率/预算差异: t_budget, t_cost_center
+   2. 部门费用/费用总额: t_expense_claim, t_cost_center, t_department
+   3. python_merge
+   4. report
+```
+
+### 回归
+
+```bash
+.venv/bin/python -m pytest tests/test_skill_runtime.py tests/test_runtime_tool_catalog.py tests/test_agentscope_adapter.py::test_local_runner_submits_data_analysis_plan_to_harness_without_sqlreact_context tests/test_agentscope_adapter.py::test_local_runner_prefers_workflow_state_selected_tables_without_business_topic_hardcode tests/test_complex_query.py tests/test_sql_react.py -q
+# 187 passed
+```

@@ -20,7 +20,7 @@ from agents.rag.retriever import (
     recall_agent_knowledge,
     recall_business_knowledge,
 )
-from agents.flow.complex_query import assess_query_feasibility
+from agents.flow.complex_query import assess_query_feasibility, infer_task_type_from_recall_context
 from agents.model.format_tool import normalize_sql_answer
 from agents.rag.query_rewrite import rewrite_query
 from agents.runtime.tool_contracts import (
@@ -31,6 +31,7 @@ from agents.runtime.tool_contracts import (
 )
 from agents.tool.security.policies import SecurityContext, authorize_tables
 from agents.tool.sql_tools.safety import SQLSafetyChecker
+from agents.tool.storage.query_route_rules import evaluate_query_route_rules
 
 logger = logging.getLogger(__name__)
 
@@ -563,8 +564,9 @@ class ToolCatalog:
                         "semantic metadata."
                     ),
                     negative=(
-                        "you need to inspect many tables at once, you already have semantic_model.search output, "
-                        "or the table is not visible."
+                        "you need columns or semantics for multiple tables; call semantic_model.search with "
+                        "table_names instead. Also do not call it when you already have semantic_model.search "
+                        "output or the table is not visible."
                     ),
                 ),
                 input_schema={
@@ -1577,7 +1579,7 @@ class ToolCatalog:
             return {"relationships": filtered}
 
         if tool_name == "plan.assess_feasibility":
-            return await self._assess_plan_feasibility(payload, context)
+            return await self._assess_plan_feasibility(payload, context, workflow_state)
 
         if tool_name == "sql.normalize":
             raw_sql = str(payload.get("answer") or payload.get("sql") or "").strip()
@@ -1778,6 +1780,7 @@ class ToolCatalog:
         self,
         payload: dict[str, Any],
         context: SecurityContext,
+        workflow_state: dict[str, Any],
     ) -> dict[str, Any]:
         query = str(payload.get("query") or "").strip()
         selected_tables = self._filter_requested_tables(
@@ -1798,12 +1801,42 @@ class ToolCatalog:
             and self._is_table_visible(str(row.get("from_table", "")), context)
             and self._is_table_visible(str(row.get("to_table", "")), context)
         ]
+        task_type = str(payload.get("task_type") or "").strip()
+        decision_source = "default"
+        route_report: dict[str, Any] = {}
+        if task_type:
+            decision_source = "payload"
+        else:
+            rule_decision = await evaluate_query_route_rules(query)
+            if rule_decision and rule_decision.confidence >= 0.8:
+                task_type = rule_decision.route_signal
+                decision_source = "rules"
+                route_report["route_rule"] = rule_decision.to_dict()
+        if not task_type:
+            recall_context = payload.get("recall_context")
+            if not isinstance(recall_context, dict):
+                recall_context = workflow_state.get("recall_context")
+            inferred_task_type, inferred_report = infer_task_type_from_recall_context(
+                query=query,
+                selected_tables=selected_tables,
+                recall_context=recall_context if isinstance(recall_context, dict) else None,
+                query_variants=[
+                    str(workflow_state.get("enhanced_query") or ""),
+                    str(workflow_state.get("rewritten_query") or ""),
+                    str(workflow_state.get("query") or ""),
+                ],
+            )
+            if inferred_task_type:
+                task_type = inferred_task_type
+                decision_source = "recall_context"
+                route_report["recall_route_signal"] = inferred_report
+
         decision = assess_query_feasibility(
             query=query,
             selected_tables=selected_tables,
             relationships=relationships,
-            task_type=str(payload.get("task_type") or "") or None,
-            decision_source="agentscope_tool",
+            task_type=task_type or None,
+            decision_source=decision_source,
         )
         feasibility_decision = {
             "execution_mode": decision.execution_mode,
@@ -1823,6 +1856,7 @@ class ToolCatalog:
             "relationships": relationships,
             "selected_tables": selected_tables,
             "route_mode": decision.execution_mode,
+            **route_report,
         }
 
     def _authorize_sql_draft(
@@ -2343,16 +2377,18 @@ class ToolCatalog:
     ) -> dict[str, Any]:
         matched_terms: list[str] = []
         business_related_tables: list[str] = []
-        evidence_related_tables: list[str] = []
-        for item in evidence:
-            evidence_related_tables.extend(self._extract_candidate_tables(item, []))
-        for entry in self._parse_business_evidence(evidence):
+        business_entries = self._parse_business_evidence(evidence)
+        for entry in business_entries:
             if not self._business_entry_matches_query(entry, query):
                 continue
             term = str(entry.get("term") or "")
             if term:
                 matched_terms.append(term)
             business_related_tables.extend(str(table) for table in entry.get("related_tables", []) if str(table))
+        evidence_related_tables: list[str] = []
+        if not business_entries:
+            for item in evidence:
+                evidence_related_tables.extend(self._extract_candidate_tables(item, []))
         return {
             "query_key": query,
             "business_evidence": evidence,
@@ -2369,7 +2405,6 @@ class ToolCatalog:
         profile = "\n".join(
             [
                 str(entry.get("term") or ""),
-                str(entry.get("formula") or ""),
                 ",".join(str(item) for item in entry.get("synonyms", [])),
             ]
         )
@@ -2628,6 +2663,8 @@ class ToolCatalog:
             "reason": str(plan.get("reason") or purpose or "").strip(),
             "steps": normalized_steps,
         }
+        if isinstance(plan_input, dict) and str(plan_input.get("execution_mode") or "").strip():
+            normalized_plan["execution_mode"] = str(plan_input.get("execution_mode")).strip()
         if isinstance(plan_input, dict) and "requires_user_confirmation" in plan_input:
             normalized_plan["requires_user_confirmation"] = bool(plan_input.get("requires_user_confirmation"))
         return normalized_plan

@@ -704,6 +704,58 @@ async def test_schema_select_candidates_uses_plain_table_names_from_evidence():
 
 
 @pytest.mark.asyncio
+async def test_schema_select_candidates_filters_unmatched_structured_business_tables():
+    from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+
+    providers = ToolProviders(
+        table_metadata_loader=lambda: [
+            {"table_name": "t_journal_item", "table_comment": "总账凭证明细"},
+            {"table_name": "t_account", "table_comment": "会计科目表"},
+            {"table_name": "t_budget", "table_comment": "预算表"},
+        ],
+        semantic_model_loader=lambda table_names: {
+            table: {
+                "amount": {
+                    "table_name": table,
+                    "column_name": "amount",
+                    "business_name": "金额",
+                }
+            }
+            for table in table_names
+        },
+    )
+    catalog = ToolCatalog(providers=providers)
+
+    selected = await catalog.invoke(
+        "schema.select_candidates",
+        {
+            "query": "去年亏损",
+            "top_k": 3,
+            "evidence": [
+                (
+                    "术语: 净利润\n"
+                    "公式: 收入 - 成本 - 费用；净利润 < 0 表示亏损\n"
+                    "同义词: 亏损, 盈利\n"
+                    "关联表: t_journal_item,t_account"
+                ),
+                (
+                    "术语: 预算执行率\n"
+                    "公式: actual_amount / budget_amount\n"
+                    "关联表: t_budget"
+                ),
+            ],
+        },
+        task_type="data_analysis",
+        security_context={"allowed_tables": ["t_journal_item", "t_account", "t_budget"]},
+    )
+
+    assert selected.ok is True
+    assert selected.output["recall_context"]["matched_terms"] == ["净利润"]
+    assert selected.output["recall_context"]["business_related_tables"] == ["t_journal_item", "t_account"]
+    assert "t_budget" not in selected.output["recall_context"]["business_related_tables"]
+
+
+@pytest.mark.asyncio
 async def test_data_analysis_sql_validation_tools_are_local_checks_without_execution():
     from agents.runtime.tool_catalog import ToolCatalog
 
@@ -791,6 +843,49 @@ async def test_plan_assess_feasibility_tool_returns_execution_mode_without_sql_e
     }
     assert result.output["relationships"][0]["from_table"] == "t_profit_statement"
     assert "execution_result" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_plan_assess_feasibility_infers_analysis_from_recall_context():
+    from agents.runtime.tool_catalog import ToolCatalog, ToolProviders
+
+    catalog = ToolCatalog(
+        providers=ToolProviders(
+            table_relationship_loader=lambda table_names: [
+                {
+                    "from_table": "t_budget",
+                    "from_column": "cost_center_id",
+                    "to_table": "t_cost_center",
+                    "to_column": "id",
+                },
+                {
+                    "from_table": "t_expense_claim",
+                    "from_column": "cost_center_id",
+                    "to_table": "t_cost_center",
+                    "to_column": "id",
+                },
+            ]
+        )
+    )
+
+    result = await catalog.invoke(
+        "plan.assess_feasibility",
+        {
+            "query": "2025年按部门分析预算执行率，并对比已审批报销费用与预算差异",
+            "selected_tables": ["t_budget", "t_expense_claim", "t_cost_center"],
+            "recall_context": {
+                "matched_terms": ["预算执行率", "预算差异", "部门费用"],
+                "business_related_tables": ["t_budget", "t_expense_claim", "t_cost_center"],
+            },
+        },
+        task_type="data_analysis",
+        security_context={"allowed_tables": ["t_budget", "t_expense_claim", "t_cost_center"]},
+    )
+
+    assert result.ok is True
+    assert result.output["feasibility_decision"]["execution_mode"] == "complex_plan"
+    assert result.output["feasibility_decision"]["task_type"] == "analysis"
+    assert result.output["feasibility_decision"]["decision_source"] == "recall_context"
 
 
 @pytest.mark.asyncio

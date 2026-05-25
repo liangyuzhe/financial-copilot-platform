@@ -11,10 +11,12 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
+from uuid import uuid4
 
 from agents.runtime.result import AgentRunResult, JsonDict
 from agents.runtime.skill_registry import SkillDefinition, SkillRegistry
 from agents.runtime.tool_catalog import ToolCatalog
+from agents.runtime.tool_exposure_policy import ToolExposurePolicy
 from agents.runtime.tool_contracts import RuntimeTool, ToolCallResult, ToolTrace
 from agents.tool.security.policies import SecurityContext
 
@@ -27,6 +29,12 @@ SUPPORTED_TASK_TYPES: tuple[str, ...] = (
     "complex_analysis",
     "data_analysis",
 )
+
+
+@dataclass(slots=True)
+class _CallbackSpan:
+    run_manager: Any = None
+    run_id: Any = None
 
 COMMON_ANALYSIS_AGENT_PROMPT = """\
 agent: common_analysis_agent
@@ -47,9 +55,10 @@ agent: data_analysis_agent
 你必须自主决定是继续探索、提出澄清、生成单步 analysis_plan，还是拆成多步 analysis_plan。
 你可以使用 query.context_rewrite、business_knowledge.search、sql_examples.search、query.enhance、schema.list_tables、schema.describe_table、schema.select_candidates、semantic_model.search、schema.related_tables、plan.assess_feasibility、sql.normalize、sql.safety_check、sql.authorize_draft、current_time.now 和 analysis_plan.submit。
 当问题包含省略主体、代词、相对时间或业务口径不清时，应主动调用相应工具；不要只描述“应该调用工具”。
+当需要多个表的字段语义时，优先调用 semantic_model.search(table_names=[...]) 或 schema.select_candidates；schema.describe_table 只用于 1-2 张需要深挖的表。
 完成规划后必须通过 analysis_plan.submit 提交包含非空 steps 的结构化 analysis_plan；如果确实不能规划，只返回澄清问题，不要伪造执行事实。
 你可以在计划中包含 SQL 草稿，但最终执行、权限检查、安全检查和审批都必须回到 SQL Harness；本地 SQL 工具只用于格式、安全和授权预检查。
-输出必须能被平台转换为 AgentRunResult，包括 answer、tool_trace、artifacts、risk_flags、state_patch 和 events。
+最终回复只输出简洁 answer、analysis_plan 或 clarification_questions；不要回写 tool_trace、events、state_patch 或完整 AgentRunResult，这些由 runtime 组装。
 """
 
 REPORT_AGENT_PROMPT = """\
@@ -108,8 +117,9 @@ class AgentScopeRunContext:
 
         payload = dict(payload or {})
         allowed_names = {tool.name for tool in self.tools}
+        active_spans: list[tuple[Any, Any]] | None = None
         if tool_name not in allowed_names:
-            await self._emit_span_start(
+            active_spans = await self._emit_span_start(
                 kind="tool",
                 name=f"agentscope.tool.{tool_name}",
                 input_text=str(payload),
@@ -152,7 +162,7 @@ class AgentScopeRunContext:
                     self._record_cache_hit(tool_name, cache_key, result)
                     return await self._finalize_tool_result(tool_name, result)
                 else:
-                    await self._emit_span_start(
+                    active_spans = await self._emit_span_start(
                         kind="tool",
                         name=f"agentscope.tool.{tool_name}",
                         input_text=str(payload),
@@ -184,7 +194,7 @@ class AgentScopeRunContext:
                         self._remember_readthrough_result(tool_name, result)
                         if tool_name in {"sql_draft.submit", "analysis_plan.submit"}:
                             self._mark_handoff_submitted(tool_name)
-        return await self._finalize_tool_result(tool_name, result)
+        return await self._finalize_tool_result(tool_name, result, active_spans=active_spans)
 
     def _readthrough_cached_result(
         self,
@@ -353,21 +363,33 @@ class AgentScopeRunContext:
             }
         )
 
-    async def _finalize_tool_result(self, tool_name: str, result: ToolCallResult) -> ToolCallResult:
+    async def _finalize_tool_result(
+        self,
+        tool_name: str,
+        result: ToolCallResult,
+        active_spans: list[tuple[Any, Any]] | None = None,
+    ) -> ToolCallResult:
         if result.trace.status not in {"cache_hit"}:
-            await self._emit_tool_span_end(tool_name, result)
+            await self._emit_tool_span_end(tool_name, result, active_spans=active_spans)
         trace = result.trace.to_dict()
         self.tool_trace.append(trace)
         self.events.append({"event": "tool_trace", "data": trace})
         return result
 
-    async def _emit_tool_span_end(self, tool_name: str, result: ToolCallResult) -> None:
+    async def _emit_tool_span_end(
+        self,
+        tool_name: str,
+        result: ToolCallResult,
+        active_spans: list[tuple[Any, Any]] | None = None,
+    ) -> None:
         # Tool spans are only emitted for real provider calls and forbidden attempts.
+        output = result.output if result.output is not None else {"error": result.error}
         await self._emit_span_end(
             kind="tool",
             name=f"agentscope.tool.{tool_name}",
-            output_text=str(result.output)[:4000] if result.output is not None else "",
+            output_text=output,
             error_text=result.error if not result.ok else "",
+            active_spans=active_spans,
         )
 
     def _cached_tool_result(self, cached: ToolCallResult, payload: JsonDict) -> ToolCallResult:
@@ -435,6 +457,24 @@ class AgentScopeRunContext:
             },
         )
 
+    async def start_chain_span(
+        self,
+        name: str,
+        input_text: Any,
+        metadata: JsonDict | None = None,
+    ) -> list[tuple[Any, Any]]:
+        return await self._emit_span_start(
+            kind="chain",
+            name=name,
+            input_text=self._span_payload_text(input_text),
+            metadata={
+                "task_type": self.task_type,
+                "session_id": self.session_id,
+                "thread_id": self.thread_id,
+                **(metadata or {}),
+            },
+        )
+
     async def start_llm_span(
         self,
         name: str,
@@ -467,6 +507,21 @@ class AgentScopeRunContext:
             active_spans=active_spans,
         )
 
+    async def end_chain_span(
+        self,
+        active_spans: list[tuple[Any, Any]],
+        name: str,
+        output_text: Any,
+        error_text: str = "",
+    ) -> None:
+        await self._emit_span_end(
+            kind="chain",
+            name=name,
+            output_text=output_text,
+            error_text=error_text,
+            active_spans=active_spans,
+        )
+
     async def end_llm_span(
         self,
         active_spans: list[tuple[Any, Any]],
@@ -481,6 +536,28 @@ class AgentScopeRunContext:
             error_text=error_text,
             active_spans=active_spans,
         )
+
+    def _span_payload_text(self, value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False, default=str)
+
+    def _run_manager_output_payload(
+        self,
+        kind: str,
+        name: str,
+        output_text: Any,
+    ) -> Any:
+        if kind == "llm":
+            return _llm_result(self._span_payload_text(output_text)).model_dump()
+        if kind == "chain":
+            return {
+                "output": self._span_payload_text(output_text),
+                "name": name,
+            }
+        return {
+            "output": output_text,
+        }
 
     def _forbidden_tool_result(
         self,
@@ -517,17 +594,22 @@ class AgentScopeRunContext:
         active_spans: list[tuple[Any, Any]] = []
         for callback in self.callbacks:
             if hasattr(callback, "on_chain_start") and kind == "chain":
+                run_id = uuid4()
                 maybe = self._callback_start_call(
                     callback,
                     "on_chain_start",
                     {"name": name},
                     {"input": input_text, **(metadata or {})},
                     metadata or {},
+                    name=name,
+                    run_type="chain",
+                    run_id=run_id,
                 )
                 if inspect.isawaitable(maybe):
                     maybe = await maybe
-                active_spans.append((callback, maybe))
+                active_spans.append((callback, _CallbackSpan(run_manager=maybe, run_id=run_id)))
             elif hasattr(callback, "on_tool_start") and kind == "tool":
+                run_id = uuid4()
                 maybe = self._callback_start_call(
                     callback,
                     "on_tool_start",
@@ -535,21 +617,26 @@ class AgentScopeRunContext:
                     input_text,
                     metadata or {},
                     inputs={"input": input_text, **(metadata or {})},
+                    name=name,
+                    run_id=run_id,
                 )
                 if inspect.isawaitable(maybe):
                     maybe = await maybe
-                active_spans.append((callback, maybe))
+                active_spans.append((callback, _CallbackSpan(run_manager=maybe, run_id=run_id)))
             elif hasattr(callback, "on_llm_start") and kind == "llm":
+                run_id = uuid4()
                 maybe = self._callback_start_call(
                     callback,
                     "on_llm_start",
                     {"name": name},
                     [input_text],
                     metadata or {},
+                    name=name,
+                    run_id=run_id,
                 )
                 if inspect.isawaitable(maybe):
                     maybe = await maybe
-                active_spans.append((callback, maybe))
+                active_spans.append((callback, _CallbackSpan(run_manager=maybe, run_id=run_id)))
         return active_spans
 
     def _callback_start_call(
@@ -583,37 +670,90 @@ class AgentScopeRunContext:
             except Exception:
                 pass
             return method(serialized, positional_input, **kwargs)
-        return method(serialized, positional_input, metadata=metadata, **kwargs)
+        filtered_kwargs = self._filtered_callback_kwargs(callback, method_name, {"metadata": metadata, **kwargs})
+        return method(serialized, positional_input, **filtered_kwargs)
 
     async def _emit_span_end(
         self,
         *,
         kind: str,
         name: str,
-        output_text: str,
+        output_text: Any,
         error_text: str = "",
         active_spans: list[tuple[Any, Any]] | None = None,
     ) -> None:
-        targets = active_spans if active_spans is not None else [(callback, None) for callback in self.callbacks]
-        for callback, run_manager in targets:
-            if kind == "chain" and hasattr(callback, "on_chain_end"):
-                if run_manager is not None and hasattr(run_manager, "on_chain_error") and error_text:
+        targets = active_spans if active_spans is not None else [
+            (callback, _CallbackSpan()) for callback in self.callbacks
+        ]
+        for callback, span in targets:
+            if isinstance(span, _CallbackSpan):
+                run_manager = span.run_manager
+                run_id = span.run_id
+            else:
+                run_manager = span
+                run_id = getattr(span, "run_id", None)
+            callback_kwargs = {"run_id": run_id} if run_id is not None else {}
+            rendered_output = str(output_text)
+            if kind == "chain":
+                if run_manager is not None and hasattr(run_manager, "end"):
+                    maybe = run_manager.end(
+                        outputs=self._run_manager_output_payload(kind, name, output_text),
+                        error=error_text or None,
+                    )
+                elif run_manager is not None and hasattr(run_manager, "finish"):
+                    if not error_text:
+                        try:
+                            run_manager.set_tags({"output": self._span_payload_text(output_text)})
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            run_manager.set_tags({"error": error_text})
+                        except Exception:
+                            pass
+                    maybe = run_manager.finish()
+                elif run_manager is not None and hasattr(run_manager, "on_chain_error") and error_text:
                     maybe = run_manager.on_chain_error(Exception(error_text))
                 elif run_manager is not None and hasattr(run_manager, "on_chain_end"):
-                    maybe = run_manager.on_chain_end({"output": output_text, "name": name})
+                    maybe = run_manager.on_chain_end({"output": rendered_output, "name": name})
+                elif error_text and hasattr(callback, "on_chain_error"):
+                    filtered_kwargs = self._filtered_callback_kwargs(callback, "on_chain_error", callback_kwargs)
+                    maybe = callback.on_chain_error(Exception(error_text), **filtered_kwargs)
+                elif hasattr(callback, "on_chain_end"):
+                    filtered_kwargs = self._filtered_callback_kwargs(callback, "on_chain_end", callback_kwargs)
+                    maybe = callback.on_chain_end({"output": rendered_output, "name": name}, **filtered_kwargs)
                 else:
-                    maybe = callback.on_chain_end({"output": output_text, "name": name})
+                    maybe = None
                 if inspect.isawaitable(maybe):
                     await maybe
             elif kind == "tool":
-                if run_manager is not None and hasattr(run_manager, "on_tool_error") and error_text:
+                if run_manager is not None and hasattr(run_manager, "end"):
+                    maybe = run_manager.end(
+                        outputs=self._run_manager_output_payload(kind, name, output_text),
+                        error=error_text or None,
+                    )
+                elif run_manager is not None and hasattr(run_manager, "finish"):
+                    if not error_text:
+                        try:
+                            run_manager.set_tags({"output": self._span_payload_text(output_text)})
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            run_manager.set_tags({"error": error_text})
+                        except Exception:
+                            pass
+                    maybe = run_manager.finish()
+                elif run_manager is not None and hasattr(run_manager, "on_tool_error") and error_text:
                     maybe = run_manager.on_tool_error(Exception(error_text))
                 elif run_manager is not None and hasattr(run_manager, "on_tool_end"):
                     maybe = run_manager.on_tool_end(output_text)
                 elif error_text and hasattr(callback, "on_tool_error"):
-                    maybe = callback.on_tool_error(Exception(error_text))
+                    filtered_kwargs = self._filtered_callback_kwargs(callback, "on_tool_error", callback_kwargs)
+                    maybe = callback.on_tool_error(Exception(error_text), **filtered_kwargs)
                 elif hasattr(callback, "on_tool_end"):
-                    maybe = callback.on_tool_end(output_text)
+                    filtered_kwargs = self._filtered_callback_kwargs(callback, "on_tool_end", callback_kwargs)
+                    maybe = callback.on_tool_end(output_text, **filtered_kwargs)
                 else:
                     maybe = None
                 if inspect.isawaitable(maybe):
@@ -621,18 +761,50 @@ class AgentScopeRunContext:
             elif kind == "llm":
                 run_managers = run_manager if isinstance(run_manager, list) else [run_manager]
                 for llm_manager in run_managers:
-                    if llm_manager is not None and hasattr(llm_manager, "on_llm_error") and error_text:
+                    if llm_manager is not None and hasattr(llm_manager, "end"):
+                        maybe = llm_manager.end(
+                            outputs=self._run_manager_output_payload(kind, name, output_text),
+                            error=error_text or None,
+                        )
+                    elif llm_manager is not None and hasattr(llm_manager, "finish"):
+                        if not error_text:
+                            try:
+                                llm_manager.set_tags({"output": self._span_payload_text(output_text)})
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                llm_manager.set_tags({"error": error_text})
+                            except Exception:
+                                pass
+                        maybe = llm_manager.finish()
+                    elif llm_manager is not None and hasattr(llm_manager, "on_llm_error") and error_text:
                         maybe = llm_manager.on_llm_error(Exception(error_text))
                     elif llm_manager is not None and hasattr(llm_manager, "on_llm_end"):
-                        maybe = llm_manager.on_llm_end(_llm_result(output_text))
+                        maybe = llm_manager.on_llm_end(_llm_result(rendered_output))
                     elif error_text and hasattr(callback, "on_llm_error"):
-                        maybe = callback.on_llm_error(Exception(error_text))
+                        filtered_kwargs = self._filtered_callback_kwargs(callback, "on_llm_error", callback_kwargs)
+                        maybe = callback.on_llm_error(Exception(error_text), **filtered_kwargs)
                     elif hasattr(callback, "on_llm_end"):
-                        maybe = callback.on_llm_end(_llm_result(output_text))
+                        filtered_kwargs = self._filtered_callback_kwargs(callback, "on_llm_end", callback_kwargs)
+                        maybe = callback.on_llm_end(_llm_result(rendered_output), **filtered_kwargs)
                     else:
                         maybe = None
                     if inspect.isawaitable(maybe):
                         await maybe
+
+    def _filtered_callback_kwargs(self, callback: Any, method_name: str, kwargs: dict[str, Any]) -> dict[str, Any]:
+        method = getattr(callback, method_name, None)
+        if method is None:
+            return {}
+        try:
+            signature = inspect.signature(method)
+        except (TypeError, ValueError):
+            return kwargs
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return kwargs
+        allowed = set(signature.parameters)
+        return {key: value for key, value in kwargs.items() if key in allowed}
 
 
 @dataclass(slots=True)
@@ -641,6 +813,7 @@ class AgentScopeRuntime:
 
     tool_catalog: ToolCatalog = field(default_factory=ToolCatalog)
     skill_registry: SkillRegistry = field(default_factory=SkillRegistry.builtin)
+    tool_exposure_policy: ToolExposurePolicy = field(default_factory=ToolExposurePolicy.from_env)
     runner: Runner | None = None
     callbacks: list[Any] = field(default_factory=list)
 
@@ -740,6 +913,8 @@ class AgentScopeRuntime:
 
     async def _call_runner(self, context: AgentScopeRunContext) -> Any:
         runner = self.runner or _default_agentscope_runner
+        if hasattr(runner, "tool_exposure_policy"):
+            setattr(runner, "tool_exposure_policy", self.tool_exposure_policy)
         result = runner(context)
         if inspect.isawaitable(result):
             return await result

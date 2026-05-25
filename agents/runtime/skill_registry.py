@@ -5,10 +5,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
+
+from agents.runtime.skill_contracts import RuntimeSkill
 
 
 JsonDict = dict[str, Any]
+SkillKind = Literal["prompt", "executable"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +26,8 @@ class SkillDefinition:
     tool_allowlist: tuple[str, ...] = ()
     output_format: JsonDict = field(default_factory=dict)
     examples: tuple[JsonDict, ...] = ()
+    kind: SkillKind = "prompt"
+    runtime_contract: RuntimeSkill | None = None
 
     @classmethod
     def from_manifest(cls, manifest_path: str | Path) -> "SkillDefinition":
@@ -43,6 +48,27 @@ class SkillDefinition:
             examples=tuple(dict(item) for item in data.get("examples", []) or []),
         )
 
+    @classmethod
+    def from_runtime_skill(
+        cls,
+        skill: RuntimeSkill,
+        *,
+        keywords: Iterable[str] = (),
+        examples: Iterable[JsonDict] = (),
+    ) -> "SkillDefinition":
+        return cls(
+            name=skill.name,
+            description=skill.description,
+            task_types=skill.task_types,
+            keywords=tuple(str(item) for item in keywords),
+            prompt="",
+            tool_allowlist=skill.allowed_tools,
+            output_format={"output_schema": dict(skill.output_schema)},
+            examples=tuple(dict(item) for item in examples),
+            kind="executable",
+            runtime_contract=skill,
+        )
+
     def matches(self, *, task_type: str, query: str) -> bool:
         if task_type not in self.task_types:
             return False
@@ -59,6 +85,8 @@ class SkillDefinition:
             "tool_allowlist": list(self.tool_allowlist),
             "output_format": dict(self.output_format),
             "examples": [dict(item) for item in self.examples],
+            "kind": self.kind,
+            "runtime_contract": self.runtime_contract.to_dict() if self.runtime_contract else None,
         }
 
 
@@ -133,8 +161,14 @@ class SkillRegistry:
 
 
 def _builtin_skills() -> list[SkillDefinition]:
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
     report_sections = ["结论", "关键指标", "异常点", "后续追查建议"]
     return [
+        SkillDefinition.from_runtime_skill(
+            FinanceRelationAnalysisSkill().contract,
+            keywords=("收入", "成本", "预算", "回款", "费用", "应收", "利润", "亏损", "净利"),
+        ),
         SkillDefinition(
             name="budget_variance_analysis",
             description="预算差异分析方法，用于比较预算、实际和偏差原因。",

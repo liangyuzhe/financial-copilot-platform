@@ -65,6 +65,9 @@ class SQLReactState(TypedDict):
     refine_feedback: str                         # 修改意见（用户拒绝或错误分析生成）
     result: str                                  # SQL 执行结果
     safety_report: dict | None                   # 安全分析报告
+    semantic_report: dict | None                 # SQL 语义一致性校验报告
+    dry_run_report: dict | None                  # SQL EXPLAIN / dry-run 预执行报告
+    result_sanity_report: dict | None            # SQL 执行结果 sanity check 报告
     error: str | None                            # SQL 执行错误信息
     retry_count: int                             # 重试次数
     execution_history: list[dict]                # 执行历史 [{sql, result, error}]

@@ -228,6 +228,7 @@ class TestTraceHelpers:
         assert result == [{"table_name": "t_account"}]
         assert handler.events[0] == ("tool_start", "schema.load_full_table_metadata", "query")
         assert handler.events[-1][0] == "tool_end"
+        assert handler.events[-1][1] == [{"table_name": "t_account"}]
 
     @pytest.mark.asyncio
     async def test_traced_async_tool_call_emits_async_tool_events(self):
@@ -255,3 +256,39 @@ class TestTraceHelpers:
         )
         assert handler.events[0][3]["storage"] == "mysql"
         assert handler.events[-1][0] == "tool_end"
+        assert handler.events[-1][1] == "领域摘要"
+
+    @pytest.mark.asyncio
+    async def test_traced_async_tool_call_deduplicates_manager_handlers(self):
+        from agents.tool.trace.tracing import traced_async_tool_call
+
+        class CountingHandler(BaseCallbackHandler):
+            def __init__(self):
+                self.events = []
+
+            async def on_tool_start(self, serialized, input_str, **kwargs):
+                self.events.append(("start", serialized.get("name"), kwargs["run_id"]))
+
+            async def on_tool_end(self, output, **kwargs):
+                self.events.append(("end", output, kwargs["run_id"]))
+
+        async def load_domain():
+            return "领域摘要"
+
+        handler = CountingHandler()
+        manager = AsyncCallbackManager.configure(
+            inheritable_callbacks=[handler],
+            local_callbacks=[handler],
+        )
+
+        result = await traced_async_tool_call(
+            "domain_summary.load",
+            "去年亏损",
+            manager,
+            load_domain,
+            metadata={"storage": "mysql"},
+        )
+
+        assert result == "领域摘要"
+        assert [event[0] for event in handler.events] == ["start", "end"]
+        assert handler.events[0][2] == handler.events[1][2]

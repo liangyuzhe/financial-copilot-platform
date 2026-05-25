@@ -156,16 +156,26 @@ def _callback_handlers_for_manager(callbacks: Any | None) -> list[Any]:
         return []
     items = list(callbacks) if isinstance(callbacks, (list, tuple)) else [callbacks]
     handlers: list[Any] = []
+    seen_handler_ids: set[int] = set()
+
+    def _append_once(handler: Any) -> None:
+        handler_id = id(handler)
+        if handler_id in seen_handler_ids:
+            return
+        seen_handler_ids.add(handler_id)
+        handlers.append(handler)
+
     for item in items:
         manager_handlers = [
             *list(getattr(item, "inheritable_handlers", []) or []),
             *list(getattr(item, "handlers", []) or []),
         ]
         if manager_handlers:
-            handlers.extend(manager_handlers)
+            for handler in manager_handlers:
+                _append_once(handler)
             continue
         if hasattr(item, "run_inline"):
-            handlers.append(item)
+            _append_once(item)
     return handlers
 
 
@@ -227,7 +237,7 @@ def traced_tool_call(
     )
     try:
         result = func()
-        run_manager.on_tool_end(str(result)[:4000])
+        run_manager.on_tool_end(result)
         return result
     except Exception as e:
         run_manager.on_tool_error(e)
@@ -260,7 +270,7 @@ async def traced_async_tool_call(
     )
     try:
         result = await func()
-        await run_manager.on_tool_end(str(result)[:4000])
+        await run_manager.on_tool_end(result)
         return result
     except Exception as e:
         await run_manager.on_tool_error(e)

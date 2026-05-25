@@ -146,6 +146,25 @@ def cmd_run_online_nl2sql(args):
         print(f"  {key}: {value:.4f}")
 
 
+def cmd_export_verified_queries(args):
+    """Export verified NL-to-SQL records as regression JSONL cases."""
+    from pathlib import Path
+
+    from agents.tool.sql_tools.verified_query_repository import (
+        VerifiedQueryRepository,
+        write_verified_query_regression_dataset,
+    )
+
+    repository = VerifiedQueryRepository(args.repository)
+    output = write_verified_query_regression_dataset(
+        repository,
+        Path(args.output),
+        limit=args.limit,
+    )
+    count = len(output.read_text(encoding="utf-8").splitlines()) if output.exists() else 0
+    print(f"Exported {count} verified query regression cases -> {output}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="RAG Retrieval Evaluation")
     sub = parser.add_subparsers(dest="command")
@@ -217,6 +236,28 @@ def main():
         help="Session id prefix used for isolated replay threads",
     )
 
+    # export-verified-queries
+    p_export_verified = sub.add_parser(
+        "export-verified-queries",
+        help="Export Verified Query Repository records to NL2SQL regression JSONL",
+    )
+    p_export_verified.add_argument(
+        "--repository",
+        default="data/eval/verified_queries.jsonl",
+        help="Verified Query Repository JSONL path",
+    )
+    p_export_verified.add_argument(
+        "--output",
+        default="data/eval/verified_query_regression.jsonl",
+        help="Regression dataset output JSONL path",
+    )
+    p_export_verified.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Maximum records to export",
+    )
+
     args = parser.parse_args()
 
     if args.command == "generate":
@@ -229,6 +270,8 @@ def main():
         cmd_run_nl2sql(args)
     elif args.command == "run-online-nl2sql":
         cmd_run_online_nl2sql(args)
+    elif args.command == "export-verified-queries":
+        cmd_export_verified_queries(args)
     else:
         parser.print_help()
         sys.exit(1)

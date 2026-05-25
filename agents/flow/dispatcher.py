@@ -551,77 +551,113 @@ def _format_analysis_plan_preview(plan: dict) -> str:
 async def approve_analysis_plan(state: FinalGraphState, config=None) -> dict:
     """Validate and ask user approval for an AgentScope-submitted analysis plan."""
     raw_plan = state.get("analysis_plan") or {}
-    if not isinstance(raw_plan, dict):
-        return {
-            "answer": "AgentScope 未提交有效分析计划。",
-            "status": "error",
-        }
-    plan = _analysis_plan_to_complex_plan(raw_plan)
-    referenced_tables = _tables_from_analysis_plan(plan)
-    auth = authorize_tables(
-        referenced_tables,
-        state.get("security_context", {}),
-        stage="analysis_plan.approve",
-    )
-    if not auth.allowed:
-        return {
-            "answer": auth.message or "分析计划引用了无权限的数据表。",
-            "status": "error",
-        }
-    ok, error = validate_complex_plan(plan, allowed_tables=set(auth.allowed_tables or referenced_tables))
-    if not ok:
-        return {
-            "answer": f"AgentScope 分析计划校验失败：{error}",
-            "status": "error",
-        }
-    approved = interrupt({
-        "complex_plan": plan,
-        "analysis_plan": raw_plan,
-        "message": _format_analysis_plan_preview(plan),
-        "approval_type": "complex_plan",
-    })
-    if approved.get("approved"):
+    step_count = len(raw_plan.get("steps") or []) if isinstance(raw_plan, dict) else 0
+
+    async def _approve() -> dict:
+        if not isinstance(raw_plan, dict):
+            return {
+                "answer": "AgentScope 未提交有效分析计划。",
+                "status": "error",
+            }
+        plan = _analysis_plan_to_complex_plan(raw_plan)
+        referenced_tables = _tables_from_analysis_plan(plan)
+        auth = authorize_tables(
+            referenced_tables,
+            state.get("security_context", {}),
+            stage="analysis_plan.approve",
+        )
+        if not auth.allowed:
+            return {
+                "answer": auth.message or "分析计划引用了无权限的数据表。",
+                "status": "error",
+            }
+        ok, error = validate_complex_plan(plan, allowed_tables=set(auth.allowed_tables or referenced_tables))
+        if not ok:
+            return {
+                "answer": f"AgentScope 分析计划校验失败：{error}",
+                "status": "error",
+            }
+        approved = interrupt({
+            "complex_plan": plan,
+            "analysis_plan": raw_plan,
+            "message": _format_analysis_plan_preview(plan),
+            "approval_type": "complex_plan",
+        })
+        if approved.get("approved"):
+            return {
+                "complex_plan": plan,
+                "plan_approved": True,
+                "analysis_plan": raw_plan,
+                "answer": "AgentScope 数据分析计划已确认，准备进入 SQL Harness 分步执行。",
+                "status": "approved",
+            }
         return {
             "complex_plan": plan,
-            "plan_approved": True,
+            "plan_approved": False,
             "analysis_plan": raw_plan,
-            "answer": "AgentScope 数据分析计划已确认，准备进入 SQL Harness 分步执行。",
-            "status": "approved",
+            "answer": "已取消 AgentScope 数据分析计划执行。",
+            "status": "rejected",
         }
-    return {
-        "complex_plan": plan,
-        "plan_approved": False,
-        "analysis_plan": raw_plan,
-        "answer": "已取消 AgentScope 数据分析计划执行。",
-        "status": "rejected",
-    }
+
+    return await traced_async_tool_call(
+        "sql_harness.approve_analysis_plan",
+        str(state.get("query") or ""),
+        callbacks_from_config(config),
+        _approve,
+        metadata={
+            "span_layer": "sql_harness",
+            "real_call": True,
+            "stage": "approval",
+            "approval_type": "complex_plan",
+            "session_id": str(state.get("session_id") or ""),
+            "step_count": step_count,
+        },
+    )
 
 
 async def execute_analysis_plan(state: FinalGraphState, config=None) -> dict:
     """Execute an approved AgentScope analysis plan through the existing SQL Harness."""
-    selected_tables = state.get("selected_tables") or _tables_from_analysis_plan(state.get("complex_plan") or state.get("analysis_plan") or {})
-    complex_state = {
-        **state,
-        "complex_plan": state.get("complex_plan") or _analysis_plan_to_complex_plan(state.get("analysis_plan") or {}),
-        "plan_approved": bool(state.get("plan_approved")),
-        "selected_tables": selected_tables,
-        "table_relationships": state.get("table_relationships", []),
-        "table_metadata": state.get("table_metadata", {}),
-        "semantic_model": state.get("semantic_model", {}),
-        "evidence": state.get("evidence", []),
-        "few_shot_examples": state.get("few_shot_examples", []),
-        "recall_context": state.get("recall_context", {}),
-        "enhanced_query": state.get("enhanced_query", ""),
-        "execution_history": state.get("execution_history", []),
-        "retry_count": state.get("retry_count", 0),
-    }
-    result = await execute_complex_plan_step(complex_state, config=config)
-    return {
-        **result,
-        "complex_plan": complex_state.get("complex_plan", {}),
-        "plan_approved": bool(complex_state.get("plan_approved")),
-        "status": "completed" if not result.get("error") else "error",
-    }
+    plan = state.get("complex_plan") or _analysis_plan_to_complex_plan(state.get("analysis_plan") or {})
+
+    async def _execute() -> dict:
+        selected_tables = state.get("selected_tables") or _tables_from_analysis_plan(state.get("complex_plan") or state.get("analysis_plan") or {})
+        complex_state = {
+            **state,
+            "complex_plan": state.get("complex_plan") or _analysis_plan_to_complex_plan(state.get("analysis_plan") or {}),
+            "plan_approved": bool(state.get("plan_approved")),
+            "selected_tables": selected_tables,
+            "table_relationships": state.get("table_relationships", []),
+            "table_metadata": state.get("table_metadata", {}),
+            "semantic_model": state.get("semantic_model", {}),
+            "evidence": state.get("evidence", []),
+            "few_shot_examples": state.get("few_shot_examples", []),
+            "recall_context": state.get("recall_context", {}),
+            "enhanced_query": state.get("enhanced_query", ""),
+            "execution_history": state.get("execution_history", []),
+            "retry_count": state.get("retry_count", 0),
+        }
+        result = await execute_complex_plan_step(complex_state, config=config)
+        return {
+            **result,
+            "complex_plan": complex_state.get("complex_plan", {}),
+            "plan_approved": bool(complex_state.get("plan_approved")),
+            "status": "completed" if not result.get("error") else "error",
+        }
+
+    return await traced_async_tool_call(
+        "sql_harness.execute_analysis_plan",
+        str(state.get("query") or ""),
+        callbacks_from_config(config),
+        _execute,
+        metadata={
+            "span_layer": "sql_harness",
+            "real_call": True,
+            "stage": "execution",
+            "session_id": str(state.get("session_id") or ""),
+            "approved": bool(state.get("plan_approved")),
+            "step_count": len(plan.get("steps") or []) if isinstance(plan, dict) else 0,
+        },
+    )
 
 
 async def chat_direct(state: FinalGraphState, config=None) -> dict:

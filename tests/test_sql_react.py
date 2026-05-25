@@ -33,6 +33,31 @@ def _mock_llm_text_response(content="I don't know how to write SQL for that."):
     return resp
 
 
+@pytest.fixture(autouse=True)
+def _mock_dry_run_sql_by_default(request, monkeypatch):
+    """Keep existing SQL harness tests offline unless they test dry_run_sql itself."""
+    if request.node.name in {
+        "test_dry_run_explains_sql_without_executing_user_query",
+        "test_dry_run_report_includes_sql_dialect",
+        "test_dry_run_falls_back_to_direct_explain_when_mcp_blocks_explain",
+        "test_dry_run_blocks_sql_when_explain_fails",
+    }:
+        return
+
+    async def fake_dry_run_sql(state):
+        return {
+            "is_sql": state.get("is_sql", True),
+            "dry_run_report": {
+                "passed": True,
+                "decision": "safe_to_approve",
+                "summary": "EXPLAIN 预执行通过。",
+                "problems": [],
+            },
+        }
+
+    monkeypatch.setattr("agents.flow.sql_react.dry_run_sql", fake_dry_run_sql)
+
+
 class TestStateReducers:
     """Test state reducers for parent/child graph merge safety."""
 
@@ -1325,9 +1350,13 @@ class TestComplexRoute:
             return {"docs": [Document(page_content="表名: t_journal_item\nloss_amount decimal")], "semantic_model": {}}
 
         async def fake_sql_generate(step_state, config=None):
+            sql = (
+                "SELECT CASE WHEN net_profit < 0 THEN ABS(net_profit) ELSE 0 END AS loss_amount "
+                "FROM (SELECT SUM(credit_amount - debit_amount) AS net_profit FROM t_journal_item) t"
+            )
             return {
-                "sql": "SELECT 0 AS loss_amount",
-                "answer": "SELECT 0 AS loss_amount",
+                "sql": sql,
+                "answer": sql,
                 "is_sql": True,
             }
 
@@ -2406,6 +2435,270 @@ class TestSafetyCheck:
 
 
 # ---------------------------------------------------------------------------
+# semantic_check node
+# ---------------------------------------------------------------------------
+
+class TestSemanticCheck:
+    """Test SQL intent consistency quality gate."""
+
+    def test_profit_loss_sql_missing_loss_formula_fails(self):
+        """Loss amount questions should require an explicit loss/profit formula."""
+        from agents.tool.sql_tools.semantic_check import check_sql_semantics
+
+        report = check_sql_semantics(
+            query="去年亏损多少",
+            sql="SELECT SUM(credit_amount) AS total_credit FROM t_journal_item;",
+            semantic_model={},
+            relationships=[],
+            evidence=["术语: 净利润\n公式: 收入 - 成本 - 费用；净利润 < 0 表示亏损"],
+        )
+
+        assert report.passed is False
+        assert report.decision == "revise_sql"
+        assert any(problem.code == "MISSING_PROFIT_LOSS_FORMULA" for problem in report.problems)
+        assert report.score < 0.8
+
+    def test_profit_loss_sql_with_formula_passes(self):
+        """A SQL expressing net profit and loss amount should pass v1 semantic rules."""
+        from agents.tool.sql_tools.semantic_check import check_sql_semantics
+
+        report = check_sql_semantics(
+            query="去年亏损多少",
+            sql="""
+            SELECT CASE WHEN net_profit < 0 THEN ABS(net_profit) ELSE 0 END AS loss_amount
+            FROM (
+                SELECT SUM(credit_amount - debit_amount) AS net_profit
+                FROM t_journal_item
+            ) t;
+            """,
+            semantic_model={},
+            relationships=[],
+            evidence=["术语: 净利润\n公式: 收入 - 成本 - 费用；净利润 < 0 表示亏损"],
+        )
+
+        assert report.passed is True
+        assert report.decision == "safe_to_execute"
+        assert report.score >= 0.8
+
+    def test_profit_loss_sql_with_table_alias_formula_passes(self):
+        """Net profit formula detection should use SQL shape, not string-only matching."""
+        from agents.tool.sql_tools.semantic_check import check_sql_semantics
+
+        report = check_sql_semantics(
+            query="去年盈亏情况",
+            sql="""
+            SELECT
+            CASE
+            WHEN SUM(ji.credit_amount - ji.debit_amount) < 0 THEN '去年亏损'
+            WHEN SUM(ji.credit_amount - ji.debit_amount) > 0 THEN '去年盈利'
+            ELSE '去年不盈不亏'
+            END AS 盈亏情况,
+            ABS(SUM(ji.credit_amount - ji.debit_amount)) AS 金额
+            FROM t_journal_item ji
+            JOIN t_journal_entry je ON ji.entry_id = je.id
+            JOIN t_account a ON ji.account_code = a.account_code
+            WHERE je.entry_date >= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 YEAR), '%Y-01-01')
+            AND je.entry_date <= DATE_FORMAT(DATE_SUB(CURDATE(), INTERVAL 1 YEAR), '%Y-12-31')
+            AND a.account_type = '损益'
+            AND je.status = '已过账';
+            """,
+            semantic_model={},
+            relationships=[],
+            evidence=["术语: 净利润\n公式: 收入 - 成本 - 费用；净利润 < 0 表示亏损"],
+        )
+
+        assert report.passed is True
+        assert report.decision == "safe_to_execute"
+        assert "profit_loss_formula" in report.matched_signals
+
+    @pytest.mark.asyncio
+    async def test_semantic_check_node_blocks_invalid_sql_before_safety(self):
+        """SQL React node should stop invalid SQL before safety/authorization/approval."""
+        from agents.flow.sql_react import semantic_check
+
+        result = await semantic_check({
+            "query": "去年亏损多少",
+            "is_sql": True,
+            "sql": "SELECT SUM(credit_amount) AS total_credit FROM t_journal_item;",
+            "evidence": ["术语: 净利润\n公式: 收入 - 成本 - 费用；净利润 < 0 表示亏损"],
+            "semantic_model": {},
+            "table_relationships": [],
+        })
+
+        assert result["is_sql"] is False
+        assert result["error"] == "semantic_check_failed"
+        assert "语义一致性校验未通过" in result["answer"]
+        assert result["semantic_report"]["decision"] == "revise_sql"
+
+    @pytest.mark.asyncio
+    async def test_complex_plan_sql_harness_runs_semantic_check_before_safety(self):
+        """Complex plan SQL steps should run semantic, safety, auth, dry-run, then execute."""
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [_mock_doc("表名: t_journal_item\ncredit_amount decimal\ndebit_amount decimal")], "semantic_model": {}}
+
+        async def fake_sql_generate(step_state, config=None):
+            return {
+                "is_sql": True,
+                "sql": "SELECT SUM(credit_amount - debit_amount) AS net_profit FROM t_journal_item",
+                "answer": "SELECT SUM(credit_amount - debit_amount) AS net_profit FROM t_journal_item",
+            }
+
+        async def fake_execute_sql(step_state):
+            return {
+                "result": '[{"net_profit":100}]',
+                "answer": "查询已执行完成。\nnet_profit：100",
+                "error": None,
+                "execution_history": [{"sql": step_state["sql"], "result": '[{"net_profit":100}]', "error": None}],
+            }
+
+        async def fake_dry_run_sql(step_state):
+            return {
+                "is_sql": True,
+                "dry_run_report": {
+                    "passed": True,
+                    "decision": "safe_to_approve",
+                    "summary": "EXPLAIN 预执行通过。",
+                    "problems": [],
+                },
+            }
+
+        observed = []
+
+        async def fake_traced_async_tool_call(name, input_str, callbacks, func, metadata=None):
+            observed.append(name)
+            return await func()
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.dry_run_sql", side_effect=fake_dry_run_sql), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql), \
+             patch("agents.flow.sql_react.traced_async_tool_call", side_effect=fake_traced_async_tool_call):
+            result = await execute_complex_plan_step({
+                "query": "去年净利润",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "查询净利润", "tables": ["t_journal_item"], "depends_on": [], "merge_keys": []},
+                    ],
+                },
+                "plan_approved": True,
+                "security_context": {"allowed_tables": ["t_journal_item"]},
+                "table_metadata": {"t_journal_item": "凭证分录明细"},
+                "table_relationships": [],
+                "evidence": ["术语: 净利润\n公式: 收入 - 成本 - 费用"],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] is None
+        assert observed[:6] == [
+            "sql.semantic_check",
+            "sql.safety_check",
+            "sql.authorize_sql",
+            "sql.dry_run",
+            "sql.execute_sql",
+            "sql.result_sanity_check",
+        ]
+        step_result = result["plan_execution_results"]["1"]
+        assert step_result["semantic_report"]["decision"] == "safe_to_execute"
+        assert step_result["dry_run_report"]["decision"] == "safe_to_approve"
+        assert step_result["result_sanity_report"]["decision"] == "accepted"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_dry_run_explains_sql_without_executing_user_query(self, mock_mcp_execute):
+        """dry_run_sql should call MCP with EXPLAIN and keep the original SQL untouched."""
+        from agents.flow.sql_react import dry_run_sql
+
+        mock_mcp_execute.return_value = '[{"select_type":"SIMPLE","table":"t_user","rows":1}]'
+
+        result = await dry_run_sql({
+            "query": "查用户",
+            "is_sql": True,
+            "sql": "SELECT id FROM t_user",
+        })
+
+        mock_mcp_execute.assert_awaited_once()
+        assert mock_mcp_execute.call_args.args[0] == "EXPLAIN SELECT id FROM t_user"
+        assert result["is_sql"] is True
+        assert result["dry_run_report"]["passed"] is True
+        assert result["dry_run_report"]["decision"] == "safe_to_approve"
+        assert result["dry_run_report"]["explain_sql"] == "EXPLAIN SELECT id FROM t_user"
+
+    def test_build_explain_sql_uses_dialect_adapter(self):
+        from agents.flow.sql_react import _build_explain_sql
+
+        assert _build_explain_sql("SELECT 1", dialect="mysql") == "EXPLAIN SELECT 1"
+        assert _build_explain_sql("SELECT 1", dialect="postgres") == "EXPLAIN SELECT 1"
+        assert _build_explain_sql("SELECT 1", dialect="sqlite") == "EXPLAIN QUERY PLAN SELECT 1"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_dry_run_report_includes_sql_dialect(self, mock_mcp_execute):
+        from agents.flow.sql_react import dry_run_sql
+
+        mock_mcp_execute.return_value = '[{"detail":"SCAN CONSTANT ROW"}]'
+
+        result = await dry_run_sql({
+            "query": "查常量",
+            "is_sql": True,
+            "sql": "SELECT 1",
+            "sql_dialect": "sqlite",
+        })
+
+        mock_mcp_execute.assert_awaited_once_with("EXPLAIN QUERY PLAN SELECT 1")
+        assert result["dry_run_report"]["dialect"] == "sqlite"
+        assert result["dry_run_report"]["explain_sql"] == "EXPLAIN QUERY PLAN SELECT 1"
+
+    @pytest.mark.asyncio
+    @patch("agents.flow.sql_react._execute_explain_sql_direct")
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_dry_run_falls_back_to_direct_explain_when_mcp_blocks_explain(
+        self,
+        mock_mcp_execute,
+        mock_direct_explain,
+    ):
+        from agents.flow.sql_react import dry_run_sql
+
+        mock_mcp_execute.side_effect = RuntimeError("Only SELECT queries are allowed")
+        mock_direct_explain.return_value = '[{"table":"t_user","rows":1}]'
+
+        result = await dry_run_sql({
+            "query": "查用户",
+            "is_sql": True,
+            "sql": "SELECT id FROM t_user",
+        })
+
+        mock_direct_explain.assert_called_once_with("EXPLAIN SELECT id FROM t_user")
+        assert result["dry_run_report"]["passed"] is True
+        assert result["dry_run_report"]["raw_result"] == '[{"table":"t_user","rows":1}]'
+        assert result["dry_run_report"]["fallback"] == "direct_mysql_explain"
+
+    @pytest.mark.asyncio
+    @patch("agents.tool.sql_tools.mcp_client.execute_sql")
+    async def test_dry_run_blocks_sql_when_explain_fails(self, mock_mcp_execute):
+        """A SQL that cannot be explained should not proceed to user approval."""
+        from agents.flow.sql_react import dry_run_sql
+
+        mock_mcp_execute.side_effect = Exception("Unknown column 'missing'")
+
+        result = await dry_run_sql({
+            "query": "查用户",
+            "is_sql": True,
+            "sql": "SELECT missing FROM t_user",
+        })
+
+        assert result["is_sql"] is False
+        assert result["error"] == "sql_dry_run_failed"
+        assert result["dry_run_report"]["passed"] is False
+        assert "Unknown column" in result["answer"]
+
+
+# ---------------------------------------------------------------------------
 # authorization nodes
 # ---------------------------------------------------------------------------
 
@@ -2511,6 +2804,17 @@ class TestAuthorizationNodes:
                 "execution_history": [{"sql": step_state["sql"], "result": '[{"id":1}]', "error": None}],
             }
 
+        async def fake_dry_run_sql(step_state):
+            return {
+                "is_sql": True,
+                "dry_run_report": {
+                    "passed": True,
+                    "decision": "safe_to_approve",
+                    "summary": "EXPLAIN 预执行通过。",
+                    "problems": [],
+                },
+            }
+
         observed = []
 
         async def fake_traced_async_tool_call(name, input_str, callbacks, func, metadata=None):
@@ -2519,6 +2823,7 @@ class TestAuthorizationNodes:
 
         with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
              patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.dry_run_sql", side_effect=fake_dry_run_sql), \
              patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql), \
              patch("agents.flow.sql_react.traced_async_tool_call", side_effect=fake_traced_async_tool_call):
             result = await execute_complex_plan_step(
@@ -2545,9 +2850,12 @@ class TestAuthorizationNodes:
 
         assert result["error"] is None
         assert [item[0] for item in observed] == [
+            "sql.semantic_check",
             "sql.safety_check",
             "sql.authorize_sql",
+            "sql.dry_run",
             "sql.execute_sql",
+            "sql.result_sanity_check",
         ]
         assert all(item[2]["step"] == 1 for item in observed)
 
@@ -2602,6 +2910,42 @@ class TestApprove:
         call_args = mock_interrupt.call_args[0][0]
         assert call_args["sql"] == "SELECT * FROM t_user"
         assert "确认" in call_args["message"]
+
+    def test_interrupt_includes_quality_gate_reports(self):
+        """Approval payload should expose quality gate results for non-SQL users."""
+        from agents.flow.sql_react import approve
+
+        semantic_report = {
+            "passed": True,
+            "decision": "safe_to_execute",
+            "score": 0.91,
+            "summary": "SQL 通过了当前规则版语义一致性校验。",
+            "problems": [],
+            "fix_suggestions": ["当前规则校验通过。"],
+        }
+        dry_run_report = {
+            "passed": True,
+            "decision": "safe_to_approve",
+            "summary": "EXPLAIN 预执行通过。",
+            "estimated_rows": 12,
+            "problems": [],
+        }
+
+        mock_interrupt = MagicMock(return_value={"approved": True})
+        with patch("agents.flow.sql_react.interrupt", mock_interrupt):
+            approve({
+                "sql": "SELECT * FROM t_user",
+                "semantic_report": semantic_report,
+                "dry_run_report": dry_run_report,
+                "safety_report": None,
+                "authorization_report": {"allowed": True, "tables": ["t_user"]},
+            })
+
+        payload = mock_interrupt.call_args[0][0]
+        assert payload["quality_gate"]["semantic"] == semantic_report
+        assert payload["quality_gate"]["dry_run"] == dry_run_report
+        assert payload["quality_gate"]["authorization"]["allowed"] is True
+        assert payload["quality_gate"]["summary"]["status"] == "passed"
 
 
 # ---------------------------------------------------------------------------
@@ -2951,6 +3295,7 @@ FROM t_journal_item ji;"""
         assert "不要用 ELSE 把 0 归为亏损或盈利" in system_msg
         assert "亏损金额" in system_msg
         assert "ABS(净利润)" in system_msg
+        assert "不得引用未在 FROM/JOIN 中声明的表别名" in system_msg
 
     def test_sql_prompt_requires_followup_to_reuse_prior_sql_context(self):
         """Follow-up queries should be instructed to reuse prior SQL semantics."""
@@ -3354,6 +3699,35 @@ class TestExecuteSql:
 class TestResultAnomaly:
     """Test suspicious execution result detection and reflection."""
 
+    @pytest.mark.asyncio
+    async def test_result_sanity_check_reports_suspicious_null_result(self):
+        from agents.flow.sql_react import result_sanity_check
+
+        result = await result_sanity_check({
+            "sql": "SELECT SUM(amount) AS net_profit FROM t_journal_item",
+            "result": '[{"net_profit": null}]',
+            "error": None,
+        })
+
+        report = result["result_sanity_report"]
+        assert report["passed"] is False
+        assert report["decision"] == "repair_or_review"
+        assert report["problems"][0]["code"] == "RESULT_SANITY_ANOMALY"
+        assert "NULL" in report["problems"][0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_result_sanity_check_accepts_non_empty_result(self):
+        from agents.flow.sql_react import result_sanity_check
+
+        result = await result_sanity_check({
+            "sql": "SELECT 1 AS ok",
+            "result": '[{"ok": 1}]',
+            "error": None,
+        })
+
+        assert result["result_sanity_report"]["passed"] is True
+        assert result["result_sanity_report"]["decision"] == "accepted"
+
     def test_detect_empty_and_null_results(self):
         from agents.flow.sql_react import _result_anomaly_reason
 
@@ -3411,9 +3785,12 @@ class TestBuildSqlReactGraph:
         assert "sql_retrieve" in node_names
         assert "check_docs" in node_names
         assert "sql_generate" in node_names
+        assert "semantic_check" in node_names
         assert "safety_check" in node_names
+        assert "dry_run_sql" in node_names
         assert "approve" in node_names
         assert "execute_sql" in node_names
+        assert "result_sanity_check" in node_names
         assert "error_analysis" in node_names
         assert "result_reflection" in node_names
         assert "query_enhance" in node_names
@@ -3427,6 +3804,21 @@ class TestBuildSqlReactGraph:
         assert "approve_complex_plan" in node_names
         assert "execute_complex_plan_step" in node_names
         assert "contextualize_query" not in node_names
+
+    @patch("agents.flow.sql_react.get_checkpointer")
+    def test_graph_reruns_semantic_check_after_result_reflection(self, mock_cp):
+        """Reflected SQL should re-enter the full quality gate, not skip semantic_check."""
+        import inspect
+        from langgraph.checkpoint.memory import MemorySaver
+        import agents.flow.sql_react as sql_react
+
+        mock_cp.return_value = MemorySaver()
+        graph = sql_react.build_sql_react_graph()
+        source = inspect.getsource(sql_react.build_sql_react_graph)
+
+        assert graph is not None
+        assert 'graph.add_edge("result_reflection", "semantic_check")' in source
+        assert 'graph.add_edge("result_reflection", "safety_check")' not in source
 
     @patch("agents.flow.sql_react.get_checkpointer")
     def test_graph_starts_at_recall_evidence(self, mock_cp):
@@ -3505,7 +3897,7 @@ class TestRouting:
         assert not _should_repair_sql_error("Access denied for user readonly")
 
 
-class TestApprove:
+class TestApproveMessaging:
     """Test approve node messaging."""
 
     @patch("agents.flow.sql_react.interrupt")
