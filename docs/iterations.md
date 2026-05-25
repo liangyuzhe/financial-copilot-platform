@@ -4809,3 +4809,192 @@ MERGED_ROWS 6
 .venv/bin/python -m pytest tests/test_metric_registry.py tests/test_sql_react.py
 # 144 passed
 ```
+
+## Iteration 78：LangSmith 真实 case Bug Fix 与踩坑记录
+
+### 背景
+
+连续排查多个真实 LangSmith case 后，确认当前主链路已经是：
+
+```text
+Final Graph
+-> classify_intent
+-> AgentScope data planner / finance_relation_analysis skill
+-> analysis_plan.submit
+-> approve_analysis_plan
+-> execute_analysis_plan
+-> SQL Harness per-step sql_generate / semantic_check / safety / authorize / dry_run / execute / sanity
+```
+
+本轮重点不是新增能力，而是把真实线上 case 中暴露的“链路信息丢失、trace 误读、复杂计划上下文错配”记录清楚，并补上回归。
+
+### Bug Fix 1：分类 LLM 的详细澄清原因被前端最终回复覆盖
+
+真实 case：
+
+```text
+用户：删除所有部门表
+LangSmith classifier 输出：
+route=clarify
+reason=用户请求删除所有部门表，这是数据库操作请求，不应该允许删除核心主数据表...
+
+前端最终输出：
+请补充查询对象、时间范围或口径后再问。
+```
+
+根因：
+
+- `/api/query/classify` 已经返回 `route_reason` / `route_confidence`。
+- 前端随后调用 `/api/query/invoke` 时只传了 `query/session_id/route/rewritten_query`。
+- 后端 `QueryRequest` 也没有把 `route_reason` 放进 graph initial state。
+- `classify_intent` 因已有 `route + rewritten_query` 直接短路，导致 `clarify_direct` 拿不到原始详细原因，只能返回通用 fallback。
+
+修复：
+
+- `QueryRequest` 增加 `route_reason` / `route_confidence`。
+- `/api/query/invoke` initial state 保留这两个字段。
+- 前端 classify 后调用 invoke 时透传 `route_reason` / `route_confidence`。
+- 增加回归测试 `test_invoke_passes_prefilled_route_reason_to_graph`。
+
+提交：
+
+```text
+8a8e5d3 Preserve classify route reason in clarify flow
+```
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_final_api.py tests/test_api.py
+# 43 passed
+```
+
+踩坑：
+
+- `classify` 和 `invoke` 是两个 HTTP 请求，不能只看 classifier LangSmith run 判断最终回复。
+- 只要前端做了预分类，就必须把分类结果作为正式上下文传给后端，否则 graph 短路会丢解释信息。
+
+### Bug Fix 2：复杂计划报告把内部 merge 诊断暴露给业务用户
+
+真实 case：
+
+```text
+2025年按部门分析预算执行率，并对比已审批报销费用与预算差异
+```
+
+旧输出问题：
+
+- 回答顶部出现大量“未对齐”“缺少合并维度”等工程诊断。
+- 业务用户最需要的列没有被优先展示：
+  - 年度
+  - 部门
+  - 预算执行率
+  - 已审批报销费用
+  - 预算
+  - 已审批报销费用与预算差异
+- merge 逻辑把 `parent_id / department_id / cost_center_id` 都当成必需键；但预算 SQL 没有 `parent_id`，导致预算侧大量记录被错误标成未对齐。
+
+修复：
+
+- `_merge_dependency_rows()` 改为使用“所有依赖结果都能提供的公共合并键”，而不是任一依赖出现的 key。
+- 复杂计划 formatter 优先生成业务表格。
+- 未匹配到报销费用的部门显示 `0.00`，继续计算费用与预算差异。
+- 技术诊断下沉到“数据诊断”，不再把 `merge_status` 暴露给业务用户。
+- 指标列识别迁移到 `agents/tool/sql_tools/metric_column_rules.json`，避免 formatter 里散落 `差异/偏差/rate` 字符串判断。
+
+提交：
+
+```text
+4ab5270 Improve complex plan business report formatting
+```
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_metric_registry.py tests/test_sql_react.py
+# 144 passed
+```
+
+踩坑：
+
+- 复杂计划的 merge key 是工程契约，不应该直接成为用户可见文案。
+- 多步 SQL 的合并键必须按“每个依赖结果都具备”动态收敛，否则会把可合并数据误判成未对齐。
+- 业务结果展示应该先给用户可比较的业务表格，数据质量问题放到下方诊断区，并说明缺少什么字段、怎么补数。
+
+### Bug Fix 3：审批后复杂计划第 1 步 SQL 被 semantic_check 误判 UNKNOWN_TABLE
+
+真实 case：
+
+```text
+2025年按部门分析盈利率，亏损，成本
+```
+
+LangSmith 现象：
+
+- 审批前 trace `019e5eb3-f1fc-7ea0-b0bb-29c8f3e270d4` 停在 `approve_analysis_plan`，节点显示红色。
+- 用户 approve 后 trace `019e5eb4-31e7-7e52-9d08-3f203d81b5ff` 最终失败。
+- approve 后 trace 中实际存在两个 `sql.sql_generate.llm` 节点，说明 SQL 生成并未缺失。
+- 失败点是第 1 步 SQL 的 `sql.semantic_check`：
+
+```text
+UNKNOWN_TABLE: t_cost_center
+UNKNOWN_TABLE: t_department
+```
+
+根因：
+
+- AgentScope skill 生成的第 1 步计划目标是“按公共粒度统计净利润、净利率、毛利率”。
+- 该 step 声明表主要是凭证/科目事实表：`t_journal_entry / t_journal_item / t_account / t_expense_claim`。
+- SQL 生成器为了满足“按部门”粒度，合理引用了 `t_cost_center` 和 `t_department`。
+- 但复杂计划执行层给该 step 的 `semantic_model` 仍只按 step 声明表裁剪。
+- `sql.schema_validate` 只看到事实表语义模型，于是把 SQL 实际引用的部门/成本中心维表误判为 unknown table。
+
+修复：
+
+- 在复杂计划 SQL step 的 `sql_generate` 之后，解析生成 SQL 实际引用的表。
+- 如果这些表属于已批准复杂计划的全局 `selected_tables` 范围，则补入当前 step 的：
+  - `selected_tables`
+  - `table_relationships`
+  - `semantic_model`
+- 再进入 `sql.semantic_check -> sql.safety_check -> sql.authorize_sql -> sql.dry_run -> sql.execute_sql`。
+- 增加回归测试 `test_complex_plan_step_keeps_merge_dimension_tables_for_semantic_check`。
+
+提交：
+
+```text
+bce37d9 Preserve complex step dimension context
+```
+
+验证：
+
+```bash
+.venv/bin/python -m pytest tests/test_sql_react.py tests/test_final_api.py tests/test_api.py
+# 181 passed
+```
+
+踩坑：
+
+- plan step 的声明表不是 SQL 最终引用表的完整集合；SQL Harness 必须以“生成 SQL 的 AST/引用表”为准更新当前 step 上下文。
+- 不能通过放松 `semantic_check` 解决这个问题。正确修复是补齐上下文，让 schema gate 继续严格拦截真正未知的表和字段。
+- 维表/桥表经常来自分析粒度和 merge key，而不是用户显式说出的业务指标。
+
+### LangSmith Trace 解读边界
+
+本轮排查形成几条固定判断规则：
+
+1. `approve_analysis_plan` 上的 `GraphInterrupt` 在 LangGraph 语义上是“等待人工审批”，不是业务失败。
+2. 用户点击 approve 后，`/api/query/approve/stream` 会用同一 graph thread resume，但 LangSmith 通常展示为另一条 root run。
+3. 所以审批前 trace 看不到 `sql.sql_generate.llm` 是正常的；SQL 生成发生在 approve 后的执行 trace。
+4. AgentScope data planner 阶段只负责提交 `analysis_plan`。当前生产 skill 不是每个 plan step 都单独开 LLM 生成 SQL，真正 SQL 由 SQL Harness 在执行阶段生成。
+5. LangSmith 中要区分：
+   - `agentscope.llm.data_analysis_agent.reasoning`：外层 AgentScope 选择 skill / 看 observation / 输出计划。
+   - `agentscope.skill.finance_relation_analysis`：skill 内部按固定工具流取证并提交 plan。
+   - `sql.sql_generate.llm`：审批后 SQL Harness 为每个 SQL step 生成 SQL。
+   - `sql.semantic_check`：SQL 生成后的正式质量门。
+
+### 后续约束
+
+- 前端 classify/invoke 之间新增字段时，必须补 API passthrough 测试。
+- 复杂计划 step 执行时，质量门上下文必须来自“计划范围 + SQL 实际引用 + 安全权限策略”的交集。
+- 业务展示层不能直接泄露内部状态字段，例如 `merge_status`、`source_step`、raw execution row。
+- LangSmith 排障时必须同时看审批前 run 和 approve 后 resume run，避免把审批暂停误判为执行失败。
