@@ -27,6 +27,8 @@ class QueryRequest(BaseModel):
     session_id: str = "default_user"
     route: str = ""  # 前端预分类的路由，非空时跳过 LLM 分类
     intent: str = ""  # 兼容旧字段
+    route_confidence: float = 0.0
+    route_reason: str = ""
     rewritten_query: str = ""  # 前端预重写的查询，非空时跳过上下文重写
 
 
@@ -293,6 +295,8 @@ async def query_invoke(req: QueryRequest, request: Request = None):
         "chat_history": chat_history,
         "route": req.route or req.intent or "",
         "intent": req.intent or req.route or "",
+        "route_confidence": req.route_confidence,
+        "route_reason": req.route_reason,
         "rewritten_query": req.rewritten_query or "",
         "security_context": _build_security_context(
             req.session_id,

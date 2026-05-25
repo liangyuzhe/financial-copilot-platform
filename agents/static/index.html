@@ -780,6 +780,8 @@
                 const classification = await clsResp.json();
                 const route = classification.route || classification.intent || 'chat';
                 const rewritten_query = classification.rewritten_query || '';
+                const route_reason = classification.route_reason || '';
+                const route_confidence = classification.route_confidence || 0;
                 const effectiveQuery = rewritten_query || query;
 
                 if (route === 'data') {
@@ -793,7 +795,7 @@
                     const resp = await fetch('/api/query/invoke', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery}),
+                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery, route_reason, route_confidence}),
                     });
                     clearInterval(loading);
                     if (!resp.ok) {
@@ -808,7 +810,7 @@
                     const resp = await fetch('/api/query/invoke', {
                         method: 'POST',
                         headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery}),
+                        body: JSON.stringify({query, session_id: sessionId, route, rewritten_query: effectiveQuery, route_reason, route_confidence}),
                     });
                     if (!resp.ok) {
                         bubble.textContent = '请求失败: HTTP ' + resp.status;

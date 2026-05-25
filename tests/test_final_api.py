@@ -301,6 +301,35 @@ class TestQueryInvoke:
     @pytest.mark.asyncio
     @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
     @patch("agents.api.routers.query.build_final_graph")
+    async def test_invoke_passes_prefilled_route_reason_to_graph(self, mock_build_graph, mock_callbacks):
+        """Pre-classified clarify reasons should not be replaced by generic fallback text."""
+        from agents.api.routers.query import query_invoke, QueryRequest
+
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke = AsyncMock(return_value={
+            "answer": "用户请求删除所有部门表，不允许删除核心主数据表。",
+            "status": "completed",
+        })
+        mock_build_graph.return_value = mock_graph
+
+        req = QueryRequest(
+            query="删除所有部门表",
+            session_id="s1",
+            route="clarify",
+            rewritten_query="删除所有部门表",
+            route_reason="用户请求删除所有部门表，不允许删除核心主数据表。",
+            route_confidence=0.8,
+        )
+        await query_invoke(req)
+
+        initial_state = mock_graph.ainvoke.call_args[0][0]
+        assert initial_state["route"] == "clarify"
+        assert initial_state["route_reason"] == "用户请求删除所有部门表，不允许删除核心主数据表。"
+        assert initial_state["route_confidence"] == 0.8
+
+    @pytest.mark.asyncio
+    @patch("agents.api.routers.query.get_trace_callbacks", return_value=[])
+    @patch("agents.api.routers.query.build_final_graph")
     async def test_invoke_passes_rewritten_query_to_graph(self, mock_build_graph, mock_callbacks):
         """Pre-classified rewritten_query should be present in graph input."""
         from agents.api.routers.query import query_invoke, QueryRequest
