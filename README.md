@@ -4,7 +4,7 @@
 
 ## 核心特性
 
-- **自然语言查数据**：自然语言 -> 意图识别/查询重写 -> AgentScope data planner -> 结构化 `analysis_plan` -> SQL Harness 质量门 -> 人工审批 -> MySQL 执行，包含 SQL AST/语义/schema/关系校验、安全分析、权限检查、EXPLAIN dry-run、执行错误修复、结果 sanity check 和用户友好结果展示。
+- **自然语言查数据**：自然语言 -> 意图识别/查询重写 -> AgentScope data planner -> 结构化 `analysis_plan` -> SQL Harness 质量门 -> 人工审批 -> MySQL 执行，包含 SQL AST/语义/schema/关系校验、安全分析、权限检查、EXPLAIN dry-run、执行错误修复、结果 sanity check 和基于 `display_schema` 的用户友好结果展示。
 - **多场景意图路由**：意图分类 + 查询重写合并为一次 LLM 调用，自动路由到 `data`、`chat`、`clarify` 三类入口，减少重复调用和历史上下文漂移。
 - **可配置意图规则**：常见路由规则存储在 MySQL，通过 Admin 页面维护；规则引擎与 LLM 并行运行，最终仲裁意图，避免把业务关键词硬编码在代码中。
 - **统一语义模型**：`t_semantic_model` 存储字段级业务映射（业务名/同义词/描述）+ 技术 schema（类型/注释/PK/FK/逻辑外键），Schema 权威源收敛到 MySQL/Redis。
@@ -21,7 +21,7 @@
 - **复杂查询模式切换**：`assess_feasibility` 不调用 LLM，基于规则引擎任务类型、关系图连通性和 JOIN 风险产出 `execution_mode`；复杂计划经用户确认后串行执行 SQL step，每个 SQL step 都经过质量门、权限、审批/恢复和执行，并把本地 merge/report step 写入可审计结果，避免超大 JOIN 幻觉和 token 膨胀。
 - **数据权限与合规审计**：API 注入用户、角色、部门和表级权限上下文；SQL 链路在选表后、补表前、审批前和复杂计划 SQL step 中执行权限门禁，拒绝时只展示业务数据域名称，并写入 no-throw 审计事件，避免越权查询和物理表名泄露。
 - **三级记忆系统**：工作记忆 + 摘要记忆 + 知识记忆（实体/事实/偏好）按 `session_id` 隔离；SQL 场景单独保存上一轮 SQL 口径，支持“亏损多少”这类多轮追问。
-- **AgentScope skill 运行区**：`data` 主路由先进入 AgentScope data planner。生产默认只向外层 ReActAgent 暴露 `finance_relation_analysis` 这类业务 skill，skill 内部再按受控流程调用 ToolCatalog primitive tools，并提交 `analysis_plan` 回到 SQL Harness。
+- **AgentScope skill 运行区**：`data` 主路由先进入 AgentScope data planner。生产默认只向外层 ReActAgent 暴露 `finance_relation_analysis` 这类业务 skill，skill 内部再按受控流程调用 ToolCatalog primitive tools，并提交包含 `grain`、`merge_keys`、`display_schema` 的 `analysis_plan` 回到 SQL Harness。
 - **ToolExposurePolicy 成本控制**：`data_analysis` 默认不把全量 schema/SQL 工具 schema 传给 LLM；debug 模式可按阶段暴露 primitive tools，生产模式按 skill contract 收窄可见函数，降低 token 和重复 tool 调用。
 - **AgentRunResult 运行时组装**：LLM 只输出简洁 answer、plan 或澄清问题；`tool_trace/events/state_patch/risk_flags` 由 runtime 在最终 reply 后组装，不要求模型理解 Python 类型。
 - **Verified Query Repository**：已提供已验证 SQL 的本地仓库与 regression/eval JSONL 导出能力，用于把人工确认或系统验证过的查询沉淀为回归集；它不会绕过 SQL Harness 的质量门、权限或审批。
@@ -92,11 +92,11 @@ finance_relation_analysis(query, time_range?, grain?)
 
 ![Permission Gate: 用户角色数据权限拦截](docs/assets/demos/sql-permission-user-role-denied.gif)
 
-### Complex Plan：预算执行与报销费用分析
+### Complex Plan：2026 部门盈利率、亏损与成本分析
 
-提问“2025年按部门分析预算执行率，并对比已审批报销费用与预算差异”，系统生成结构化执行计划；用户确认后按 SQL step 串行执行预算和报销费用查询，并用本地 merge/report 汇总每步结果。
+提问“2026年按部门分析盈利率，亏损，成本”，系统生成结构化执行计划；用户确认后 SQL Harness 按业务知识口径生成受治理 SQL draft，完成语义校验、安全检查、权限检查和执行，并按 `display_schema` 输出部门、收入、成本、净利润和盈利率表格。
 
-![Complex Plan: 预算执行与报销费用分析](docs/assets/demos/sql-complex-budget-expense-analysis-approved.gif)
+![Complex Plan: 2026 部门盈利率、亏损与成本分析](docs/assets/demos/sql-complex-dept-profitability-2026-approved.gif)
 
 ## 最新节点调用流程图
 
@@ -132,9 +132,9 @@ flowchart TD
 |------|------|
 | `classify_intent` | 一次 LLM 调用完成意图分类和查询重写；规则引擎与 LLM 并行后仲裁 |
 | `agentscope_data_planner` | AgentScope 选择业务 skill；生产默认只暴露 `finance_relation_analysis`，不暴露全量 primitive tools |
-| `finance_relation_analysis` | skill 内部调用 ToolCatalog 取证、选候选表、加载字段语义、检查关系和复杂度，提交结构化 `analysis_plan` |
+| `finance_relation_analysis` | skill 内部调用 ToolCatalog 取证、选候选表、加载字段语义、检查关系和复杂度，提交结构化 `analysis_plan`，并保留 planner 给出的 `grain`、`merge_keys`、`display_schema` |
 | `approve_analysis_plan` | 把 `analysis_plan` 转成可审批的 `complex_plan`，并做权限和计划校验 |
-| `execute_analysis_plan` | 进入 SQL Harness，完成 SQL 生成、SQL Quality Gate、审批恢复、执行、结果 sanity check 和本地 merge/report |
+| `execute_analysis_plan` | 进入 SQL Harness，完成 SQL 生成、SQL Quality Gate、审批恢复、执行、结果 sanity check、本地 merge/report，并按 `display_schema` 渲染最终表格；缺失契约时只做通用预览 |
 | `chat_direct` | RAG Chat 回答非数据请求 |
 | `clarify_direct` | 对目标、范围、时间、主体不清的问题发起澄清 |
 
@@ -260,8 +260,7 @@ financial-copilot-platform/
 │   │   │   ├── safety.py           # SQL 安全分析
 │   │   │   ├── sql_shape.py        # sqlglot AST 结构提取
 │   │   │   ├── sql_validation.py   # schema/table/column/join validation
-│   │   │   ├── metric_registry.py  # 可配置指标口径注册表（当前内置净利润）
-│   │   │   ├── metric_column_rules.json # 结果列到业务指标角色的可配置规则
+│   │   │   ├── metric_registry.py  # SQL 语义指标表达式注册表（当前内置净利润）
 │   │   │   ├── semantic_check.py   # SQL Quality Gate pipeline report
 │   │   │   ├── verified_query_repository.py # 已验证 SQL 回归资产
 │   │   │   └── error_codes.py      # 错误码分类 + is_retryable()
@@ -744,7 +743,7 @@ curl -X POST http://localhost:8080/api/document/insert \
 
 - `semantic_check` 使用 `sqlglot` 解析 SQL AST，提取表、别名、字段、JOIN、过滤、聚合和 CASE 表达式。
 - `sql_validation` 基于语义模型验证表/字段是否存在、别名是否声明、JOIN 关系是否来自 schema graph。
-- `metric_registry` 先内置净利润/亏损口径校验，结果列识别通过 `metric_column_rules.json` 配置业务指标角色，避免在 formatter 中写死“预算/差异/执行率”等列名判断；后续可扩展为 DB/config backed 指标注册表。
+- `metric_registry` 只服务 SQL 语义校验，用 AST 校验净利润/亏损等指标表达式是否存在；它不再给 SQL 生成 prompt 注入指标别名，也不承担结果展示列识别，避免静态 JSON 口径影响 LLM 规划。
 - SQL 安全检查只允许安全 `SELECT/WITH`，拦截 DROP、TRUNCATE、DELETE、UPDATE 和 always-true 条件等高风险语句。
 - 权限门禁在选表后、补表前、审批前和复杂计划 SQL step 中执行，拒绝时只展示业务数据域名称并写入审计事件。
 - `dry_run_sql` 在用户审批前执行 EXPLAIN：MySQL/Postgres 使用 `EXPLAIN <sql>`，SQLite 使用 `EXPLAIN QUERY PLAN <sql>`；当 MCP wrapper 拒绝 EXPLAIN 时，MySQL 会使用直连 EXPLAIN fallback，但仍不执行用户 SQL。

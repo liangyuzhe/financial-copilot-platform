@@ -40,6 +40,15 @@ class SqlAggregation:
     function: str
     sql: str
     column_refs: list[tuple[str, str]] = field(default_factory=list)
+    alias: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class SqlSelectItem:
+    sql: str
+    alias: str = ""
+    column_refs: list[tuple[str, str]] = field(default_factory=list)
+    is_constant: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +62,7 @@ class SqlShape:
     joins: list[SqlJoin]
     filters: list[SqlFilter]
     aggregations: list[SqlAggregation]
+    select_items: list[SqlSelectItem]
     case_expressions: list[str]
     group_by: list[str]
     having: list[str]
@@ -132,9 +142,11 @@ def extract_sql_shape(sql: str, dialect: str = "mysql") -> SqlShape:
             function="SUM",
             sql=aggregation.sql(dialect=dialect),
             column_refs=_column_refs(aggregation),
+            alias=_nearest_alias(aggregation),
         )
         for aggregation in tree.find_all(exp.Sum)
     ]
+    select_items = _select_items(tree, dialect=dialect)
     case_expressions = [
         case.sql(dialect=dialect)
         for case in tree.find_all(exp.Case)
@@ -154,6 +166,7 @@ def extract_sql_shape(sql: str, dialect: str = "mysql") -> SqlShape:
         joins=joins,
         filters=filters,
         aggregations=aggregations,
+        select_items=select_items,
         case_expressions=case_expressions,
         group_by=_expression_list_sql(tree.args.get("group"), dialect=dialect),
         having=_single_expression_sql(tree.args.get("having"), dialect=dialect),
@@ -176,6 +189,17 @@ def _column_refs(expression) -> list[tuple[str, str]]:
     return refs
 
 
+def _nearest_alias(expression) -> str:
+    from sqlglot import exp
+
+    parent = getattr(expression, "parent", None)
+    while parent is not None:
+        if isinstance(parent, exp.Alias):
+            return str(parent.alias or "")
+        parent = getattr(parent, "parent", None)
+    return ""
+
+
 def _extract_filters(tree, dialect: str) -> list[SqlFilter]:
     from sqlglot import exp
 
@@ -191,6 +215,39 @@ def _extract_filters(tree, dialect: str) -> list[SqlFilter]:
             )
         )
     return filters
+
+
+def _select_items(tree, dialect: str) -> list[SqlSelectItem]:
+    from sqlglot import exp
+
+    items: list[SqlSelectItem] = []
+    for expression in getattr(tree, "expressions", None) or []:
+        alias = ""
+        payload = expression
+        if isinstance(expression, exp.Alias):
+            alias = str(expression.alias or "")
+            payload = expression.this
+        elif isinstance(expression, exp.Column):
+            alias = str(expression.alias_or_name or "")
+        items.append(
+            SqlSelectItem(
+                sql=expression.sql(dialect=dialect),
+                alias=alias,
+                column_refs=_column_refs(expression),
+                is_constant=_is_constant_select_payload(payload),
+            )
+        )
+    return items
+
+
+def _is_constant_select_payload(expression) -> bool:
+    from sqlglot import exp
+
+    if isinstance(expression, exp.Literal):
+        return True
+    if isinstance(expression, exp.Neg):
+        return _is_constant_select_payload(expression.this)
+    return False
 
 
 def _expression_list_sql(expression, dialect: str) -> list[str]:

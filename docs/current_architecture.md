@@ -178,7 +178,7 @@ flowchart TD
 
 | 函数 | 作用 | 边界 |
 |------|------|------|
-| `finance_relation_analysis` | 对收入、成本、预算、回款、费用、利润、亏损等财务关系问题做取证、复杂度判断并提交 `analysis_plan` | 不执行 SQL；只返回 compact observation 给外层 LLM |
+| `finance_relation_analysis` | 对收入、成本、预算、回款、费用、利润、亏损等财务关系问题做取证、复杂度判断并提交包含 `grain`、`merge_keys`、`display_schema` 的 `analysis_plan` | 不执行 SQL；只返回 compact observation 给外层 LLM |
 
 `finance_relation_analysis` skill 内部允许的 primitive tools：
 
@@ -199,6 +199,7 @@ flowchart TD
 - 业务知识中的 `formula` 只作为口径说明，不参与“该术语是否命中用户问题”的表范围匹配；命中判断以术语名和同义词为主，避免公式文本污染选表。
 - `single_sql` 会先收敛到直接命中的主业务证据组，再选择最佳可执行连通组件，例如“去年亏损”只保留凭证主表、凭证分录和会计科目。
 - `plan_execute` 按业务术语的 `关联表` 和主事实表分组，同一事实表上的多个指标会合并，并只补直接相连的维表或桥表。
+- `display_schema` 是最终展示契约，由 Planner/Skill/LLM 根据用户语义给出；formatter 只渲染该契约，没有契约时只做通用预览，不根据 Python 业务关键词生成专用表格。
 
 ## SQL Harness 分步执行
 
@@ -210,7 +211,9 @@ flowchart TD
     TableAuth --> Approval[Human-in-the-Loop<br/>interrupt / approve]
     Approval --> StepLoop[execute_complex_plan_step]
 
-    StepLoop --> HasSQL{step.sql exists?}
+    StepLoop --> Governed{governed SQL draft<br/>from display_schema + evidence?}
+    Governed -->|yes| Normalize[normalize submitted SQL]
+    Governed -->|no| HasSQL{step.sql exists?}
     HasSQL -->|yes| Normalize[normalize submitted SQL]
     HasSQL -->|no| Retrieve[sql_retrieve<br/>加载完整语义模型]
     Retrieve --> CheckDocs[check_docs]
@@ -272,7 +275,7 @@ flowchart TD
 |------|------|------|----------------|
 | `FinalGraphState` | `flow/state.py` | API 主请求、路由、AgentScope 计划、审批恢复 | 是，承载主请求状态 |
 | `AgentRunResult.state_patch` | `runtime/result.py` | AgentScope 输出计划、候选表、展示状态 | 否，需要回写并经 Harness 校验 |
-| `analysis_plan` | AgentScope -> FinalGraph | 结构化计划，`plan_only` | 否 |
+| `analysis_plan` | AgentScope -> FinalGraph | 结构化计划，`plan_only`；可包含 `display_schema` 展示契约 | 否 |
 | `complex_plan` | SQL Harness | 可审批、可执行的分步计划 | 是，审批后执行 |
 | `SQLReactState` | `flow/state.py` | SQL 生成、权限、安全、执行、修复、反思 | 是，SQL 执行事实源 |
 | `semantic_report` / `dry_run_report` / `result_sanity_report` | SQL Harness | SQL Quality Gate 分阶段报告，审批卡和 trace 使用 | 是，SQL 治理事实源 |
@@ -336,6 +339,7 @@ flowchart LR
 
 - `POST /api/query/invoke`，`route=data`，问题“2025年按部门分析预算执行率，并对比已审批报销费用与预算差异”返回 `pending_approval=true`，`approval_type=complex_plan`。
 - 真实 HTTP E2E：问题“去年亏损”返回复杂计划审批；审批后 `POST /api/query/approve/stream` 返回 `status=completed`，答案包含 `亏损金额：617000.00`。
+- 真实 HTTP E2E：问题“2026年按部门分析盈利率，亏损，成本”返回 `pending_approval=true`；审批后返回 `status=completed`，最终表格包含 `部门 / 收入 / 成本 / 净利润 / 盈利率` 8 个部门。该链路使用 `analysis_plan.evidence` 中的收入/成本科目口径生成受治理 SQL draft，再进入 SQL Harness 质量门。
 - 生成 SQL 正确包含 `JOIN t_journal_entry je ON ji.entry_id = je.id`，并经过 `semantic_check`、`safety_check`、`authorize_sql`、`dry_run_sql` 和 `result_sanity_check`。
 - 缺少 `t_journal_entry` 表权限时，审批执行返回业务可读的权限拒绝。
 - 补齐 `t_journal_entry` 权限后，审批执行返回 `status=completed`，SQL 通过质量门、权限检查并执行，最终输出结果。
@@ -347,5 +351,6 @@ flowchart LR
 - 权限拒绝不暴露不该展示的物理表细节，返回业务可读提示并写入 no-throw audit。
 - AgentScope real runner 可失败或不提交计划，FinalGraph 会 fallback 到本地兼容 runner，避免 data 主链路直接暴露 ReAct chatter。
 - `analysis_plan.submit` 允许规范化半结构化计划，但输出仍是 `plan_only`。
+- `analysis_plan.submit` 必须保留 `evidence` 和 `display_schema` 这类计划执行契约；它们不是执行事实，但 SQL Harness 需要用它们做口径校验、受治理 draft 生成和用户友好展示。
 - 当前 `data` 主链路优先规划，不代表 SQLReact 被删除；SQLReact 仍是执行控制面和兼容子图。
 - Verified Query Repository 只能作为回归/eval 资产，不能作为执行白名单，不能绕过质量门、权限或审批。

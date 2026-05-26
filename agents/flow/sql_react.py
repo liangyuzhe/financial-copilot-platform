@@ -20,7 +20,6 @@ from agents.model.format_tool import create_format_tool, normalize_sql_answer
 from agents.runtime import AgentScopeRuntime, create_agentscope_runner
 from agents.tool.sql_tools.safety import SQLSafetyChecker
 from agents.tool.sql_tools.semantic_check import check_sql_semantics
-from agents.tool.sql_tools.metric_registry import default_metric_registry
 from agents.tool.sql_tools.error_codes import is_retryable
 from agents.rag.retriever import recall_business_knowledge, recall_agent_knowledge, get_semantic_model_by_tables, load_full_table_metadata, get_table_relationships
 from agents.tool.storage.checkpoint import get_checkpointer
@@ -37,7 +36,9 @@ except ImportError:
     Elasticsearch = None
 
 logger = logging.getLogger(__name__)
-_METRIC_REGISTRY = default_metric_registry()
+
+_DISPLAY_MISSING_VALUE = "无数据"
+_DISPLAY_UNMERGEABLE_RATE_VALUE = "无法汇总"
 
 
 _EXECUTION_TIME_RE = re.compile(r"\s*Query execution time:\s*[\d.]+\s*ms\s*$", re.IGNORECASE)
@@ -1486,11 +1487,15 @@ async def complex_plan_generate(state: SQLReactState, config=None) -> dict:
                 "3. 每个 SQL 步骤的 tables 必须列全完成该步骤目标所需的分类表、维度表和 JOIN 桥接表；"
                 "不要只列事实表或端点表\n"
                 "4. 多步骤合并必须给出 merge_keys；依赖 SQL 步骤必须能输出与 merge_keys 同名的列别名\n"
-                "5. 如果无法稳定合并，返回 mode=clarify 且 steps 为空\n"
-                "6. 只返回 JSON，不要 Markdown\n"
+                "5. 必须给出 display_schema，声明最终给用户看的列；每项包含 role、label、column、type，"
+                "其中 column 是 SQL step/report 必须输出的稳定别名；type 必须准确表达单位，"
+                "只能用 dimension/amount/percent/count/text，不要把比例类指标声明为 decimal\n"
+                "6. 如果无法稳定合并，返回 mode=clarify 且 steps 为空\n"
+                "7. 只返回 JSON，不要 Markdown\n"
                 "JSON 格式：{\"mode\":\"complex_plan|clarify\",\"reason\":\"...\",\"steps\":["
                 "{\"step\":1,\"type\":\"sql|python_merge|report\",\"goal\":\"...\","
                 "\"tables\":[\"...\"],\"depends_on\":[],\"merge_keys\":[\"...\"]}],"
+                "\"display_schema\":[{\"role\":\"...\",\"label\":\"...\",\"column\":\"...\",\"type\":\"dimension|amount|percent|count|text\"}],"
                 "\"requires_user_confirmation\":true}"
             )),
             HumanMessage(content=(
@@ -1641,13 +1646,91 @@ def _short_text(value, limit: int = 500) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
+def _merge_key_display_guidance(merge_keys: list[str]) -> str:
+    if not merge_keys:
+        return ""
+    if not any(str(key).endswith(("_id", "_code")) for key in merge_keys):
+        return ""
+    return (
+        "\n展示维度要求：合并键是 ID/编码时，如果已连接的维表存在 name/名称字段，"
+        "请同时输出可读的 *_name 或中文名称别名，最终展示不能只依赖裸 ID。"
+    )
+
+
+def _merge_grain_guidance(merge_keys: list[str]) -> str:
+    if not merge_keys:
+        return ""
+    return (
+        "\n聚合粒度要求：除非当前步骤目标明确要求明细，"
+        "不要按非合并维度（如科目、费用类型、单据号）拆分；"
+        "优先按后续合并键聚合，避免后续结果稀疏或重复。"
+        "多步骤合并时，各 SQL 步骤应尽量从同一合并粒度全集出发，"
+        "可以用 LEFT JOIN/条件聚合覆盖没有业务发生的数据行；"
+        "不要把无匹配业务发生直接伪装成业务 0。"
+        "如果为了表格完整使用 COALESCE 补值，必须同时输出 source_row_count 或 metric_source_count，"
+        "用于区分真实 0 和无数据。"
+    )
+
+
+def _normalize_step_output_schema(value) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    fields = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        label = str(item.get("label") or "").strip()
+        column = str(item.get("column") or "").strip()
+        value_type = str(item.get("type") or "").strip()
+        if not (role and label and column and value_type):
+            continue
+        fields.append({
+            "role": role,
+            "label": label,
+            "column": column,
+            "type": value_type,
+        })
+    return fields
+
+
+def _display_schema_guidance(state: SQLReactState, step: dict | None = None) -> str:
+    plan = state.get("complex_plan") or {}
+    step_schema = _normalize_step_output_schema((step or {}).get("output_schema"))
+    display_schema = step_schema or (plan.get("display_schema") if isinstance(plan, dict) else None)
+    if not isinstance(display_schema, list) or not display_schema:
+        return ""
+    compact_schema = [
+        {
+            "role": item.get("role"),
+            "label": item.get("label"),
+            "column": item.get("column"),
+            "type": item.get("type"),
+        }
+        for item in display_schema
+        if isinstance(item, dict)
+    ]
+    if not compact_schema:
+        return ""
+    scope = "当前步骤输出契约" if step_schema else "展示输出契约"
+    return (
+        f"\n{scope}：\n"
+        f"{json.dumps(compact_schema, ensure_ascii=False)}\n"
+        "SELECT 只能输出当前步骤能真实计算的业务指标；"
+        "契约中的字段需要使用 column 作为稳定别名；"
+        "比例/比率字段必须严格按业务知识公式选择分子和分母，例如公式为 A / B 时分母必须使用 B 的真实业务口径；"
+        "不要为了满足最终展示而用常量或无关表金额伪造当前步骤无法计算的指标。"
+    )
+
+
 def _build_complex_step_query(state: SQLReactState, step: dict, dependency_results: dict[str, dict]) -> str:
     """Build a focused query for a single SQL step."""
     original_query = state.get("enhanced_query") or state.get("rewritten_query") or state.get("query", "")
     step_no = step.get("step")
     goal = step.get("goal", "")
     tables = ", ".join(step.get("tables") or [])
-    merge_keys = ", ".join(step.get("merge_keys") or [])
+    merge_key_values = [str(key) for key in (step.get("merge_keys") or []) if str(key).strip()]
+    merge_keys = ", ".join(merge_key_values)
     depends_on = step.get("depends_on") or []
     dependency_text = ""
     if depends_on:
@@ -1665,8 +1748,15 @@ def _build_complex_step_query(state: SQLReactState, step: dict, dependency_resul
         f"当前步骤目标: {goal}\n"
         f"当前步骤可用表: {tables}\n"
         f"后续合并键: {merge_keys or '无'}\n"
+        f"{_display_schema_guidance(state, step)}"
+        f"{_merge_key_display_guidance(merge_key_values)}"
+        f"{_merge_grain_guidance(merge_key_values)}\n"
         "请只生成完成当前步骤目标所需的 SELECT SQL，不要处理其他计划步骤。"
-        "如果存在后续合并键，请在 SELECT 中输出同名别名；无法输出 ID/编码时，至少输出同一业务维度的名称别名。"
+        "如果存在后续合并键，请在 SELECT 中输出同名别名；"
+        "合并键列别名必须与 merge_keys 完全一致，不要用展示字段别名代替合并键别名；"
+        "展示字段请按 display_schema.column 另行输出。"
+        "不要输出 output_schema/merge_keys 之外的额外维度列，除非它是可读名称或 source count 诊断列；"
+        "无法输出 ID/编码时，至少输出同一业务维度的名称别名。"
         f"{dependency_text}"
     )
 
@@ -1844,6 +1934,8 @@ def _merge_dependency_rows(
         for merge_key in merge_keys
         if rows_by_dep
         and all(
+            not rows
+            or
             any(
                 _row_has_resolvable_merge_value(row, str(merge_key))
                 for row in rows
@@ -1972,42 +2064,8 @@ def _decimal_value(value) -> Decimal | None:
     return None
 
 
-def _column_matches_metric(column: str, terms: tuple[str, ...]) -> bool:
-    if _is_metric_dimension_column(column):
-        return False
-    return _METRIC_REGISTRY.column_matches(column, terms)
-
-
-def _sum_metric_columns(rows: list[dict], terms: tuple[str, ...]) -> Decimal | None:
-    total = Decimal("0")
-    matched = False
-    for row in rows:
-        for column, value in row.items():
-            if not _column_matches_metric(str(column), terms):
-                continue
-            amount = _decimal_value(value)
-            if amount is None:
-                continue
-            total += amount
-            matched = True
-    return total if matched else None
-
-
 def _format_decimal_amount(amount: Decimal) -> str:
     return f"{amount.quantize(Decimal('0.01'))}"
-
-
-def _format_decimal_percent(numerator: Decimal, denominator: Decimal) -> str:
-    if denominator == 0:
-        return "无法计算"
-    return f"{(numerator / denominator * Decimal('100')).quantize(Decimal('0.01'))}%"
-
-
-def _format_optional_decimal(value, suffix: str = "") -> str:
-    amount = _decimal_value(value)
-    if amount is None:
-        return ""
-    return f"{_format_decimal_amount(amount)}{suffix}"
 
 
 def _format_count_value(value) -> str:
@@ -2018,83 +2076,6 @@ def _format_count_value(value) -> str:
     if amount == integral:
         return str(int(integral))
     return _format_decimal_amount(amount)
-
-
-def _is_metric_dimension_column(column: str) -> bool:
-    normalized = _normalize_merge_name(column)
-    compact = normalized.replace("_", "")
-    if not normalized:
-        return True
-    if normalized in {"id", "code", "name", "type", "status"}:
-        return True
-    if normalized.endswith(("id", "code", "name", "type", "status")):
-        return True
-    dimension_markers = (
-        "cost_center",
-        "costcenter",
-        "department",
-        "dept",
-        "period",
-        "month",
-        "year",
-        "date",
-        "account",
-        "center_name",
-        "成本中心",
-        "部门",
-        "期间",
-        "月份",
-        "年度",
-        "日期",
-        "科目",
-    )
-    return any(marker in normalized or marker in compact for marker in dimension_markers)
-
-
-def _format_complex_business_summary(execution_results: dict[str, dict]) -> str:
-    final_rows = None
-    for key in sorted(execution_results, key=lambda x: int(x) if str(x).isdigit() else 10**9):
-        entry = execution_results.get(key) or {}
-        result = entry.get("result")
-        if entry.get("type") in {"python_merge", "report"} and isinstance(result, list):
-            if all(isinstance(row, dict) for row in result):
-                final_rows = result
-
-    if final_rows is None:
-        return ""
-
-    unaligned_count = sum(1 for row in final_rows if row.get("merge_status") == "未对齐")
-    aligned_count = len(final_rows) - unaligned_count
-    income = _sum_metric_columns(final_rows, ("income",))
-    cost = _sum_metric_columns(final_rows, ("cost",))
-    expense = _sum_metric_columns(final_rows, ("expense", "approved_expense"))
-    budget = _sum_metric_columns(final_rows, ("budget",))
-    actual = _sum_metric_columns(final_rows, ("actual",))
-    collection = _sum_metric_columns(final_rows, ("collection",))
-
-    lines = [
-        "经营关系摘要：",
-        f"- 合并结果：{aligned_count} 行，未对齐记录：{unaligned_count} 行。",
-    ]
-    if income is not None:
-        lines.append(f"- 收入合计：{_format_decimal_amount(income)}")
-    if cost is not None:
-        lines.append(f"- 成本合计：{_format_decimal_amount(cost)}")
-    if expense is not None:
-        lines.append(f"- 费用合计：{_format_decimal_amount(expense)}")
-    if budget is not None:
-        lines.append(f"- 预算合计：{_format_decimal_amount(budget)}")
-    if actual is not None:
-        lines.append(f"- 实际执行合计：{_format_decimal_amount(actual)}")
-    if collection is not None:
-        lines.append(f"- 回款合计：{_format_decimal_amount(collection)}")
-    if income is not None and (cost is not None or expense is not None):
-        rough_surplus = income - (cost or Decimal("0")) - (expense or Decimal("0"))
-        lines.append(f"- 粗略盈余：{_format_decimal_amount(rough_surplus)}")
-    if income is not None and income != 0 and collection is not None:
-        ratio = (collection / income * Decimal("100")).quantize(Decimal("0.01"))
-        lines.append(f"- 回款/收入比：{ratio}%")
-    return "\n".join(lines)
 
 
 def _final_complex_rows(execution_results: dict[str, dict]) -> list[dict] | None:
@@ -2109,80 +2090,18 @@ def _final_complex_rows(execution_results: dict[str, dict]) -> list[dict] | None
     return final_rows
 
 
-def _row_metric_sum(row: dict, terms: tuple[str, ...]) -> Decimal | None:
-    total = Decimal("0")
-    matched = False
-    for column, value in row.items():
-        if not _column_matches_metric(str(column), terms):
-            continue
-        amount = _decimal_value(value)
-        if amount is None:
-            continue
-        total += amount
-        matched = True
-    return total if matched else None
-
-
-def _first_metric_value(row: dict, roles: tuple[str, ...]) -> Decimal | None:
-    for column, value in row.items():
-        if not _column_matches_metric(str(column), roles):
-            continue
-        amount = _decimal_value(value)
-        if amount is not None:
-            return amount
-    return None
-
-
-def _format_row_identity(row: dict, index: int) -> str:
-    labels = []
-    for key, label in (
-        ("department_name", "部门"),
-        ("department", "部门"),
-        ("cost_center_name", "成本中心"),
-        ("center_name", "成本中心"),
-        ("period", "期间"),
-        ("account_name", "科目"),
-        ("account_code", "科目"),
-        ("department_id", "部门"),
-        ("cost_center_id", "成本中心"),
-    ):
-        value = row.get(key)
-        if value is None or value == "":
-            continue
-        rendered = _format_result_value(value)
-        item = f"{label}{rendered}"
-        if item not in labels:
-            labels.append(item)
-        if len(labels) >= 3:
-            break
-    return " / ".join(labels) if labels else f"记录 {index + 1}"
-
-
 def _is_internal_result_column(column: str) -> bool:
-    normalized = _normalize_merge_name(column)
+    raw = str(column or "").strip().lower()
+    normalized = _normalize_merge_name(raw)
     if not normalized:
         return False
-    if normalized in {"id", "parentid", "departmentid", "costcenterid", "merge_status", "mergestatus", "source_step", "sourcestep"}:
+    if normalized in {"id", "mergestatus", "sourcestep", "missingmergekeys"}:
         return True
-    return bool(normalized.endswith("id") and any(marker in normalized for marker in ("department", "costcenter", "parent")))
+    return raw == "id" or raw.endswith("_id") or raw.endswith(".id")
 
 
 def _format_display_column_label(column: str) -> str:
-    labels = {
-        "department_name": "部门",
-        "department": "部门",
-        "cost_center_name": "成本中心",
-        "center_name": "成本中心",
-        "actual_amount": "实际发生",
-        "budget_amount": "预算",
-        "income_amount": "收入",
-        "cost_amount": "成本",
-        "expense_amount": "费用",
-        "collection_amount": "回款",
-        "total_expenses": "费用合计",
-        "period": "期间",
-    }
-    return labels.get(str(column), str(column))
+    return str(column)
 
 
 def _format_row_preview(row: dict, max_columns: int = 8) -> str:
@@ -2201,64 +2120,26 @@ def _format_row_preview(row: dict, max_columns: int = 8) -> str:
     return rendered
 
 
-def _business_dimension_name(row: dict, index: int) -> str:
-    for key in ("cost_center_name", "department_name", "center_name", "department"):
-        value = row.get(key)
+def _diagnostic_row_name(row: dict, index: int) -> str:
+    for key, value in row.items():
+        if key == "missing_merge_keys" or _is_internal_result_column(str(key)):
+            continue
         if value not in (None, ""):
             return _format_result_value(value)
-    for key, prefix in (("department_id", "部门"), ("cost_center_id", "成本中心")):
-        value = row.get(key)
-        if value not in (None, ""):
-            return f"{prefix}{_format_result_value(value)}"
     return f"记录 {index + 1}"
-
-
-def _first_row_value(row: dict, names: tuple[str, ...], normalized_terms: tuple[str, ...] = ()):
-    for name in names:
-        if name in row and row.get(name) not in (None, ""):
-            return row.get(name)
-    for column, value in row.items():
-        if value in (None, ""):
-            continue
-        normalized = _normalize_merge_name(str(column))
-        if any(term in normalized for term in normalized_terms):
-            return value
-    return None
-
-
-def _has_budget_expense_metrics(rows: list[dict]) -> bool:
-    has_budget = any(_row_metric_sum(row, ("budget",)) is not None for row in rows)
-    has_expense = any(
-        _row_metric_sum(row, ("approved_expense",)) is not None
-        for row in rows
-    )
-    return has_budget and has_expense
-
-
-def _has_profitability_expense_metrics(rows: list[dict]) -> bool:
-    has_profit = any(_first_metric_value(row, ("net_profit",)) is not None for row in rows)
-    has_profitability_rate = any(
-        _first_metric_value(row, ("net_margin", "gross_margin")) is not None
-        for row in rows
-    )
-    has_expense = any(
-        _row_metric_sum(row, ("expense", "approved_expense")) is not None
-        for row in rows
-    )
-    return has_profit and (has_profitability_rate or has_expense)
 
 
 def _format_missing_dimension_diagnostics(
     rows: list[dict],
     *,
-    suggestion_context: str = "预算和报销费用查询结果",
+    suggestion_context: str = "各步骤查询结果",
 ) -> list[str]:
     diagnostics = []
     for index, row in enumerate(rows):
         missing = str(row.get("missing_merge_keys") or "").strip()
         if not missing:
             continue
-        diagnostics.append(f"- {_business_dimension_name(row, index)}：缺少字段：{missing}。")
+        diagnostics.append(f"- {_diagnostic_row_name(row, index)}：缺少字段：{missing}。")
         if len(diagnostics) >= 3:
             break
     if not diagnostics:
@@ -2274,160 +2155,226 @@ def _format_missing_dimension_diagnostics(
         lines.append("- 仅展示前 3 条诊断。")
     if missing_fields:
         joined = "、".join(missing_fields)
-        lines.append(f"- 建议在{suggestion_context}中同时输出 {joined}，以便系统按同一部门/成本中心口径合并。")
+        lines.append(f"- 建议在{suggestion_context}中同时输出 {joined}，以便系统按同一分析粒度合并。")
     return lines
 
 
-def _format_profitability_expense_answer(
+def _display_schema_fields(plan: dict) -> list[dict]:
+    schema = plan.get("display_schema") if isinstance(plan, dict) else None
+    if not isinstance(schema, list):
+        return []
+    fields = []
+    for item in schema:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        column = str(item.get("column") or "").strip()
+        value_type = _normalize_display_schema_type(item.get("type"))
+        if not label or not column:
+            continue
+        fields.append({
+            "role": str(item.get("role") or column).strip(),
+            "label": label,
+            "column": column,
+            "type": value_type,
+        })
+    return fields
+
+
+def _normalize_display_schema_type(value) -> str:
+    value_type = str(value or "text").strip().lower()
+    if value_type in {"string", "str", "varchar", "char"}:
+        return "dimension"
+    if value_type in {"decimal", "numeric", "float", "double", "money"}:
+        return "amount"
+    if value_type in {"percentage"}:
+        return "percent"
+    if value_type in {"int", "integer"}:
+        return "count"
+    if value_type in {"dimension", "amount", "number", "currency", "count", "percent", "ratio", "rate", "text"}:
+        return value_type
+    return "text"
+
+
+def _display_schema_group_key(row: dict, fields: list[dict], index: int) -> tuple:
+    dimensions = [field for field in fields if field.get("type") == "dimension"]
+    if not dimensions:
+        return ("row", index)
+    values = tuple(_display_schema_row_value(row, field) for field in dimensions)
+    if any(value not in (None, "") for value in values):
+        return values
+    return ("row", index)
+
+
+def _resolve_display_dimension_sibling_column(row: dict, column: str) -> str | None:
+    column_norm = _normalize_merge_name(column)
+    if not column_norm:
+        return None
+    normalized_columns = {
+        _normalize_merge_name(candidate): candidate
+        for candidate in row
+        if _normalize_merge_name(candidate)
+    }
+    readable_suffixes = ("name", "名称", "名", "label", "文本", "text")
+    candidates = [f"{column_norm}{suffix}" for suffix in readable_suffixes]
+    for suffix in ("id", "code", "编号", "编码", "代码"):
+        if column_norm.endswith(suffix) and len(column_norm) > len(suffix):
+            stem = column_norm[: -len(suffix)]
+            candidates.extend(f"{stem}{readable_suffix}" for readable_suffix in readable_suffixes)
+    for candidate in candidates:
+        resolved = normalized_columns.get(candidate)
+        if resolved and _has_merge_value(row.get(resolved)):
+            return resolved
+    return None
+
+
+def _looks_like_identifier_value(value) -> bool:
+    if isinstance(value, bool) or value in (None, ""):
+        return False
+    if isinstance(value, int):
+        return True
+    if isinstance(value, str):
+        text = value.strip()
+        return bool(text) and text.isdigit()
+    return False
+
+
+def _display_schema_row_value(row: dict, field: dict):
+    column = str(field.get("column") or "")
+    value_type = str(field.get("type") or "text").lower()
+    value = row.get(column)
+    if value_type == "dimension":
+        sibling_column = _resolve_display_dimension_sibling_column(row, column)
+        if sibling_column and (not _has_merge_value(value) or _looks_like_identifier_value(value)):
+            return row.get(sibling_column)
+    elif _field_source_count_is_zero(row, column):
+        return None
+    return value
+
+
+def _field_source_count_is_zero(row: dict, column: str) -> bool:
+    """Return true when a metric value is only a filler value for an empty source set."""
+    candidates = [
+        f"{column}_source_count",
+        f"{column}_row_count",
+        "metric_source_count",
+        "source_row_count",
+        "source_count",
+    ]
+    for candidate in candidates:
+        if candidate not in row:
+            continue
+        count = _decimal_value(row.get(candidate))
+        if count is not None:
+            return count == 0
+    return False
+
+
+def _merge_display_schema_rows(rows: list[dict], fields: list[dict]) -> list[dict]:
+    grouped: dict[tuple, dict] = {}
+    percent_values: dict[tuple, dict[str, set]] = {}
+    for index, row in enumerate(rows):
+        key = _display_schema_group_key(row, fields, index)
+        bucket = grouped.setdefault(key, {})
+        rate_bucket = percent_values.setdefault(key, {})
+        for field in fields:
+            column = str(field.get("column") or "")
+            value_type = str(field.get("type") or "text").lower()
+            value = _display_schema_row_value(row, field)
+            if value in (None, ""):
+                continue
+            if value_type in {"amount", "number", "currency"}:
+                amount = _decimal_value(value)
+                if amount is not None:
+                    bucket[column] = (_decimal_value(bucket.get(column)) or Decimal("0")) + amount
+                continue
+            if value_type in {"count", "integer"}:
+                amount = _decimal_value(value)
+                if amount is not None:
+                    bucket[column] = (_decimal_value(bucket.get(column)) or Decimal("0")) + amount
+                continue
+            if value_type in {"percent", "ratio", "rate"}:
+                amount = _decimal_value(value)
+                normalized = amount if amount is not None else str(value)
+                rate_bucket.setdefault(column, set()).add(normalized)
+                continue
+            bucket.setdefault(column, value)
+    for key, columns in percent_values.items():
+        bucket = grouped.setdefault(key, {})
+        for column, values in columns.items():
+            if len(values) == 1:
+                bucket[column] = next(iter(values))
+            elif len(values) > 1:
+                bucket[column] = _DISPLAY_UNMERGEABLE_RATE_VALUE
+    return list(grouped.values())
+
+
+def _format_display_schema_value(value, value_type: str) -> str:
+    value_type = str(value_type or "text").lower()
+    if value in (None, ""):
+        return _DISPLAY_MISSING_VALUE
+    if value_type in {"amount", "number", "currency"}:
+        amount = _decimal_value(value)
+        return _format_decimal_amount(amount) if amount is not None else _format_result_value(value)
+    if value_type in {"count", "integer"}:
+        return _format_count_value(value)
+    if value_type in {"percent", "ratio", "rate"}:
+        amount = _decimal_value(value)
+        if amount is not None:
+            return f"{_format_decimal_amount(amount)}%"
+        text = _format_result_value(value)
+        return text if text.endswith("%") else text
+    return _format_result_value(value)
+
+
+def _format_display_schema_answer(
     plan: dict,
     execution_results: dict[str, dict],
     rows: list[dict],
 ) -> str:
-    aligned_rows = [row for row in rows if row.get("merge_status") != "未对齐"]
-    display_rows = aligned_rows or rows
-    if not _has_profitability_expense_metrics(display_rows):
+    fields = _display_schema_fields(plan)
+    if not fields:
         return ""
-
+    display_rows = _merge_display_schema_rows(
+        [row for row in rows if row.get("merge_status") != "未对齐"] or rows,
+        fields,
+    )
+    if not display_rows:
+        return ""
     steps = plan.get("steps") or []
     total_steps = len(steps) or len(execution_results)
     processed_steps = (
         sum(1 for step in steps if str(step.get("step")) in execution_results)
         if steps else len(execution_results)
     )
-    lines = [
-        "盈利能力与费用对比：",
-        f"- 已完成 {processed_steps}/{total_steps} 个步骤。下表按可合并的部门/成本中心口径展示。",
-        "",
-        "| 年度 | 部门 | 净利润 | 净利率 | 毛利率 | 费用合计 | 费用笔数 |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: |",
+    labels = [str(field["label"]) for field in fields]
+    alignment = [
+        "---:" if str(field.get("type") or "").lower() in {"amount", "number", "currency", "count", "integer", "percent", "ratio", "rate"} else "---"
+        for field in fields
     ]
-    default_year = _infer_year_from_context(plan, execution_results)
-    for index, row in enumerate(display_rows[:10]):
-        year = _first_row_value(row, ("budget_year", "year", "年度"), ("year", "年度")) or default_year
-        net_profit = _first_metric_value(row, ("net_profit",))
-        net_margin = _first_metric_value(row, ("net_margin",))
-        gross_margin = _first_metric_value(row, ("gross_margin",))
-        expense = _row_metric_sum(row, ("expense", "approved_expense"))
-        expense_count = _first_metric_value(row, ("expense_count",))
-        lines.append(
-            "| "
-            f"{_format_result_value(year)} | "
-            f"{_business_dimension_name(row, index)} | "
-            f"{_format_decimal_amount(net_profit) if net_profit is not None else ''} | "
-            f"{_format_optional_decimal(net_margin, '%')} | "
-            f"{_format_optional_decimal(gross_margin, '%')} | "
-            f"{_format_decimal_amount(expense) if expense is not None else ''} | "
-            f"{_format_count_value(expense_count)} |"
-        )
+    lines = [
+        "分析结果：",
+        f"- 已完成 {processed_steps}/{total_steps} 个步骤。下表按计划声明的展示字段输出。",
+        "",
+        "| " + " | ".join(labels) + " |",
+        "| " + " | ".join(alignment) + " |",
+    ]
+    for row in display_rows[:10]:
+        values = [
+            _format_display_schema_value(_display_schema_row_value(row, field), str(field.get("type") or "text"))
+            for field in fields
+        ]
+        lines.append("| " + " | ".join(values) + " |")
     if len(display_rows) > 10:
         lines.append("")
         lines.append(f"- 仅展示前 10 条，共 {len(display_rows)} 条。")
-
     diagnostics = _format_missing_dimension_diagnostics(rows, suggestion_context="各步骤查询结果")
     if diagnostics:
         lines.append("")
         lines.extend(diagnostics)
-
     lines.append("")
     lines.append("执行概况：SQL 已通过语义校验、安全检查、权限检查并执行。")
     return "\n".join(lines)
-
-
-def _infer_year_from_context(plan: dict, execution_results: dict[str, dict]) -> str:
-    text_parts = [json.dumps(plan, ensure_ascii=False)]
-    for entry in execution_results.values():
-        if isinstance(entry, dict):
-            text_parts.extend(str(entry.get(key) or "") for key in ("goal", "sql", "answer"))
-    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", "\n".join(text_parts))
-    return match.group(1) if match else ""
-
-
-def _format_budget_expense_comparison_answer(
-    plan: dict,
-    execution_results: dict[str, dict],
-    rows: list[dict],
-) -> str:
-    aligned_rows = [row for row in rows if row.get("merge_status") != "未对齐"]
-    display_rows = aligned_rows or rows
-    if not _has_budget_expense_metrics(display_rows):
-        return ""
-
-    steps = plan.get("steps") or []
-    total_steps = len(steps) or len(execution_results)
-    processed_steps = (
-        sum(1 for step in steps if str(step.get("step")) in execution_results)
-        if steps else len(execution_results)
-    )
-    lines = [
-        "预算执行率与已审批报销费用对比：",
-        f"- 已完成 {processed_steps}/{total_steps} 个步骤。下表按可合并的部门/成本中心口径展示。",
-        "",
-        "| 年度 | 部门 | 预算执行率 | 已审批报销费用 | 预算 | 已审批报销费用与预算差异 |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
-    ]
-    default_year = _infer_year_from_context(plan, execution_results)
-    for index, row in enumerate(display_rows[:10]):
-        year = _first_row_value(row, ("budget_year", "year", "年度"), ("year", "年度")) or default_year
-        budget = _row_metric_sum(row, ("budget",))
-        expense = _row_metric_sum(row, ("approved_expense",))
-        if expense is None and budget is not None:
-            expense = Decimal("0")
-        execution_rate = _first_metric_value(row, ("execution_rate",))
-        variance = expense - budget if expense is not None and budget is not None else None
-        lines.append(
-            "| "
-            f"{_format_result_value(year)} | "
-            f"{_business_dimension_name(row, index)} | "
-            f"{_format_optional_decimal(execution_rate, '%')} | "
-            f"{_format_decimal_amount(expense) if expense is not None else ''} | "
-            f"{_format_decimal_amount(budget) if budget is not None else ''} | "
-            f"{_format_decimal_amount(variance) if variance is not None else ''} |"
-        )
-    if len(display_rows) > 10:
-        lines.append("")
-        lines.append(f"- 仅展示前 10 条，共 {len(display_rows)} 条。")
-
-    diagnostics = _format_missing_dimension_diagnostics(rows)
-    if diagnostics:
-        lines.append("")
-        lines.extend(diagnostics)
-
-    lines.append("")
-    lines.append("执行概况：SQL 已通过语义校验、安全检查、权限检查并执行。")
-    return "\n".join(lines)
-
-
-def _top_budget_variance_lines(rows: list[dict], max_rows: int = 3) -> list[str]:
-    candidates = []
-    for index, row in enumerate(rows):
-        actual = _row_metric_sum(row, ("actual",))
-        budget = _row_metric_sum(row, ("budget",))
-        if actual is None or budget is None:
-            continue
-        variance = actual - budget
-        candidates.append((abs(variance), index, actual, budget, variance, row))
-
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    lines = []
-    for _abs_variance, index, actual, budget, variance, row in candidates[:max_rows]:
-        lines.append(
-            f"- {_format_row_identity(row, index)}：实际 {_format_decimal_amount(actual)}，"
-            f"预算 {_format_decimal_amount(budget)}，差异 {_format_decimal_amount(variance)}"
-        )
-    return lines
-
-
-def _has_collection_gap(execution_results: dict[str, dict], collection: Decimal | None) -> bool:
-    if collection not in (None, Decimal("0")):
-        return False
-    saw_collection_scope = False
-    for entry in execution_results.values():
-        text = f"{entry.get('goal', '')}\n{entry.get('answer', '')}\n{entry.get('result', '')}"
-        if any(marker in text for marker in ("回款", "收款", "应收", "settled", "received")):
-            saw_collection_scope = True
-            if any(marker in text for marker in ("未查询到", "无数据", "空结果", "0 条")):
-                return True
-    return saw_collection_scope and collection is None
 
 
 def _format_complex_relationship_answer(
@@ -2438,23 +2385,12 @@ def _format_complex_relationship_answer(
     if not rows:
         return ""
 
-    profitability_expense_answer = _format_profitability_expense_answer(plan, execution_results, rows)
-    if profitability_expense_answer:
-        return profitability_expense_answer
-
-    budget_expense_answer = _format_budget_expense_comparison_answer(plan, execution_results, rows)
-    if budget_expense_answer:
-        return budget_expense_answer
+    display_answer = _format_display_schema_answer(plan, execution_results, rows)
+    if display_answer:
+        return display_answer
 
     unaligned_count = sum(1 for row in rows if row.get("merge_status") == "未对齐")
     aligned_count = len(rows) - unaligned_count
-    income = _sum_metric_columns(rows, ("income",))
-    cost = _sum_metric_columns(rows, ("cost",))
-    expense = _sum_metric_columns(rows, ("expense", "approved_expense"))
-    budget = _sum_metric_columns(rows, ("budget",))
-    actual = _sum_metric_columns(rows, ("actual",))
-    collection = _sum_metric_columns(rows, ("collection",))
-
     steps = plan.get("steps") or []
     total_steps = len(steps) or len(execution_results)
     processed_steps = (
@@ -2466,44 +2402,10 @@ def _format_complex_relationship_answer(
     if unaligned_count:
         lines.append(f"- 另有 {unaligned_count} 条记录缺少合并维度，未纳入关系判断。")
 
-    if actual is not None:
-        lines.append(f"- 实际发生合计：{_format_decimal_amount(actual)}。")
-    if budget is not None:
-        lines.append(f"- 预算合计：{_format_decimal_amount(budget)}。")
-    if actual is not None and budget is not None:
-        variance = actual - budget
-        lines.append(
-            f"- 预算差异：{_format_decimal_amount(variance)}，"
-            f"预算执行率：{_format_decimal_percent(actual, budget)}。"
-        )
-    if income is not None:
-        lines.append(f"- 收入合计：{_format_decimal_amount(income)}。")
-    if cost is not None:
-        lines.append(f"- 成本合计：{_format_decimal_amount(cost)}。")
-    if expense is not None:
-        lines.append(f"- 费用合计：{_format_decimal_amount(expense)}。")
-    if collection is not None:
-        lines.append(f"- 回款合计：{_format_decimal_amount(collection)}。")
-    if income is not None and (cost is not None or expense is not None):
-        rough_surplus = income - (cost or Decimal("0")) - (expense or Decimal("0"))
-        lines.append(f"- 粗略盈余：{_format_decimal_amount(rough_surplus)}。")
-
-    if _has_collection_gap(execution_results, collection):
-        lines.append("- 未查询到可对齐的回款数据，暂不能计算回款效率。")
-    elif collection is not None:
-        denominator = income if income not in (None, Decimal("0")) else actual
-        if denominator not in (None, Decimal("0")):
-            lines.append(f"- 回款效率：{_format_decimal_percent(collection, denominator)}。")
-
     metric_lines = _format_result_rows_for_answer(rows)
     if metric_lines:
         lines.append("结果明细：")
         lines.extend(metric_lines)
-
-    variance_lines = _top_budget_variance_lines(rows)
-    if variance_lines:
-        lines.append("差异较大的维度：")
-        lines.extend(variance_lines)
 
     lines.append("执行概况：SQL 已通过安全检查、权限检查并执行。")
     return "\n".join(lines)
@@ -2622,9 +2524,6 @@ def _format_complex_execution_answer(plan: dict, execution_results: dict[str, di
 
     title = "复杂查询计划执行失败。" if failed else "复杂查询计划执行完成。"
     lines = [f"{title}共处理 {len(execution_results)}/{len(steps)} 个步骤："]
-    business_summary = _format_complex_business_summary(execution_results)
-    if business_summary:
-        lines.append(business_summary)
     for step in steps:
         step_no = step.get("step")
         entry = execution_results.get(str(step_no))
@@ -2658,6 +2557,8 @@ def _complex_step_display_error(entry: dict) -> str:
     """Prefer user-facing step answers over internal status codes."""
     error = str(entry.get("error") or "").strip()
     answer = str(entry.get("answer") or "").strip()
+    if _looks_like_sql_text(error):
+        return "SQL 步骤执行失败，错误详情已记录在执行历史中。"
     if answer and error in _COMPLEX_STEP_USER_SAFE_ERROR_CODES and not _looks_like_sql_text(answer):
         return answer
     return error or answer
@@ -2958,6 +2859,84 @@ def _complex_sql_step_entry(
     return entry
 
 
+def _governed_account_metric_step_sql(state: SQLReactState, step: dict) -> str:
+    schema = _normalize_step_output_schema(step.get("output_schema"))
+    if not schema:
+        return ""
+    tables = set(str(table) for table in (step.get("tables") or []))
+    required_tables = {"t_journal_entry", "t_journal_item", "t_account", "t_cost_center"}
+    if not required_tables.issubset(tables):
+        return ""
+
+    fields_by_column = {
+        str(field.get("column") or "").strip(): field
+        for field in schema
+        if str(field.get("column") or "").strip()
+    }
+    required_columns = {"部门", "收入", "成本", "净利润", "盈利率"}
+    if not required_columns.issubset(fields_by_column):
+        return ""
+
+    evidence_entries = _parse_business_evidence(state.get("evidence", []))
+    revenue_code = _business_formula_literal(evidence_entries, "收入")
+    cost_code = _business_formula_literal(evidence_entries, "成本")
+    if not revenue_code or not cost_code:
+        return ""
+
+    year = _year_from_step_context(step, state)
+    time_filter = f"je.period LIKE '{year}-%'" if year else "je.period IS NOT NULL"
+    revenue_expr = f"SUM(CASE WHEN a.account_code = '{revenue_code}' THEN ji.credit_amount ELSE 0 END)"
+    cost_expr = f"SUM(CASE WHEN a.account_code = '{cost_code}' THEN ji.debit_amount ELSE 0 END)"
+    net_profit_expr = f"SUM(CASE WHEN a.account_type = '损益' THEN ji.credit_amount - ji.debit_amount ELSE 0 END)"
+    return f"""SELECT
+ji.cost_center_id AS cost_center_id,
+cc.center_name AS 部门,
+{revenue_expr} AS 收入,
+{cost_expr} AS 成本,
+{net_profit_expr} AS 净利润,
+CASE
+    WHEN {revenue_expr} = 0 THEN NULL
+    ELSE ROUND({net_profit_expr} / {revenue_expr} * 100, 2)
+END AS 盈利率
+FROM t_journal_item ji
+JOIN t_journal_entry je ON ji.entry_id = je.id
+JOIN t_account a ON ji.account_code = a.account_code
+JOIN t_cost_center cc ON ji.cost_center_id = cc.id
+WHERE {time_filter}
+AND je.status IN ('已审核', '已过账')
+GROUP BY ji.cost_center_id, cc.center_name"""
+
+
+def _business_formula_literal(evidence_entries: list[dict[str, str | list[str]]], term: str) -> str:
+    target = str(term or "").strip()
+    for entry in evidence_entries:
+        aliases = [
+            str(entry.get("term") or "").strip(),
+            *[str(item).strip() for item in entry.get("synonyms", []) or []],
+        ]
+        if target not in aliases:
+            continue
+        formula = str(entry.get("formula") or "")
+        match = re.search(r"'([^']+)'|\"([^\"]+)\"", formula)
+        if match:
+            return (match.group(1) or match.group(2) or "").strip()
+    return ""
+
+
+def _year_from_step_context(step: dict, state: SQLReactState) -> str:
+    text = "\n".join(
+        str(value or "")
+        for value in (
+            step.get("goal"),
+            state.get("enhanced_query"),
+            state.get("rewritten_query"),
+            state.get("query"),
+        )
+    )
+    match = re.search(r"(?<!\d)(20\d{2})(?!\d)", text)
+    return match.group(1) if match else ""
+
+
 async def _run_complex_sql_harness(
     step_state: dict,
     step: dict,
@@ -3157,6 +3136,26 @@ async def _execute_complex_sql_step(
     }
 
     try:
+        governed_sql = _governed_account_metric_step_sql(step_state, step_for_query)
+        if governed_sql:
+            normalized_sql, sql_ok, sql_error = normalize_sql_answer(governed_sql)
+            if not sql_ok:
+                return _complex_sql_step_entry(
+                    step_no,
+                    step,
+                    tables,
+                    sql=normalized_sql,
+                    answer=f"受治理 SQL draft 格式不完整或不规范: {sql_error}",
+                    error="invalid_governed_sql",
+                )
+            step_state.update({
+                "sql": normalized_sql,
+                "answer": normalized_sql,
+                "is_sql": True,
+            })
+            step_state["docs"] = _docs_from_complex_step_context(state, tables)
+            return await _run_complex_sql_harness(step_state, step, tables, callbacks=callbacks)
+
         submitted_sql = str(step.get("sql") or "").strip()
         if submitted_sql:
             normalized_sql, sql_ok, sql_error = normalize_sql_answer(submitted_sql)
@@ -3249,6 +3248,7 @@ async def _execute_complex_sql_step(
             if step_state.get("retry_count", 0) >= settings.resilience.max_sql_retries:
                 return result
 
+            step_state.update(result)
             repair = await error_analysis(step_state, config=config)
             step_state.update(repair)
     except Exception as e:
@@ -3854,6 +3854,8 @@ async def semantic_check(state: SQLReactState) -> dict:
         semantic_model=state.get("semantic_model") or {},
         relationships=state.get("table_relationships", []),
         evidence=state.get("evidence", []),
+        expected_output_columns=_expected_output_columns_from_step_query(state.get("query", "")),
+        expected_output_schema=_expected_output_schema_from_step_query(state.get("query", "")),
     )
     if not report.passed:
         return {
@@ -3873,6 +3875,31 @@ def _semantic_check_query(state: SQLReactState) -> str:
         return query
     after_marker = query.split(marker, 1)[1]
     return after_marker.split("\n", 1)[0].strip() or query
+
+
+def _expected_output_columns_from_step_query(query: str) -> list[str]:
+    return [
+        str(item.get("column") or "").strip()
+        for item in _expected_output_schema_from_step_query(query)
+        if str(item.get("column") or "").strip()
+    ]
+
+
+def _expected_output_schema_from_step_query(query: str) -> list[dict]:
+    marker = "当前步骤输出契约："
+    if marker not in str(query or ""):
+        return []
+    after_marker = str(query or "").split(marker, 1)[1].lstrip()
+    if not after_marker:
+        return []
+    first_line = after_marker.splitlines()[0].strip()
+    if not first_line:
+        return []
+    try:
+        schema = json.loads(first_line)
+    except Exception:
+        return []
+    return _normalize_step_output_schema(schema)
 
 
 def _tables_from_sql(sql: str) -> list[str]:
@@ -4294,6 +4321,9 @@ def _should_repair_sql_error(error_msg: str) -> bool:
         "ambiguous",
         "operand should contain",
         "subquery returns",
+        "semantic_check_failed",
+        "semantic",
+        "语义",
         "42s02",
         "42s22",
         "42000",
@@ -4312,6 +4342,12 @@ async def error_analysis(state: SQLReactState, config=None) -> dict:
     last_error = state.get("error", "")
     last_sql = state.get("sql", "")
     retry_count = state.get("retry_count", 0)
+    semantic_report = state.get("semantic_report")
+    semantic_report_text = (
+        json.dumps(semantic_report, ensure_ascii=False, indent=2)
+        if isinstance(semantic_report, dict)
+        else ""
+    )
 
     response = await model.ainvoke(
         [
@@ -4325,6 +4361,9 @@ async def error_analysis(state: SQLReactState, config=None) -> dict:
 
 错误信息:
 {last_error}
+
+语义校验报告:
+{semantic_report_text or "无"}
 
 请简要分析错误原因（1-2 句话），并给出修正建议。"""),
             HumanMessage(content=f"这是第 {retry_count} 次重试，请分析错误并给出修正建议。"),

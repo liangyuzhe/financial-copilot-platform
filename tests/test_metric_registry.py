@@ -42,6 +42,32 @@ def test_net_profit_metric_rejects_single_sided_amount_shape():
     assert result.problem_code == "MISSING_METRIC_EXPRESSION"
 
 
+def test_sum_difference_metric_rejects_same_aggregation_with_reverse_difference():
+    from agents.tool.sql_tools.metric_registry import default_metric_registry, validate_metric_shape
+    from agents.tool.sql_tools.sql_shape import extract_sql_shape
+
+    metric = default_metric_registry().get("net_profit")
+    shape = extract_sql_shape(
+        """
+        SELECT SUM(
+            CASE
+            WHEN a.balance_direction = '贷' THEN ji.credit_amount - ji.debit_amount
+            WHEN a.balance_direction = '借' THEN ji.debit_amount - ji.credit_amount
+            ELSE 0
+            END
+        ) AS profit
+        FROM t_journal_item ji
+        JOIN t_account a ON ji.account_code = a.account_code
+        """,
+        dialect="mysql",
+    )
+
+    result = validate_metric_shape(metric, shape)
+
+    assert result.passed is False
+    assert result.problem_code == "REVERSED_METRIC_EXPRESSION"
+
+
 def test_semantic_check_uses_supplied_metric_registry_for_non_hardcoded_metric():
     from agents.tool.sql_tools.metric_registry import MetricDefinition, MetricExpression, MetricRegistry
     from agents.tool.sql_tools.semantic_check import check_sql_semantics
@@ -100,60 +126,10 @@ def test_semantic_check_reports_generic_metric_error_for_non_hardcoded_metric():
     assert "净利润" not in report.problems[0].title
 
 
-def test_metric_registry_matches_columns_by_configured_rules():
+def test_metric_registry_does_not_drive_result_column_or_prompt_rules():
     from agents.tool.sql_tools.metric_registry import default_metric_registry
 
     registry = default_metric_registry()
 
-    assert registry.column_matches("total_budget", ("budget",))
-    assert not registry.column_matches("budget_variance", ("budget",))
-    assert registry.column_matches("budget_variance", ("variance",))
-    assert not registry.column_matches("execution_rate", ("budget",))
-    assert registry.column_matches("execution_rate", ("execution_rate",))
-    assert registry.column_matches("total_approved_amount", ("approved_expense",))
-    assert not registry.column_matches("expense_count", ("expense",))
-    assert registry.column_matches("expense_count", ("expense_count",))
-    assert registry.column_matches("net_profit", ("net_profit",))
-    assert registry.column_matches("net_margin", ("net_margin",))
-    assert registry.column_matches("gross_margin", ("gross_margin",))
-
-
-def test_metric_column_rules_can_load_from_external_file(tmp_path):
-    import json
-
-    from agents.tool.sql_tools.metric_registry import MetricDefinition, MetricExpression, MetricRegistry, load_metric_column_rules
-
-    rule_file = tmp_path / "metric_rules.json"
-    rule_file.write_text(
-        json.dumps({
-            "rules": [
-                {
-                    "role": "custom_amount",
-                    "aliases": ["自定义金额"],
-                    "include_terms": ["custom_amount"],
-                    "exclude_terms": ["rate"],
-                }
-            ]
-        }),
-        encoding="utf-8",
-    )
-
-    registry = MetricRegistry(
-        metrics=[
-            MetricDefinition(
-                metric_id="custom_metric",
-                business_names=["自定义"],
-                expression=MetricExpression(
-                    expression_type="sum_difference",
-                    aggregation="SUM",
-                    left_column="left_amount",
-                    right_column="right_amount",
-                    operator="-",
-                ),
-            )
-        ],
-        column_rules=load_metric_column_rules(rule_file),
-    )
-
-    assert registry.column_matches("custom_amount", ("自定义金额",))
-    assert not registry.column_matches("custom_amount_rate", ("自定义金额",))
+    assert not hasattr(registry, "column_matches")
+    assert not hasattr(registry, "prompt_hints_for_query")

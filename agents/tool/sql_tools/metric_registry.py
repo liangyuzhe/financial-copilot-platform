@@ -1,12 +1,9 @@
-"""Configurable semantic metric definitions for SQL quality gates."""
+"""Semantic metric definitions for SQL quality gates."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json
-from pathlib import Path
 import re
-from typing import Iterable
 
 from agents.tool.sql_tools.sql_shape import SqlShape
 
@@ -30,30 +27,7 @@ class MetricDefinition:
     required_tables: list[str] = field(default_factory=list)
     required_filters: list[dict] = field(default_factory=list)
     time_field: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class MetricColumnRule:
-    """Configurable rule for mapping result columns to business metric roles."""
-
-    role: str
-    aliases: list[str]
-    include_terms: list[str]
-    exclude_terms: list[str] = field(default_factory=list)
-
-    def matches_request(self, requested: Iterable[str]) -> bool:
-        normalized_aliases = {_normalize_metric_text(alias) for alias in [self.role, *self.aliases]}
-        return any(_normalize_metric_text(item) in normalized_aliases for item in requested)
-
-    def matches_column(self, column: str) -> bool:
-        normalized = _normalize_metric_text(column)
-        if not normalized:
-            return False
-        exclude_terms = [_normalize_metric_text(term) for term in self.exclude_terms]
-        include_terms = [_normalize_metric_text(term) for term in self.include_terms]
-        if any(term and term in normalized for term in exclude_terms):
-            return False
-        return any(term and term in normalized for term in include_terms)
+    output_aliases: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,44 +42,14 @@ def _normalize_metric_text(value: str) -> str:
     return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(value or "").lower())
 
 
-def _default_metric_column_rules_path() -> Path:
-    return Path(__file__).with_name("metric_column_rules.json")
-
-
-def load_metric_column_rules(path: str | Path | None = None) -> list[MetricColumnRule]:
-    """Load metric result-column matching rules from a JSON seed file."""
-    rule_path = Path(path) if path is not None else _default_metric_column_rules_path()
-    if not rule_path.exists():
-        return []
-    payload = json.loads(rule_path.read_text(encoding="utf-8"))
-    items = payload.get("rules", payload) if isinstance(payload, dict) else payload
-    rules = []
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip()
-        if not role:
-            continue
-        rules.append(
-            MetricColumnRule(
-                role=role,
-                aliases=[str(value) for value in item.get("aliases", [])],
-                include_terms=[str(value) for value in item.get("include_terms", [])],
-                exclude_terms=[str(value) for value in item.get("exclude_terms", [])],
-            )
-        )
-    return rules
-
-
 class MetricRegistry:
     """In-memory metric registry for deterministic SQL semantic checks."""
 
-    def __init__(self, metrics: list[MetricDefinition], column_rules: list[MetricColumnRule] | None = None):
+    def __init__(self, metrics: list[MetricDefinition]):
         self._metrics = {
             metric.metric_id: metric
             for metric in metrics
         }
-        self._column_rules = column_rules or []
 
     def get(self, metric_id: str) -> MetricDefinition:
         return self._metrics[metric_id]
@@ -118,12 +62,22 @@ class MetricRegistry:
                 matches.append(metric)
         return matches
 
-    def column_matches(self, column: str, requested_roles: Iterable[str]) -> bool:
-        requested = list(requested_roles)
-        return any(
-            rule.matches_request(requested) and rule.matches_column(column)
-            for rule in self._column_rules
-        )
+    def match_output_aliases(self, aliases: list[str]) -> list[MetricDefinition]:
+        """Return governed metrics whose declared output aliases appear in SQL output."""
+        normalized_aliases = {_normalize_metric_text(alias) for alias in aliases if str(alias or "").strip()}
+        if not normalized_aliases:
+            return []
+        matches: list[MetricDefinition] = []
+        for metric in self._metrics.values():
+            candidates = metric.output_aliases or [metric.metric_id, *metric.business_names]
+            normalized_candidates = {
+                _normalize_metric_text(candidate)
+                for candidate in candidates
+                if str(candidate or "").strip()
+            }
+            if normalized_aliases & normalized_candidates:
+                matches.append(metric)
+        return matches
 
 
 def default_metric_registry() -> MetricRegistry:
@@ -141,9 +95,9 @@ def default_metric_registry() -> MetricRegistry:
                     operator="-",
                 ),
                 required_tables=["t_journal_item"],
+                output_aliases=["net_profit", "profit", "loss", "loss_amount", "净利润", "利润", "亏损", "亏损金额"],
             )
         ],
-        column_rules=load_metric_column_rules(),
     )
 
 
@@ -151,18 +105,83 @@ def validate_metric_shape(metric: MetricDefinition, shape: SqlShape) -> MetricVa
     """Validate whether a SQL shape contains the configured metric expression."""
     expression = metric.expression
     if expression.expression_type == "sum_difference":
-        for aggregation in shape.aggregations:
+        aggregations = _target_metric_aggregations(metric, shape) or shape.aggregations
+        saw_reversed_expression = False
+        for aggregation in aggregations:
             if aggregation.function.upper() != expression.aggregation.upper():
                 continue
             refs = {name for _table_alias, name in aggregation.column_refs}
-            if {expression.left_column, expression.right_column}.issubset(refs) and expression.operator in aggregation.sql:
+            if not {expression.left_column, expression.right_column}.issubset(refs):
+                continue
+            if _contains_reversed_difference(
+                aggregation.sql,
+                left_column=expression.left_column,
+                right_column=expression.right_column,
+            ):
+                saw_reversed_expression = True
+                continue
+            if expression.operator in aggregation.sql:
                 return MetricValidationResult(
                     passed=True,
                     metric_id=metric.metric_id,
                     matched_signals=[f"metric_expression:{metric.metric_id}"],
                 )
+        if saw_reversed_expression:
+            return MetricValidationResult(
+                passed=False,
+                metric_id=metric.metric_id,
+                problem_code="REVERSED_METRIC_EXPRESSION",
+            )
     return MetricValidationResult(
         passed=False,
         metric_id=metric.metric_id,
         problem_code="MISSING_METRIC_EXPRESSION",
     )
+
+
+def _target_metric_aggregations(metric: MetricDefinition, shape: SqlShape) -> list:
+    aliases = [_normalize_metric_text(alias) for alias in metric.output_aliases]
+    if not aliases:
+        aliases = [_normalize_metric_text(metric.metric_id), *(_normalize_metric_text(name) for name in metric.business_names)]
+    aliases = [alias for alias in aliases if alias]
+    if not aliases:
+        return []
+    return [
+        aggregation
+        for aggregation in shape.aggregations
+        if _normalize_metric_text(getattr(aggregation, "alias", "")) in aliases
+    ]
+
+
+def _contains_reversed_difference(sql: str, *, left_column: str, right_column: str) -> bool:
+    """Return true when one aggregate mixes left-right with right-left.
+
+    A configured ``sum_difference`` metric has a directional meaning. Seeing
+    both directions in the same aggregate is usually a sign that the SQL turned
+    costs into positive profit by adding the reverse branch back into the same
+    metric.
+    """
+    if not str(left_column or "").strip() or not str(right_column or "").strip():
+        return False
+    text = sql or ""
+    forward = _difference_pattern(left_column, right_column)
+    reverse = _difference_pattern(right_column, left_column)
+    return bool(forward.search(text) and any(not _is_unary_negated(text, match.start()) for match in reverse.finditer(text)))
+
+
+def _is_unary_negated(sql: str, match_start: int) -> bool:
+    prefix = sql[:match_start].rstrip()
+    return prefix.endswith("-") or prefix.endswith("-(")
+
+
+def _difference_pattern(left_column: str, right_column: str) -> re.Pattern:
+    return re.compile(
+        rf"{_sql_column_pattern(left_column)}\s*-\s*{_sql_column_pattern(right_column)}",
+        re.IGNORECASE,
+    )
+
+
+def _sql_column_pattern(column: str) -> str:
+    name = re.escape(str(column or "").strip("` "))
+    optional_alias = r"(?:`?[A-Za-z_][\w]*`?\s*\.\s*)?"
+    return rf"{optional_alias}`?{name}`?"

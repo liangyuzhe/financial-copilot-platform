@@ -50,11 +50,10 @@ agent: data_analysis_agent
 
 你是 Financial Copilot Platform 的轻量数据分析规划 Agent。
 目标是选择并调用少量业务 skill 生成结构化 analysis_plan，并交回 SQL Harness。
-默认只使用已暴露的 skill，不直接调用底层 schema、semantic_model、SQL 预检查或 analysis_plan handoff 工具。
-不要直接执行 SQL；安全检查、权限校验、审批、执行和报告生成都属于后续 SQL Harness。
+默认只用已暴露 skill，不直接调底层 schema、semantic_model、SQL 或 analysis_plan handoff 工具。
+不要执行 SQL；安全、权限、审批、执行和报告交给 SQL Harness。
 如果信息不足以规划，返回 clarification_questions；如果足以规划，调用合适的业务 skill，让 skill 提交 mode=analysis_plan 且 steps 非空的计划。
-调用 finance_relation_analysis 时，LLM/Planner 需要根据用户语义推断分析粒度；若用户表达了按部门、成本中心、期间、项目等粒度分析，在 skill input 中传入 grain。
-如果能从语义和 schema 关系推断步骤结果的行对齐键，在 skill input 中传入 merge_keys；不要把 id、parent_id、entry_id 这类主键、层级键或凭证连接键作为默认 merge key。
+调用 finance_relation_analysis 时推断 grain、merge_keys、display_schema；display_schema 每项含 role/label/column/type，展示列名来自该契约；type 必须准确表达单位，只能用 dimension/amount/percent/count/text，不要把比例类指标声明为 decimal；merge_keys 不默认用 id、parent_id、entry_id 等技术键。
 最终回复只输出简洁 answer、analysis_plan 或 clarification_questions；不要回写 tool_trace、events、state_patch 或完整 AgentRunResult。
 """
 
@@ -1516,7 +1515,11 @@ class LocalAgentScopeCompatibleRunner:
             state_patch["analysis_plan"] = result.analysis_plan
             state_patch["candidate_tables"] = self._tables_from_plan(result.analysis_plan)
             state_patch["selected_tables"] = list(state_patch["candidate_tables"])
-            state_patch["evidence"] = self._knowledge_evidence(evidence)
+            state_patch["evidence"] = (
+                list(result.analysis_plan.get("evidence") or [])
+                if isinstance(result.analysis_plan.get("evidence"), list)
+                else self._knowledge_evidence(evidence)
+            )
             state_patch["semantic_model"] = semantic.get("semantic_model", {}) if isinstance(semantic, dict) else {}
             state_patch["table_relationships"] = relationships.get("relationships", []) if isinstance(relationships, dict) else []
             if isinstance(feasibility, dict):

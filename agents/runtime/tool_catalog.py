@@ -2663,11 +2663,65 @@ class ToolCatalog:
             "reason": str(plan.get("reason") or purpose or "").strip(),
             "steps": normalized_steps,
         }
+        display_schema = self._normalize_display_schema(plan.get("display_schema"))
+        if display_schema:
+            normalized_plan["display_schema"] = display_schema
+        evidence = self._normalize_evidence(plan.get("evidence"))
+        if evidence:
+            normalized_plan["evidence"] = evidence
         if isinstance(plan_input, dict) and str(plan_input.get("execution_mode") or "").strip():
             normalized_plan["execution_mode"] = str(plan_input.get("execution_mode")).strip()
         if isinstance(plan_input, dict) and "requires_user_confirmation" in plan_input:
             normalized_plan["requires_user_confirmation"] = bool(plan_input.get("requires_user_confirmation"))
         return normalized_plan
+
+    def _normalize_evidence(self, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        rows: list[str] = []
+        seen: set[str] = set()
+        for item in value:
+            text = str(item or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            rows.append(text)
+        return rows[:8]
+
+    def _normalize_display_schema(self, value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        fields: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            label = str(item.get("label") or "").strip()
+            column = str(item.get("column") or "").strip()
+            value_type = self._normalize_display_schema_type(item.get("type"))
+            if not (role and label and column and value_type):
+                continue
+            fields.append({
+                "role": role,
+                "label": label,
+                "column": column,
+                "type": value_type,
+            })
+        return fields
+
+    def _normalize_display_schema_type(self, value: Any) -> str:
+        value_type = str(value or "").strip().lower()
+        if value_type in {"string", "str", "varchar", "char"}:
+            return "dimension"
+        if value_type in {"decimal", "numeric", "float", "double", "money"}:
+            return "amount"
+        if value_type in {"percentage"}:
+            return "percent"
+        if value_type in {"int", "integer"}:
+            return "count"
+        if value_type in {"dimension", "amount", "number", "currency", "count", "percent", "ratio", "rate", "text"}:
+            return value_type
+        return ""
 
     def _is_structured_analysis_step(self, step: Any) -> bool:
         if not isinstance(step, dict):
@@ -2744,6 +2798,9 @@ class ToolCatalog:
             "depends_on": depends_on,
             "merge_keys": merge_keys,
         }
+        output_schema = self._normalize_display_schema(raw_step.get("output_schema"))
+        if output_schema:
+            normalized["output_schema"] = output_schema
         if sql_text:
             normalized["sql"] = self._normalize_sql_text(sql_text)
         return normalized

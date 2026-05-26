@@ -17,18 +17,6 @@ JoinRisk = Literal["low", "medium", "high"]
 VALID_STEP_TYPES = {"sql", "python_merge", "report"}
 DECOMPOSABLE_TASK_TYPES = {"analysis", "report", "comparison"}
 CLARIFY_TASK_TYPES = {"detail", "export", "sensitive"}
-DECOMPOSABLE_TASK_SIGNAL_TERMS = (
-    "分析",
-    "对比",
-    "比较",
-    "差异",
-    "偏差",
-    "趋势",
-    "关系",
-    "关联",
-    "影响",
-    "报告",
-)
 
 
 @dataclass(frozen=True)
@@ -194,8 +182,9 @@ def infer_task_type_from_recall_context(
     """Infer a decomposable task type from runtime recall evidence.
 
     Business semantics stay in recall data: matched business terms and related
-    tables come from business knowledge/few-shot retrieval. The query text is
-    only used for generic task-action signals such as analysis/comparison.
+    tables come from business knowledge/few-shot retrieval. Query action words
+    are not used here; route decisions should be governed by rules, recall
+    evidence, and schema structure.
     """
     if not isinstance(recall_context, dict):
         return "", {}
@@ -207,13 +196,7 @@ def infer_task_type_from_recall_context(
             "task_type": explicit_task_type,
         }
 
-    query_text = " ".join(
-        str(value or "")
-        for value in [
-            query,
-            *(query_variants or []),
-        ]
-    )
+    del query, query_variants
     matched_terms = _unique_strings([
         str(term).strip()
         for term in recall_context.get("matched_terms", []) or []
@@ -231,8 +214,7 @@ def infer_task_type_from_recall_context(
     related_selected_count = len(set(related_tables) & set(selected_tables or []))
 
     if (
-        _has_decomposable_task_signal(query_text)
-        and len(matched_terms) >= 3
+        len(matched_terms) >= 3
         and (selected_count >= 3 or related_selected_count >= 3 or len(related_tables) >= 3)
     ):
         return "analysis", {
@@ -240,7 +222,7 @@ def infer_task_type_from_recall_context(
             "business_related_tables_count": len(related_tables),
             "selected_tables_count": selected_count,
             "related_selected_tables_count": related_selected_count,
-            "reason": "multi-term decomposable analysis inferred from recall context",
+            "reason": "multi-term decomposable evidence inferred from recall context",
         }
     return "", {}
 
@@ -250,10 +232,6 @@ def _normalize_task_type(value: str | None) -> TaskType:
     if task_type in {"analysis", "report", "comparison", "detail", "export", "sensitive", "ambiguous"}:
         return task_type  # type: ignore[return-value]
     return "ambiguous"
-
-
-def _has_decomposable_task_signal(query: str) -> bool:
-    return any(term in query for term in DECOMPOSABLE_TASK_SIGNAL_TERMS)
 
 
 def _unique_strings(values: list[str]) -> list[str]:

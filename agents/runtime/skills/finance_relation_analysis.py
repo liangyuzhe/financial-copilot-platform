@@ -66,6 +66,25 @@ class FinanceRelationAnalysisSkill:
                     ),
                     "items": {"type": "string"},
                 },
+                "display_schema": {
+                    "type": "array",
+                    "description": (
+                        "Optional user-facing output contract inferred by the planner. "
+                        "Each item declares role, label, output column, and type. "
+                        "SQL steps must output these columns when relevant; formatter renders only this contract."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {"type": "string"},
+                            "label": {"type": "string"},
+                            "column": {"type": "string"},
+                            "type": {"type": "string"},
+                        },
+                        "required": ["role", "label", "column", "type"],
+                        "additionalProperties": True,
+                    },
+                },
             },
             "required": ["query"],
             "additionalProperties": False,
@@ -87,6 +106,7 @@ class FinanceRelationAnalysisSkill:
         query = str(payload.get("query") or context.query or "").strip()
         requested_grain = payload.get("grain")
         requested_merge_keys = self._string_items(payload.get("merge_keys"))
+        display_schema = self._display_schema_items(payload.get("display_schema"))
         if self._needs_clarification(query):
             return SkillResult(
                 status="needs_clarification",
@@ -106,6 +126,7 @@ class FinanceRelationAnalysisSkill:
             {"query": query, "top_k": 5},
         )
         evidence = self._knowledge_evidence(knowledge.output)
+        evidence = await self._expand_formula_dependency_evidence(context, query, evidence)
         candidate_payload: JsonDict = {
             "query": query,
             "evidence": evidence,
@@ -201,9 +222,11 @@ class FinanceRelationAnalysisSkill:
                 relationship_rows,
                 requested_grain=requested_grain,
                 requested_merge_keys=requested_merge_keys,
+                display_schema=display_schema,
+                semantic_model=semantic.output.get("semantic_model", {}) if isinstance(semantic.output, dict) else {},
             )
             if execution_mode == "plan_execute"
-            else self._single_sql_plan(query, selected_tables, evidence)
+            else self._single_sql_plan(query, selected_tables, evidence, display_schema=display_schema)
         )
         submitted = await context.invoke_tool(
             "analysis_plan.submit",
@@ -257,7 +280,7 @@ class FinanceRelationAnalysisSkill:
         if isinstance(feasibility_output, dict) and isinstance(feasibility_output.get("feasibility_decision"), dict):
             decision = feasibility_output["feasibility_decision"]
         mode = str(decision.get("execution_mode") or "").strip()
-        if mode == "complex_plan":
+        if mode in {"complex_plan", "plan_execute"}:
             return "plan_execute"
         if mode == "clarify":
             return "clarification"
@@ -271,6 +294,70 @@ class FinanceRelationAnalysisSkill:
             if isinstance(item, dict) and str(item.get("content") or "").strip():
                 rows.append(str(item.get("content")).strip())
         return rows[:5]
+
+    async def _expand_formula_dependency_evidence(
+        self,
+        context: Any,
+        query: str,
+        evidence: list[str],
+    ) -> list[str]:
+        dependency_terms = self._missing_formula_dependency_terms(query, evidence)
+        if not dependency_terms:
+            return evidence
+
+        dependency_evidence: list[str] = []
+        for term in dependency_terms[:3]:
+            knowledge = await context.invoke_tool(
+                "business_knowledge.search",
+                {"query": term, "top_k": 3},
+            )
+            for row in self._knowledge_evidence(knowledge.output):
+                if self._evidence_matches_term(row, term):
+                    dependency_evidence.append(row)
+        return self._unique_evidence([*dependency_evidence, *evidence])
+
+    def _missing_formula_dependency_terms(self, query: str, evidence: list[str]) -> list[str]:
+        entries = self._business_evidence_entries(evidence)
+        known_terms = {
+            self._normalize_schema_token(str(entry.get("term") or ""))
+            for entry in entries
+            if str(entry.get("term") or "").strip()
+        }
+        missing: list[str] = []
+        for entry in entries:
+            if self._business_entry_query_match_score(entry, query) <= 0:
+                continue
+            for component in self._formula_components(str(entry.get("formula") or "")):
+                normalized = self._normalize_schema_token(component)
+                if not normalized or normalized in known_terms:
+                    continue
+                if component not in missing:
+                    missing.append(component)
+        return missing
+
+    def _evidence_matches_term(self, evidence: str, term: str) -> bool:
+        target = self._normalize_schema_token(term)
+        if not target:
+            return False
+        for entry in self._business_evidence_entries([evidence]):
+            aliases = [
+                str(entry.get("term") or "").strip(),
+                *self._string_items(entry.get("synonyms") or []),
+            ]
+            if any(self._normalize_schema_token(alias) == target for alias in aliases):
+                return True
+        return False
+
+    def _unique_evidence(self, rows: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for row in rows:
+            text = str(row or "").strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            result.append(text)
+        return result
 
     def _selected_tables(self, output: Any) -> list[str]:
         if not isinstance(output, dict):
@@ -465,11 +552,35 @@ class FinanceRelationAnalysisSkill:
                 )
         return rows
 
-    def _single_sql_plan(self, query: str, selected_tables: list[str], evidence: list[str]) -> JsonDict:
+    def _display_schema_items(self, value: Any) -> list[JsonDict]:
+        if not isinstance(value, list):
+            return []
+        items: list[JsonDict] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip()
+            label = str(item.get("label") or "").strip()
+            column = str(item.get("column") or "").strip()
+            value_type = str(item.get("type") or "").strip()
+            if not (role and label and column and value_type):
+                continue
+            items.append({"role": role, "label": label, "column": column, "type": value_type})
+        return items
+
+    def _single_sql_plan(
+        self,
+        query: str,
+        selected_tables: list[str],
+        evidence: list[str],
+        *,
+        display_schema: list[JsonDict] | None = None,
+    ) -> JsonDict:
         return {
             "mode": "analysis_plan",
             "execution_mode": "single_sql",
             "reason": "候选表和口径较集中，可交由 SQL Harness 生成单步 SQL。",
+            "display_schema": list(display_schema or []),
             "evidence": evidence[:5],
             "steps": [
                 {
@@ -495,30 +606,53 @@ class FinanceRelationAnalysisSkill:
         *,
         requested_grain: Any = "",
         requested_merge_keys: list[str] | None = None,
+        display_schema: list[JsonDict] | None = None,
+        semantic_model: dict[str, Any] | None = None,
     ) -> JsonDict:
+        semantic_model = semantic_model or {}
+        inferred_grain = self._infer_requested_grain(
+            query=query,
+            relationships=relationships,
+            semantic_model=semantic_model,
+        )
+        effective_grain = requested_grain or inferred_grain.get("label") or ""
+        effective_requested_merge_keys = requested_merge_keys or self._string_items(inferred_grain.get("merge_keys"))
+        ignored_metric_labels = [str(effective_grain or "").replace("维度", "").strip()]
         subject_groups = self._subject_groups_from_evidence(
             query=query,
             selected_tables=selected_tables,
             evidence=evidence,
             recall_context=recall_context,
             relationships=relationships,
+            ignored_query_labels=ignored_metric_labels,
         )
         if not subject_groups:
             subject_groups = self._subject_groups_from_components(selected_tables, relationships)
         subject_groups = self._limit_subject_groups(subject_groups, max_sql_steps=3)
+        effective_display_schema = (
+            list(display_schema or [])
+            or self._infer_display_schema(
+                query=query,
+                evidence=evidence,
+                subject_groups=subject_groups,
+                grain_label=str(effective_grain or ""),
+            )
+        )
         merge_keys = self._merge_keys_from_relationships(
             relationships,
-            requested_merge_keys=requested_merge_keys or [],
+            requested_merge_keys=effective_requested_merge_keys,
+            requested_grain=effective_grain,
         )
         grain_label = self._grain_label_for_merge_keys(
             merge_keys,
-            requested_grain=requested_grain,
+            requested_grain=effective_grain,
         )
         step_table_limit = 8
 
         steps: list[JsonDict] = []
         for index, group in enumerate(subject_groups, start=1):
             label = str(group.get("label") or f"指标组 {index}")
+            group_terms = self._group_terms(group)
             tables = [
                 table
                 for table in group.get("tables", [])
@@ -532,6 +666,12 @@ class FinanceRelationAnalysisSkill:
                 relationships,
                 merge_keys,
             )
+            output_schema = self._step_output_schema(
+                effective_display_schema,
+                group_terms=group_terms,
+                group_tables=tables,
+                evidence=evidence,
+            )
             steps.append(
                 {
                     "step": index,
@@ -541,6 +681,7 @@ class FinanceRelationAnalysisSkill:
                     "grain": merge_keys,
                     "depends_on": [],
                     "merge_keys": merge_keys,
+                    **({"output_schema": output_schema} if output_schema else {}),
                 }
             )
 
@@ -582,6 +723,7 @@ class FinanceRelationAnalysisSkill:
                 "为降低多表 join 幻觉风险，先按证据分组汇总，再交由 SQL Harness 合并分析。"
             ),
             "source_query": query,
+            "display_schema": list(effective_display_schema),
             "evidence": evidence[:5],
             "feasibility": self._compact_feasibility(feasibility_output),
             "steps": steps,
@@ -596,6 +738,7 @@ class FinanceRelationAnalysisSkill:
         evidence: list[str],
         recall_context: dict[str, Any],
         relationships: list[dict[str, Any]],
+        ignored_query_labels: list[str] | None = None,
     ) -> list[JsonDict]:
         matched_terms = set(self._string_items(recall_context.get("matched_terms") or []))
         if not matched_terms:
@@ -606,6 +749,8 @@ class FinanceRelationAnalysisSkill:
         for entry in self._business_evidence_entries(evidence):
             term = str(entry.get("term") or "").strip()
             if term not in matched_terms:
+                continue
+            if self._business_entry_query_match_score(entry, query, ignored_labels=ignored_query_labels) <= 0:
                 continue
             tables = self._selected_ordered_tables(entry.get("related_tables", []), selected_tables)
             if not tables:
@@ -636,6 +781,239 @@ class FinanceRelationAnalysisSkill:
             )
         return groups
 
+    def _group_terms(self, group: JsonDict) -> list[str]:
+        terms = self._string_items(group.get("terms") or [])
+        if terms:
+            return terms
+        label = str(group.get("label") or "").strip()
+        return self._split_terms(label) if label else []
+
+    def _step_output_schema(
+        self,
+        display_schema: list[JsonDict],
+        *,
+        group_terms: list[str],
+        group_tables: list[str],
+        evidence: list[str],
+    ) -> list[JsonDict]:
+        if not display_schema:
+            return []
+        searchable = self._step_schema_search_text(group_terms, group_tables, evidence)
+        fields: list[JsonDict] = []
+        for field in display_schema:
+            role = str(field.get("role") or "").strip()
+            label = str(field.get("label") or "").strip()
+            column = str(field.get("column") or "").strip()
+            value_type = str(field.get("type") or "").strip().lower()
+            if value_type == "dimension":
+                fields.append(dict(field))
+                continue
+            candidates = [role, label, column]
+            if any(self._schema_token_matches(candidate, searchable) for candidate in candidates):
+                fields.append(dict(field))
+        return fields
+
+    def _step_schema_search_text(
+        self,
+        group_terms: list[str],
+        group_tables: list[str],
+        evidence: list[str],
+    ) -> str:
+        selected_tables = set(group_tables)
+        parts = [*group_terms, *group_tables]
+        matched_terms = set(group_terms)
+        for entry in self._business_evidence_entries(evidence):
+            related_tables = set(self._string_items(entry.get("related_tables") or []))
+            if selected_tables and related_tables and not selected_tables.intersection(related_tables):
+                continue
+            term = str(entry.get("term") or "")
+            synonyms = self._string_items(entry.get("synonyms") or [])
+            parts.append(term)
+            parts.extend(synonyms)
+            aliases = {term, *synonyms}
+            if matched_terms.intersection(alias for alias in aliases if alias):
+                parts.extend(self._formula_components(str(entry.get("formula") or "")))
+        return " ".join(part for part in parts if part)
+
+    def _schema_token_matches(self, candidate: str, searchable: str) -> bool:
+        token = self._normalize_schema_token(candidate)
+        haystack = self._normalize_schema_token(searchable)
+        return bool(token and haystack and (token in haystack or haystack in token))
+
+    def _normalize_schema_token(self, value: str) -> str:
+        return "".join(ch for ch in str(value or "").lower() if ch.isalnum() or "\u4e00" <= ch <= "\u9fff")
+
+    def _infer_requested_grain(
+        self,
+        *,
+        query: str,
+        relationships: list[dict[str, Any]],
+        semantic_model: dict[str, Any],
+    ) -> JsonDict:
+        best: tuple[int, str, str] | None = None
+        for rel in relationships:
+            if not self._is_dimension_relationship(rel):
+                continue
+            merge_key = str(rel.get("from_column") or "").strip()
+            score, label = self._best_query_label_match(
+                query,
+                self._relationship_business_labels(rel, semantic_model),
+            )
+            if score <= 0 or not label:
+                continue
+            candidate = (score, label, merge_key)
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+        if best is None:
+            return {}
+        return {"label": best[1], "merge_keys": [best[2]]}
+
+    def _relationship_business_labels(
+        self,
+        rel: dict[str, Any],
+        semantic_model: dict[str, Any],
+    ) -> list[str]:
+        labels = [
+            self._merge_key_base(str(rel.get("from_column") or "")),
+            self._table_base(str(rel.get("to_table") or "")),
+        ]
+        for table_name, column_name in (
+            (str(rel.get("from_table") or ""), str(rel.get("from_column") or "")),
+            (str(rel.get("to_table") or ""), str(rel.get("to_column") or "")),
+        ):
+            columns = semantic_model.get(table_name) if isinstance(semantic_model, dict) else None
+            if not isinstance(columns, dict):
+                continue
+            column = columns.get(column_name)
+            if not isinstance(column, dict):
+                continue
+            labels.extend(
+                str(column.get(key) or "")
+                for key in ("business_name", "column_comment", "synonyms", "business_description")
+                if str(column.get(key) or "").strip()
+            )
+        return labels
+
+    def _best_query_label_match(self, query: str, labels: list[str]) -> tuple[int, str]:
+        query_norm = self._normalize_schema_token(query)
+        best: tuple[int, str] = (0, "")
+        for raw_label in labels:
+            split_labels = self._split_terms(str(raw_label or "")) or [str(raw_label or "")]
+            for label in split_labels:
+                label_norm = self._normalize_schema_token(label)
+                if not label_norm:
+                    continue
+                if label_norm in query_norm:
+                    candidate = (100 + len(label_norm), label)
+                else:
+                    candidate = self._best_substring_label_match(query_norm, label_norm)
+                if candidate[0] > best[0]:
+                    best = candidate
+        return best
+
+    def _best_substring_label_match(self, query_norm: str, label_norm: str) -> tuple[int, str]:
+        max_len = min(len(label_norm), 8)
+        for length in range(max_len, 1, -1):
+            for start in range(0, len(label_norm) - length + 1):
+                piece = label_norm[start : start + length]
+                if piece and piece in query_norm:
+                    return (length, piece)
+        return (0, "")
+
+    def _infer_display_schema(
+        self,
+        *,
+        query: str,
+        evidence: list[str],
+        subject_groups: list[JsonDict],
+        grain_label: str,
+    ) -> list[JsonDict]:
+        fields: list[JsonDict] = []
+        clean_grain = str(grain_label or "").replace("维度", "").strip()
+        if clean_grain:
+            fields.append(self._display_field(clean_grain, "dimension"))
+
+        subject_terms = {
+            term
+            for group in subject_groups
+            for term in self._group_terms(group)
+            if term
+        }
+        amount_fields: list[JsonDict] = []
+        ratio_dependency_fields: list[JsonDict] = []
+        percent_fields: list[JsonDict] = []
+        for entry in self._business_evidence_entries(evidence):
+            term = str(entry.get("term") or "").strip()
+            if term and subject_terms and term not in subject_terms:
+                continue
+            if self._business_entry_query_match_score(entry, query, ignored_labels=[clean_grain]) <= 0:
+                continue
+            for component in self._formula_components(str(entry.get("formula") or "")):
+                if component in query:
+                    amount_fields.append(self._display_field(component, "amount"))
+            aliases = [term, *self._string_items(entry.get("synonyms") or [])]
+            matched_aliases = [alias for alias in aliases if alias and alias in query]
+            if matched_aliases:
+                if any(self._looks_like_percent_label(alias) for alias in matched_aliases):
+                    percent_label = next(alias for alias in matched_aliases if self._looks_like_percent_label(alias))
+                    percent_fields.append(self._display_field(percent_label, "percent"))
+                if term:
+                    value_type = "percent" if self._looks_like_percent_label(term) else "amount"
+                    (percent_fields if value_type == "percent" else amount_fields).append(
+                        self._display_field(term, value_type)
+                    )
+                    if value_type == "percent":
+                        for denominator in self._ratio_denominator_components(str(entry.get("formula") or "")):
+                            ratio_dependency_fields.append(self._display_field(denominator, "amount"))
+        return self._unique_display_fields([*fields, *ratio_dependency_fields, *amount_fields, *percent_fields])
+
+    def _ratio_denominator_components(self, formula: str) -> list[str]:
+        text = str(formula or "")
+        if "/" not in text:
+            return []
+        denominator = text.split("/", 1)[1]
+        denominator = denominator.split("*", 1)[0].split("%", 1)[0].split("；", 1)[0].split(";", 1)[0]
+        return [
+            item
+            for item in self._formula_components(denominator)
+            if item
+        ]
+
+    def _formula_components(self, formula: str) -> list[str]:
+        text = str(formula or "")
+        text = text.split("；", 1)[0].split(";", 1)[0].split("。", 1)[0]
+        for symbol in ("(", ")", "（", "）", "+", "-", "*", "/", "=", ">", "<", "%", "，", "；", ";", ","):
+            text = text.replace(symbol, " ")
+        return [
+            item.strip()
+            for item in text.split()
+            if item.strip() and not item.strip().isdigit()
+        ]
+
+    def _looks_like_percent_label(self, label: str) -> bool:
+        text = str(label or "").lower()
+        return bool("率" in text or "ratio" in text or "rate" in text or "percent" in text or "%" in text)
+
+    def _display_field(self, label: str, value_type: str) -> JsonDict:
+        clean_label = str(label or "").strip()
+        return {
+            "role": self._normalize_schema_token(clean_label) or clean_label,
+            "label": clean_label,
+            "column": clean_label,
+            "type": value_type,
+        }
+
+    def _unique_display_fields(self, fields: list[JsonDict]) -> list[JsonDict]:
+        result: list[JsonDict] = []
+        seen: set[str] = set()
+        for field in fields:
+            column = str(field.get("column") or "").strip()
+            if not column or column in seen:
+                continue
+            seen.add(column)
+            result.append(field)
+        return result
+
     def _business_evidence_entries(self, evidence: list[str]) -> list[JsonDict]:
         entries: list[JsonDict] = []
         for item in evidence:
@@ -646,6 +1024,8 @@ class FinanceRelationAnalysisSkill:
                     continue
                 if key in {"术语", "term"}:
                     entry["term"] = value
+                elif key in {"公式", "formula", "定义", "definition"}:
+                    entry["formula"] = value
                 elif key in {"同义词", "synonyms"}:
                     entry["synonyms"] = self._split_terms(value)
                 elif key in {"关联表", "related_tables", "tables"}:
@@ -674,7 +1054,14 @@ class FinanceRelationAnalysisSkill:
     def _split_terms(self, value: str) -> list[str]:
         return [
             term.strip()
-            for term in str(value or "").replace("，", ",").replace("；", ",").replace(";", ",").split(",")
+            for term in (
+                str(value or "")
+                .replace("，", ",")
+                .replace("；", ",")
+                .replace(";", ",")
+                .replace("、", ",")
+                .split(",")
+            )
             if term.strip()
         ]
 
@@ -777,17 +1164,38 @@ class FinanceRelationAnalysisSkill:
         best_component = max(components, key=component_key)
         return [table for table in selected_tables if table in best_component] or selected_tables
 
-    def _business_entry_query_match_score(self, entry: JsonDict, query: str) -> int:
+    def _business_entry_query_match_score(
+        self,
+        entry: JsonDict,
+        query: str,
+        *,
+        ignored_labels: list[str] | None = None,
+    ) -> int:
+        ignored = {
+            self._normalize_schema_token(label)
+            for label in self._string_items(ignored_labels or [])
+            if self._normalize_schema_token(label)
+        }
         aliases = [
             str(entry.get("term") or "").strip(),
             *self._string_items(entry.get("synonyms") or []),
         ]
         score = 0
         for alias in aliases:
+            alias_norm = self._normalize_schema_token(alias)
+            if alias_norm in ignored:
+                continue
             if alias and alias in query:
                 score += max(1, len(alias))
             elif alias and query in alias:
                 score += max(1, len(query))
+            else:
+                overlap_score, _label = self._best_substring_label_match(
+                    self._normalize_schema_token(query),
+                    alias_norm,
+                )
+                if overlap_score and _label not in ignored:
+                    score += overlap_score
         return score
 
     def _subject_groups_from_components(
@@ -826,6 +1234,7 @@ class FinanceRelationAnalysisSkill:
         relationships: list[dict[str, Any]],
         *,
         requested_merge_keys: list[str],
+        requested_grain: Any = "",
     ) -> list[str]:
         validated = [
             key
@@ -850,7 +1259,55 @@ class FinanceRelationAnalysisSkill:
             for column, source_tables in candidate_counts.items()
             if column and len(source_tables) > 1
         ]
-        return self._order_merge_keys_by_relationship_grain(candidates, relationships)[:3]
+        ordered = self._order_merge_keys_by_relationship_grain(candidates, relationships)
+        grain_filtered = self._filter_merge_keys_by_requested_grain(
+            ordered,
+            relationships,
+            requested_grain=requested_grain,
+        )
+        return (grain_filtered or ordered)[:3]
+
+    def _filter_merge_keys_by_requested_grain(
+        self,
+        merge_keys: list[str],
+        relationships: list[dict[str, Any]],
+        *,
+        requested_grain: Any = "",
+    ) -> list[str]:
+        grain = self._normalize_grain_token(str(requested_grain or ""))
+        if not grain:
+            return []
+        return [
+            key
+            for key in merge_keys
+            if self._merge_key_matches_requested_grain(key, grain, relationships)
+        ]
+
+    def _merge_key_matches_requested_grain(
+        self,
+        merge_key: str,
+        normalized_grain: str,
+        relationships: list[dict[str, Any]],
+    ) -> bool:
+        candidates = {self._merge_key_base(merge_key)}
+        for rel in relationships:
+            if str(rel.get("from_column") or "").strip() == merge_key and self._is_dimension_relationship(rel):
+                candidates.add(self._table_base(str(rel.get("to_table") or "").strip()))
+        normalized_candidates = {self._normalize_grain_token(candidate) for candidate in candidates}
+        return any(
+            candidate == normalized_grain
+            or (len(candidate) >= 4 and candidate in normalized_grain)
+            or (len(normalized_grain) >= 4 and normalized_grain in candidate)
+            for candidate in normalized_candidates
+            if candidate
+        )
+
+    def _normalize_grain_token(self, value: str) -> str:
+        token = str(value or "").strip().lower()
+        for suffix in ("维度", "grain", "_id", "_code"):
+            if token.endswith(suffix):
+                token = token[: -len(suffix)]
+        return "".join(ch for ch in token if ch.isalnum())
 
     def _is_valid_requested_merge_key(self, key: str, relationships: list[dict[str, Any]]) -> bool:
         if key == "period":

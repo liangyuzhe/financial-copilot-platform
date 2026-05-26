@@ -791,15 +791,20 @@ def recall_business_knowledge(query: str, top_k: int = 5, callbacks=None) -> lis
     else:
         fused = es_docs
 
-    # 质量过滤：必须包含公式/术语
+    # 质量过滤：必须包含公式/术语。MySQL 中的精确术语/同义词命中是治理资产，
+    # 不应因为向量/ES 已经占满 topK 而被挤掉。
     filtered = _filter_has_business_term(fused)
-    if len(filtered) < top_k:
-        existing_ids = {d.metadata.get("doc_id", "") for d in filtered}
-        lexical_docs = [
-            d for d in _lexical_business_knowledge_search(query, top_k, callbacks=callbacks)
-            if d.metadata.get("doc_id", "") not in existing_ids
-        ]
-        filtered.extend(lexical_docs[: top_k - len(filtered)])
+    lexical_docs = _lexical_business_knowledge_search(query, top_k, callbacks=callbacks)
+    if lexical_docs:
+        merged: list[Document] = []
+        seen_ids: set[str] = set()
+        for doc in [*lexical_docs, *filtered]:
+            doc_id = str(doc.metadata.get("doc_id") or doc.page_content)
+            if doc_id in seen_ids:
+                continue
+            seen_ids.add(doc_id)
+            merged.append(doc)
+        filtered = merged
 
     logger.info(
         "Business knowledge recall: vector=%d, es=%d, fused=%d, filtered=%d",

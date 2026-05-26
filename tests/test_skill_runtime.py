@@ -206,15 +206,19 @@ async def test_skill_runtime_invokes_child_tools_and_returns_compact_observation
     assert result.analysis_plan["mode"] == "analysis_plan"
     assert result.analysis_plan["execution_mode"] == "plan_execute"
     assert any(step["type"] == "python_merge" for step in result.analysis_plan["steps"])
-    assert [trace["tool_name"] for trace in context.tool_trace] == [
+    trace_names = [trace["tool_name"] for trace in context.tool_trace]
+    assert trace_names[:2] == [
         "current_time.now",
         "business_knowledge.search",
+    ]
+    assert trace_names[-5:] == [
         "schema.select_candidates",
         "schema.related_tables",
         "semantic_model.search",
         "plan.assess_feasibility",
         "analysis_plan.submit",
     ]
+    assert trace_names.count("business_knowledge.search") > 1
     assert observation["skill_name"] == "finance_relation_analysis_skill"
     assert "tool_trace" not in observation
     assert len(str(observation)) < 2000
@@ -251,7 +255,7 @@ async def test_skill_runtime_span_metadata_includes_visible_functions():
     assert start[3]["real_call"] is True
     assert start[3]["visible_functions"] == ["finance_relation_analysis"]
     assert "analysis_plan.submit" in start[3]["allowed_tools"]
-    assert ast.literal_eval(spans[-1][1]["output"])["child_tool_count"] == 7
+    assert ast.literal_eval(spans[-1][1]["output"])["child_tool_count"] == len(context.tool_trace)
 
 
 @pytest.mark.asyncio
@@ -281,7 +285,7 @@ async def test_finance_relation_skill_keeps_loss_query_focused_on_profit_loss():
 
 
 @pytest.mark.asyncio
-async def test_finance_relation_skill_routes_budget_expense_analysis_to_plan_execute():
+async def test_finance_relation_skill_routes_multi_subject_analysis_to_plan_execute():
     from agents.runtime.skill_runtime import SkillRuntime
     from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
 
@@ -385,6 +389,161 @@ async def test_finance_relation_skill_does_not_override_feasibility_with_keyword
     assert result.status == "plan_ready"
     assert result.execution_mode == "single_sql"
     assert result.analysis_plan["execution_mode"] == "single_sql"
+
+
+@pytest.mark.asyncio
+async def test_finance_relation_skill_recalls_formula_dependency_terms_for_sql_contract():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    class FormulaDependencyContext:
+        query = "2026年按部门分析盈利率，亏损，成本"
+
+        def __init__(self):
+            self.calls = []
+
+        async def invoke_tool(self, tool_name, payload):
+            self.calls.append((tool_name, payload))
+            if tool_name == "current_time.now":
+                return SimpleNamespace(ok=True, output={}, error="")
+            if tool_name == "business_knowledge.search":
+                query = str(payload.get("query") or "")
+                if query == "收入":
+                    return SimpleNamespace(
+                        ok=True,
+                        output={
+                            "results": [
+                                {
+                                    "content": (
+                                        "术语: 收入\n"
+                                        "公式: 主营业务收入；通常取损益类收入科目的贷方发生额，"
+                                        "例如 t_account.account_code='6001'\n"
+                                        "关联表: t_journal_entry,t_journal_item,t_account,t_cost_center"
+                                    )
+                                }
+                            ]
+                        },
+                        error="",
+                    )
+                return SimpleNamespace(
+                    ok=True,
+                    output={
+                        "results": [
+                            {
+                                "content": (
+                                    "术语: 盈利率\n"
+                                    "公式: 净利润 / 收入 * 100\n"
+                                    "同义词: 净利率,利润率\n"
+                                    "关联表: t_journal_entry,t_journal_item,t_account,t_cost_center"
+                                )
+                            },
+                            {
+                                "content": (
+                                    "术语: 成本\n"
+                                    "公式: 主营业务成本；通常取损益类成本科目的借方发生额，例如 t_account.account_code='6401'\n"
+                                    "关联表: t_journal_entry,t_journal_item,t_account,t_cost_center"
+                                )
+                            },
+                            {
+                                "content": (
+                                    "术语: 净利润\n"
+                                    "公式: 收入 - 成本 - 费用\n"
+                                    "同义词: 盈利,亏损\n"
+                                    "关联表: t_journal_entry,t_journal_item,t_account,t_expense_claim"
+                                )
+                            },
+                        ]
+                    },
+                    error="",
+                )
+            if tool_name == "schema.select_candidates":
+                return SimpleNamespace(
+                    ok=True,
+                    output={
+                        "selected_tables": [
+                            "t_journal_entry",
+                            "t_journal_item",
+                            "t_account",
+                            "t_cost_center",
+                        ],
+                        "recall_context": {
+                            "matched_terms": ["盈利率", "成本", "净利润"],
+                            "business_related_tables": [
+                                "t_journal_entry",
+                                "t_journal_item",
+                                "t_account",
+                                "t_cost_center",
+                            ],
+                        },
+                    },
+                    error="",
+                )
+            if tool_name == "schema.related_tables":
+                return SimpleNamespace(
+                    ok=True,
+                    output={
+                        "relationships": [
+                            {
+                                "from_table": "t_journal_item",
+                                "from_column": "entry_id",
+                                "to_table": "t_journal_entry",
+                                "to_column": "id",
+                            },
+                            {
+                                "from_table": "t_journal_item",
+                                "from_column": "account_code",
+                                "to_table": "t_account",
+                                "to_column": "account_code",
+                            },
+                            {
+                                "from_table": "t_journal_item",
+                                "from_column": "cost_center_id",
+                                "to_table": "t_cost_center",
+                                "to_column": "id",
+                            },
+                        ]
+                    },
+                    error="",
+                )
+            if tool_name == "semantic_model.search":
+                return SimpleNamespace(
+                    ok=True,
+                    output={
+                        "semantic_model": {
+                            "t_journal_item": {
+                                "cost_center_id": {"business_name": "成本中心ID", "synonyms": "部门"},
+                            },
+                            "t_cost_center": {
+                                "id": {"business_name": "成本中心ID"},
+                                "center_name": {"business_name": "部门"},
+                            },
+                        }
+                    },
+                    error="",
+                )
+            if tool_name == "plan.assess_feasibility":
+                return SimpleNamespace(
+                    ok=True,
+                    output={"feasibility_decision": {"execution_mode": "plan_execute"}},
+                    error="",
+                )
+            if tool_name == "analysis_plan.submit":
+                return SimpleNamespace(ok=True, output={"plan": payload["plan"]}, error="")
+            raise AssertionError(f"Unexpected tool call: {tool_name}")
+
+    result = await FinanceRelationAnalysisSkill().run(
+        {
+            "query": FormulaDependencyContext.query,
+            "grain": "部门",
+            "merge_keys": ["cost_center_id"],
+        },
+        FormulaDependencyContext(),
+    )
+
+    evidence_text = "\n".join(result.analysis_plan["evidence"])
+    first_step_columns = [field["column"] for field in result.analysis_plan["steps"][0]["output_schema"]]
+
+    assert "account_code='6001'" in evidence_text
+    assert first_step_columns == ["部门", "收入", "成本", "净利润", "盈利率"]
 
 
 def test_finance_relation_skill_merges_subject_groups_by_relationship_expansion():
@@ -492,7 +651,246 @@ def test_finance_relation_skill_plan_execute_keeps_requested_department_grain():
     assert all("parent_id" not in step["merge_keys"] for step in sql_steps)
     assert "t_cost_center" in sql_steps[0]["tables"]
     assert "t_department" in sql_steps[0]["tables"]
-    assert plan["steps"][-2]["goal"] == "按部门维度合并各指标组结果并计算对比指标"
+    assert all("公共粒度" not in step["goal"] for step in plan["steps"])
+
+
+def test_finance_relation_skill_uses_requested_grain_when_merge_keys_are_omitted():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+    relationships = [
+        {
+            "from_table": "t_journal_item",
+            "from_column": "account_code",
+            "to_table": "t_account",
+            "to_column": "account_code",
+        },
+        {
+            "from_table": "t_budget",
+            "from_column": "account_code",
+            "to_table": "t_account",
+            "to_column": "account_code",
+        },
+        {
+            "from_table": "t_journal_item",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_cost_center",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+    ]
+
+    plan = skill._plan_execute_plan(
+        query="2025年按部门分析盈利率，亏损，成本",
+        selected_tables=[
+            "t_journal_entry",
+            "t_journal_item",
+            "t_account",
+            "t_budget",
+            "t_expense_claim",
+            "t_cost_center",
+            "t_department",
+        ],
+        evidence=[
+            "术语: 净利润\n公式: 收入 - 成本 - 费用\n关联表: t_journal_entry,t_journal_item,t_account,t_expense_claim",
+            "术语: 部门费用\n公式: SUM(total_amount) GROUP BY cost_center_id\n关联表: t_expense_claim,t_cost_center,t_department",
+        ],
+        feasibility_output={"feasibility_decision": {"execution_mode": "complex_plan"}},
+        recall_context={"matched_terms": ["净利润", "部门费用"]},
+        relationships=relationships,
+        requested_grain="department",
+        requested_merge_keys=[],
+    )
+
+    sql_steps = [step for step in plan["steps"] if step["type"] == "sql"]
+    assert sql_steps
+    assert all(step["merge_keys"] == ["department_id"] for step in sql_steps)
+    assert all("account_code" not in step["merge_keys"] for step in sql_steps)
+
+
+def test_finance_relation_skill_infers_grain_and_display_schema_when_payload_omits_them():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+    relationships = [
+        {
+            "from_table": "t_journal_item",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_cost_center",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+    ]
+
+    plan = skill._plan_execute_plan(
+        query="2025年按部门分析盈利率，亏损，成本",
+        selected_tables=[
+            "t_journal_entry",
+            "t_journal_item",
+            "t_account",
+            "t_expense_claim",
+            "t_cost_center",
+            "t_department",
+        ],
+        evidence=[
+            "术语: 净利润\n公式: 收入 - 成本 - 费用\n同义词: 利润,盈利,亏损,成本,收入\n关联表: t_journal_entry,t_journal_item,t_account",
+            "术语: 盈利率\n公式: 净利润 / 收入\n同义词: 净利率,利润率\n关联表: t_journal_entry,t_journal_item,t_account",
+            "术语: 部门费用\n公式: SUM(total_amount) GROUP BY cost_center_id\n同义词: 报销费用,费用合计\n关联表: t_expense_claim,t_cost_center,t_department",
+        ],
+        feasibility_output={"feasibility_decision": {"execution_mode": "complex_plan"}},
+        recall_context={"matched_terms": ["净利润", "盈利率", "部门费用"]},
+        relationships=relationships,
+        requested_grain="",
+        requested_merge_keys=[],
+        display_schema=[],
+        semantic_model={
+            "t_cost_center": {
+                "department_id": {"business_name": "关联部门ID"},
+                "cost_center_id": {"business_name": "成本中心ID", "synonyms": "部门"},
+            },
+            "t_department": {
+                "id": {"business_name": "部门ID"},
+                "name": {"business_name": "部门名称"},
+            },
+        },
+    )
+
+    sql_steps = [step for step in plan["steps"] if step["type"] == "sql"]
+    first_columns = [field["column"] for field in sql_steps[0]["output_schema"]]
+
+    assert all("部门维度" in step["goal"] for step in sql_steps)
+    assert all(step["merge_keys"] == ["department_id"] for step in sql_steps)
+    assert [field["label"] for field in plan["display_schema"]] == ["部门", "收入", "成本", "净利润", "盈利率"]
+    assert first_columns == ["部门", "收入", "成本", "净利润", "盈利率"]
+    assert all("部门费用" not in step["goal"] for step in sql_steps)
+
+
+def test_finance_relation_step_output_schema_uses_formula_components_not_synonym_hacks():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+
+    fields = [
+        {"role": "department", "label": "部门", "column": "部门", "type": "dimension"},
+        {"role": "revenue", "label": "收入", "column": "收入", "type": "amount"},
+        {"role": "cost", "label": "成本", "column": "成本", "type": "amount"},
+        {"role": "netprofit", "label": "净利润", "column": "净利润", "type": "amount"},
+        {"role": "profitability", "label": "盈利率", "column": "盈利率", "type": "percent"},
+    ]
+
+    output_schema = skill._step_output_schema(
+        fields,
+        group_terms=["净利润", "盈利率"],
+        group_tables=["t_journal_entry", "t_journal_item", "t_account", "t_cost_center"],
+        evidence=[
+            "术语: 净利润\n公式: 收入 - 成本 - 费用\n同义词: 盈利,亏损\n关联表: t_journal_entry,t_journal_item,t_account",
+            "术语: 盈利率\n公式: 净利润 / 收入 * 100\n同义词: 净利率,利润率\n关联表: t_journal_entry,t_journal_item,t_account",
+        ],
+    )
+
+    assert [field["column"] for field in output_schema] == ["部门", "收入", "成本", "净利润", "盈利率"]
+
+
+def test_finance_relation_skill_assigns_step_output_schema_from_evidence_terms():
+    from agents.runtime.skills.finance_relation_analysis import FinanceRelationAnalysisSkill
+
+    skill = FinanceRelationAnalysisSkill()
+    relationships = [
+        {
+            "from_table": "t_journal_item",
+            "from_column": "account_code",
+            "to_table": "t_account",
+            "to_column": "account_code",
+        },
+        {
+            "from_table": "t_journal_item",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_expense_claim",
+            "from_column": "cost_center_id",
+            "to_table": "t_cost_center",
+            "to_column": "id",
+        },
+        {
+            "from_table": "t_cost_center",
+            "from_column": "department_id",
+            "to_table": "t_department",
+            "to_column": "id",
+        },
+    ]
+
+    plan = skill._plan_execute_plan(
+        query="2025年按部门分析盈利率、亏损、成本，并对比已审批报销费用",
+        selected_tables=[
+            "t_journal_entry",
+            "t_journal_item",
+            "t_account",
+            "t_expense_claim",
+            "t_cost_center",
+            "t_department",
+        ],
+        evidence=[
+            "术语: 净利润\n同义词: 利润,盈利,亏损\n关联表: t_journal_entry,t_journal_item,t_account",
+            "术语: 部门费用\n同义词: 已审批报销费用,报销费用\n关联表: t_expense_claim,t_cost_center,t_department",
+        ],
+        feasibility_output={"feasibility_decision": {"execution_mode": "complex_plan"}},
+        recall_context={"matched_terms": ["净利润", "部门费用"]},
+        relationships=relationships,
+        requested_grain="部门",
+        requested_merge_keys=["department_id"],
+        display_schema=[
+            {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+            {"role": "profit", "label": "利润", "column": "profit", "type": "amount"},
+            {"role": "profit_rate", "label": "盈利率", "column": "profit_margin", "type": "percent"},
+            {"role": "expense", "label": "已审批报销费用", "column": "approved_expense", "type": "amount"},
+        ],
+    )
+
+    sql_steps = [step for step in plan["steps"] if step["type"] == "sql"]
+    expense_step = next(step for step in sql_steps if "部门费用" in step["goal"])
+    expense_columns = [field["column"] for field in expense_step["output_schema"]]
+
+    assert "department_name" in expense_columns
+    assert "approved_expense" in expense_columns
+    assert "profit" not in expense_columns
+    assert "profit_margin" not in expense_columns
 
 
 def test_finance_relation_skill_filters_invalid_planner_merge_keys_by_schema_graph():

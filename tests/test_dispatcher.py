@@ -551,6 +551,59 @@ async def test_dispatcher_preserves_agentscope_context_into_analysis_execution()
 
 
 @pytest.mark.asyncio
+async def test_dispatcher_loads_analysis_plan_relationships_before_execution_when_missing():
+    """SQL Harness execution should not skip relationship validation after AgentScope handoff."""
+    from agents.flow.dispatcher import execute_analysis_plan
+
+    state = {
+        "complex_plan": {
+            "mode": "complex_plan",
+            "steps": [
+                {
+                    "step": 1,
+                    "type": "sql",
+                    "goal": "按部门统计盈利率",
+                    "tables": ["t_journal_item", "t_journal_entry", "t_account", "t_department"],
+                    "depends_on": [],
+                    "merge_keys": ["department_id"],
+                }
+            ],
+        },
+        "plan_approved": True,
+        "selected_tables": ["t_journal_item", "t_journal_entry", "t_account", "t_department"],
+        "table_relationships": [],
+        "query": "2025年按部门分析盈利率",
+        "session_id": "plan-session",
+        "security_context": {"allowed_tables": ["t_journal_item", "t_journal_entry", "t_account", "t_department"]},
+    }
+
+    loaded_relationships = [
+        {"from_table": "t_journal_item", "from_column": "entry_id", "to_table": "t_journal_entry", "to_column": "id"},
+        {"from_table": "t_journal_item", "from_column": "account_code", "to_table": "t_account", "to_column": "account_code"},
+        {"from_table": "t_journal_item", "from_column": "cost_center_id", "to_table": "t_cost_center", "to_column": "id"},
+        {"from_table": "t_cost_center", "from_column": "department_id", "to_table": "t_department", "to_column": "id"},
+    ]
+
+    with (
+        patch("agents.flow.dispatcher.get_table_relationships", return_value=loaded_relationships) as mock_relationships,
+        patch("agents.flow.dispatcher.execute_complex_plan_step", new_callable=AsyncMock) as mock_execute,
+    ):
+        mock_execute.return_value = {
+            "answer": "ok",
+            "is_sql": False,
+            "error": None,
+            "plan_current_step": 1,
+            "plan_execution_results": {},
+        }
+        result = await execute_analysis_plan(state)
+
+    complex_state = mock_execute.call_args.args[0]
+    mock_relationships.assert_called_once_with(["t_journal_item", "t_journal_entry", "t_account", "t_department"])
+    assert complex_state["table_relationships"] == loaded_relationships
+    assert result["status"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_emits_sql_harness_approval_and_execution_spans():
     """AgentScope plans should show a clear SQL Harness boundary in trace."""
     from agents.flow.dispatcher import approve_analysis_plan, execute_analysis_plan

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 from agents.tool.sql_tools.metric_registry import MetricRegistry, default_metric_registry, validate_metric_shape
 from agents.tool.sql_tools.sql_shape import SqlParseError, SqlShape, extract_sql_shape
@@ -114,12 +114,16 @@ def check_sql_semantics(
     relationships: Iterable[dict] | None = None,
     evidence: Iterable[str] | None = None,
     metric_registry: MetricRegistry | None = None,
+    expected_output_columns: Iterable[str] | None = None,
+    expected_output_schema: Iterable[dict] | None = None,
 ) -> SemanticCheckReport:
     """Return a deterministic semantic consistency report for a SQL draft."""
 
     normalized_query = _normalize_text(query)
     normalized_sql = _normalize_text(sql)
-    evidence_text = "\n".join(str(item) for item in (evidence or []) if str(item).strip())
+    evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
+    evidence_text = "\n".join(evidence_items)
+    business_entries = _business_evidence_entries(evidence_items)
     sql_shape = _try_extract_shape(sql)
 
     if not normalized_sql:
@@ -158,6 +162,16 @@ def check_sql_semantics(
     intent = _detect_intent(normalized_query, evidence_text)
     registry = metric_registry or default_metric_registry()
     matched_metrics = registry.match_query(f"{normalized_query} {evidence_text}")
+    matched_metric_ids = {metric.metric_id for metric in matched_metrics}
+    output_alias_metrics = [
+        metric
+        for metric in (
+            registry.match_output_aliases(_sql_output_aliases(sql_shape))
+            if sql_shape
+            else []
+        )
+        if metric.metric_id not in matched_metric_ids
+    ]
     problems: list[SemanticCheckProblem] = []
     fix_suggestions: list[str] = []
     matched_signals: list[str] = []
@@ -210,6 +224,109 @@ def check_sql_semantics(
             )
         )
 
+    fabricated_metric_gate_problems: list[SemanticCheckProblem] = []
+    if sql_shape and output_alias_metrics:
+        for metric in output_alias_metrics:
+            metric_result = validate_metric_shape(metric, sql_shape)
+            if metric_result.passed:
+                continue
+            problem = _fabricated_metric_problem(
+                metric,
+                evidence_text=evidence_text,
+                problem_code=metric_result.problem_code,
+            )
+            fabricated_metric_gate_problems.append(problem)
+            problems.append(problem)
+            fix_suggestions.append(problem.repair_hint)
+        if fabricated_metric_gate_problems:
+            score -= 0.35
+        gate_reports.append(
+            QualityGateReport(
+                name="sql.output_metric_contract_validate",
+                passed=not fabricated_metric_gate_problems,
+                decision="continue" if not fabricated_metric_gate_problems else "revise_sql",
+                score=1.0 if not fabricated_metric_gate_problems else 0.0,
+                problems=[problem.to_dict() for problem in fabricated_metric_gate_problems],
+                extracted_facts={
+                    "output_aliases": _sql_output_aliases(sql_shape),
+                    "matched_output_metrics": [metric.metric_id for metric in output_alias_metrics],
+                },
+                repair_hints=[problem.repair_hint for problem in fabricated_metric_gate_problems],
+            )
+        )
+    else:
+        gate_reports.append(
+            QualityGateReport(
+                name="sql.output_metric_contract_validate",
+                passed=True,
+                decision="skipped",
+                extracted_facts={"reason": "no_governed_output_metric_alias"},
+            )
+        )
+
+    output_contract_problems: list[SemanticCheckProblem] = []
+    expected_schema = _normalize_expected_output_schema(expected_output_schema)
+    expected_columns = [
+        str(field.get("column") or "").strip()
+        for field in expected_schema
+        if str(field.get("column") or "").strip()
+    ]
+    expected_columns.extend([
+        str(column).strip()
+        for column in (expected_output_columns or [])
+        if str(column).strip()
+    ])
+    expected_columns = _dedupe(expected_columns)
+    if sql_shape and expected_columns:
+        output_aliases = _sql_output_aliases(sql_shape)
+        normalized_aliases = {_normalize_output_column(alias) for alias in output_aliases}
+        missing_columns = [
+            column
+            for column in expected_columns
+            if _normalize_output_column(column) not in normalized_aliases
+        ]
+        if missing_columns:
+            problem = _missing_output_schema_column_problem(missing_columns, output_aliases)
+            output_contract_problems.append(problem)
+            problems.append(problem)
+            fix_suggestions.append(problem.repair_hint)
+            score -= 0.25
+        formula_contract_problems = _output_schema_formula_contract_problems(
+            sql_shape=sql_shape,
+            expected_schema=expected_schema,
+            business_entries=business_entries,
+            evidence_text=evidence_text,
+        )
+        if formula_contract_problems:
+            output_contract_problems.extend(formula_contract_problems)
+            problems.extend(formula_contract_problems)
+            fix_suggestions.extend(problem.repair_hint for problem in formula_contract_problems)
+            score -= 0.3
+        gate_reports.append(
+            QualityGateReport(
+                name="sql.output_schema_validate",
+                passed=not output_contract_problems,
+                decision="continue" if not output_contract_problems else "revise_sql",
+                score=1.0 if not output_contract_problems else 0.0,
+                problems=[problem.to_dict() for problem in output_contract_problems],
+                extracted_facts={
+                    "expected_output_columns": expected_columns,
+                    "expected_output_schema": expected_schema,
+                    "output_aliases": output_aliases,
+                },
+                repair_hints=[problem.repair_hint for problem in output_contract_problems],
+            )
+        )
+    else:
+        gate_reports.append(
+            QualityGateReport(
+                name="sql.output_schema_validate",
+                passed=True,
+                decision="skipped",
+                extracted_facts={"reason": "missing_sql_shape_or_expected_output_columns"},
+            )
+        )
+
     if sql_shape and semantic_model:
         schema_report = validate_sql_schema(sql_shape, semantic_model)
         for schema_problem in schema_report.problems:
@@ -253,18 +370,27 @@ def check_sql_semantics(
                 metric_validation_passed = True
                 metric_gate_signals.extend(metric_result.matched_signals)
                 matched_signals.extend(metric_result.matched_signals)
+            elif metric_result and metric_result.problem_code == "REVERSED_METRIC_EXPRESSION":
+                problem = _metric_expression_problem(
+                    metric,
+                    requires_loss_amount=requires_loss_amount,
+                    evidence_text=evidence_text,
+                    problem_code=metric_result.problem_code,
+                )
+                metric_gate_problems.append(problem)
         if metric_validation_passed:
             score += 0.28
             if any(metric.metric_id == "net_profit" for metric in matched_metrics):
                 matched_signals.append("profit_loss_formula")
         else:
-            problem = _metric_expression_problem(
+            problem = metric_gate_problems[0] if metric_gate_problems else _metric_expression_problem(
                 matched_metrics[0],
                 requires_loss_amount=requires_loss_amount,
                 evidence_text=evidence_text,
             )
             problems.append(problem)
-            metric_gate_problems.append(problem)
+            if problem not in metric_gate_problems:
+                metric_gate_problems.append(problem)
             fix_suggestions.append(problem.repair_hint)
             score -= 0.28
 
@@ -511,8 +637,18 @@ def _shape_extracted_facts(shape: SqlShape) -> dict:
                 "function": aggregation.function,
                 "sql": aggregation.sql,
                 "column_refs": list(aggregation.column_refs),
+                "alias": aggregation.alias,
             }
             for aggregation in shape.aggregations
+        ],
+        "select_items": [
+            {
+                "sql": item.sql,
+                "alias": item.alias,
+                "column_refs": list(item.column_refs),
+                "is_constant": item.is_constant,
+            }
+            for item in shape.select_items
         ],
         "case_expressions": list(shape.case_expressions),
         "group_by": list(shape.group_by),
@@ -522,7 +658,412 @@ def _shape_extracted_facts(shape: SqlShape) -> dict:
     }
 
 
-def _metric_expression_problem(metric, *, requires_loss_amount: bool, evidence_text: str) -> SemanticCheckProblem:
+def _sql_output_aliases(shape: SqlShape | None) -> list[str]:
+    if not shape:
+        return []
+    aliases: list[str] = []
+    for item in shape.select_items:
+        alias = str(getattr(item, "alias", "") or "").strip()
+        if alias and alias not in aliases:
+            aliases.append(alias)
+    for aggregation in shape.aggregations:
+        alias = str(getattr(aggregation, "alias", "") or "").strip()
+        if alias and alias not in aliases:
+            aliases.append(alias)
+    return aliases
+
+
+def _normalize_output_column(value: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z\u4e00-\u9fff]+", "", str(value or "").lower())
+
+
+def _normalize_expected_output_schema(value: Iterable[dict] | None) -> list[dict]:
+    fields: list[dict] = []
+    for item in value or []:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        label = str(item.get("label") or "").strip()
+        column = str(item.get("column") or "").strip()
+        value_type = str(item.get("type") or "").strip().lower()
+        if not (role and label and column and value_type):
+            continue
+        fields.append({"role": role, "label": label, "column": column, "type": value_type})
+    return fields
+
+
+def _business_evidence_entries(evidence: Iterable[str]) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for item in evidence:
+        entry: dict[str, Any] = {"term": "", "formula": "", "synonyms": [], "related_tables": []}
+        for raw_line in str(item or "").splitlines():
+            key, value = _split_evidence_line(raw_line)
+            if not key:
+                continue
+            if key in {"术语", "term"}:
+                entry["term"] = value
+            elif key in {"公式", "formula", "定义", "definition"}:
+                entry["formula"] = value
+            elif key in {"同义词", "synonyms"}:
+                entry["synonyms"] = _split_terms(value)
+            elif key in {"关联表", "related_tables", "tables"}:
+                entry["related_tables"] = _split_terms(value)
+        if entry.get("term"):
+            entries.append(entry)
+    return entries
+
+
+def _split_evidence_line(line: str) -> tuple[str, str]:
+    text = str(line or "").strip()
+    for sep in (":", "："):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            return left.strip().lower(), right.strip()
+    return "", ""
+
+
+def _split_terms(value: str) -> list[str]:
+    return [
+        term.strip()
+        for term in (
+            str(value or "")
+            .replace("，", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+            .replace("、", ",")
+            .split(",")
+        )
+        if term.strip()
+    ]
+
+
+def _output_schema_formula_contract_problems(
+    *,
+    sql_shape: SqlShape,
+    expected_schema: list[dict],
+    business_entries: list[dict[str, Any]],
+    evidence_text: str,
+) -> list[SemanticCheckProblem]:
+    problems: list[SemanticCheckProblem] = []
+    for field in expected_schema:
+        if str(field.get("type") or "").strip().lower() not in {"percent", "ratio", "rate"}:
+            continue
+        column = str(field.get("column") or "").strip()
+        label = str(field.get("label") or "").strip()
+        entry = _business_entry_for_output_field(field, business_entries)
+        denominator_terms = _ratio_denominator_terms(str(entry.get("formula") or "")) if entry else []
+        if not denominator_terms:
+            continue
+        select_item = _select_item_for_alias(sql_shape, column)
+        if select_item is None:
+            continue
+        denominator_sql = _ratio_denominator_sql(select_item.sql)
+        if not denominator_sql:
+            continue
+        if not (
+            _denominator_matches_any_term(denominator_sql, denominator_terms, business_entries)
+            or _denominator_matches_output_alias(denominator_sql, denominator_terms, business_entries, sql_shape)
+        ):
+            expected = "、".join(denominator_terms)
+            problems.append(
+                SemanticCheckProblem(
+                    code="INVALID_RATIO_DENOMINATOR",
+                    title=f"比例指标分母不符合业务公式: {label or column}",
+                    severity="high",
+                    message=f"SQL 输出比例列 {label or column}，但分母没有对齐业务知识公式中的 {expected}。",
+                    why="比例类指标不能只凭输出别名通过校验，分子和分母都必须来自业务知识声明的口径。",
+                    expected=f"{label or column} 的分母应按业务公式使用 {expected} 口径。",
+                    actual=f"当前分母表达式：{denominator_sql}",
+                    evidence=evidence_text,
+                    repair_hint=f"按业务知识公式重写 {label or column}：先计算分子，再用 {expected} 作为分母；不要使用无关科目或空分母过滤。",
+                )
+            )
+    for field in expected_schema:
+        if str(field.get("type") or "").strip().lower() not in {"amount", "number", "currency"}:
+            continue
+        column = str(field.get("column") or "").strip()
+        label = str(field.get("label") or "").strip()
+        entry = _business_entry_for_output_field(field, business_entries)
+        required_literals = _formula_required_literals(str(entry.get("formula") or "")) if entry else []
+        if not required_literals:
+            continue
+        select_item = _select_item_for_alias(sql_shape, column)
+        if select_item is None:
+            continue
+        expression_norm = _normalize_output_column(select_item.sql)
+        if not any(_normalize_output_column(literal) in expression_norm for literal in required_literals):
+            expected = "、".join(required_literals)
+            problems.append(
+                SemanticCheckProblem(
+                    code="MISSING_FORMULA_FILTER",
+                    title=f"输出指标缺少业务公式过滤条件: {label or column}",
+                    severity="high",
+                    message=f"SQL 输出金额列 {label or column}，但表达式没有使用业务知识公式中的关键过滤值：{expected}。",
+                    why="金额类指标不能只凭列名通过校验；当业务知识声明了明确过滤条件时，SQL 必须把该口径落到对应 SELECT 表达式里。",
+                    expected=f"{label or column} 的 SELECT 表达式应包含业务公式过滤值：{expected}。",
+                    actual=f"当前表达式：{select_item.sql}",
+                    evidence=evidence_text,
+                    repair_hint=f"按业务知识公式重写 {label or column}，在该列表达式中使用 {expected} 对应的过滤口径。",
+                )
+            )
+    return problems
+
+
+def _business_entry_for_output_field(field: dict, business_entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    field_terms = [
+        str(field.get("label") or ""),
+        str(field.get("column") or ""),
+        str(field.get("role") or ""),
+    ]
+    normalized_field_terms = {_normalize_output_column(term) for term in field_terms if str(term).strip()}
+    best: tuple[int, dict[str, Any]] | None = None
+    for entry in business_entries:
+        aliases = [
+            str(entry.get("term") or ""),
+            *[str(item) for item in entry.get("synonyms", []) or []],
+        ]
+        score = 0
+        for alias in aliases:
+            alias_norm = _normalize_output_column(alias)
+            if not alias_norm:
+                continue
+            if alias_norm in normalized_field_terms:
+                score = max(score, 100 + len(alias_norm))
+                continue
+            for field_norm in normalized_field_terms:
+                if alias_norm in field_norm or field_norm in alias_norm:
+                    score = max(score, min(len(alias_norm), len(field_norm)))
+        if score and (best is None or score > best[0]):
+            best = (score, entry)
+    return best[1] if best else None
+
+
+def _ratio_denominator_terms(formula: str) -> list[str]:
+    text = str(formula or "")
+    if "/" not in text:
+        return []
+    denominator = text.split("/", 1)[1]
+    denominator = re.split(r"[*%×xX；;，,。)\n]", denominator, maxsplit=1)[0]
+    return [
+        token
+        for token in _formula_tokens(denominator)
+        if not _is_formula_noise_token(token)
+    ]
+
+
+def _formula_tokens(value: str) -> list[str]:
+    text = str(value or "")
+    for symbol in ("(", ")", "（", "）", "+", "-", "*", "/", "=", ">", "<", "%", "，", "；", ";", ","):
+        text = text.replace(symbol, " ")
+    return [item.strip() for item in text.split() if item.strip()]
+
+
+def _is_formula_noise_token(token: str) -> bool:
+    normalized = _normalize_output_column(token)
+    return not normalized or normalized.isdigit()
+
+
+def _select_item_for_alias(sql_shape: SqlShape, alias: str):
+    target = _normalize_output_column(alias)
+    for item in sql_shape.select_items:
+        if _normalize_output_column(getattr(item, "alias", "") or "") == target:
+            return item
+    return None
+
+
+def _formula_required_literals(formula: str) -> list[str]:
+    values: list[str] = []
+    for match in re.finditer(r"'([^']+)'|\"([^\"]+)\"", str(formula or "")):
+        value = (match.group(1) or match.group(2) or "").strip()
+        if value:
+            values.append(value)
+    return _dedupe(values)
+
+
+def _ratio_denominator_sql(select_sql: str) -> str:
+    text = str(select_sql or "")
+    slash_index = _operator_index(text, "/")
+    if slash_index < 0:
+        return ""
+    after = text[slash_index + 1 :]
+    end = _ratio_denominator_end(after)
+    return after[:end].strip()
+
+
+def _operator_index(text: str, operator: str) -> int:
+    quote = ""
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char == operator:
+            return index
+    return -1
+
+
+def _ratio_denominator_end(text: str) -> int:
+    quote = ""
+    depth = 0
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"', "`"}:
+            quote = char
+            continue
+        if char == "(":
+            depth += 1
+            continue
+        if char == ")":
+            if depth == 0:
+                return index
+            depth -= 1
+            continue
+        if depth == 0 and char in {"*", "+", "-"}:
+            return index
+    return len(text)
+
+
+def _denominator_matches_any_term(
+    denominator_sql: str,
+    denominator_terms: list[str],
+    business_entries: list[dict[str, Any]],
+) -> bool:
+    denominator_norm = _normalize_output_column(denominator_sql)
+    if not denominator_norm:
+        return False
+    for term in denominator_terms:
+        candidates = _term_candidate_tokens(term, business_entries)
+        if any(candidate and candidate in denominator_norm for candidate in candidates):
+            return True
+    return False
+
+
+def _denominator_matches_output_alias(
+    denominator_sql: str,
+    denominator_terms: list[str],
+    business_entries: list[dict[str, Any]],
+    sql_shape: SqlShape,
+) -> bool:
+    denominator_norm = _normalize_sql_expression(denominator_sql)
+    if not denominator_norm:
+        return False
+    accepted_aliases = {
+        candidate
+        for term in denominator_terms
+        for candidate in _term_candidate_tokens(term, business_entries)
+        if candidate
+    }
+    for item in sql_shape.select_items:
+        alias_norm = _normalize_output_column(getattr(item, "alias", "") or "")
+        if alias_norm not in accepted_aliases:
+            continue
+        expression_norm = _normalize_sql_expression(_select_expression_without_alias(item.sql))
+        if expression_norm and expression_norm == denominator_norm:
+            return True
+    return False
+
+
+def _select_expression_without_alias(sql: str) -> str:
+    return re.split(r"\s+AS\s+", str(sql or ""), maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+
+def _normalize_sql_expression(sql: str) -> str:
+    return re.sub(r"[\s`]+", "", str(sql or "").lower())
+
+
+def _term_candidate_tokens(term: str, business_entries: list[dict[str, Any]]) -> list[str]:
+    term_norm = _normalize_output_column(term)
+    candidates = [term_norm] if term_norm else []
+    for entry in business_entries:
+        aliases = [
+            str(entry.get("term") or ""),
+            *[str(item) for item in entry.get("synonyms", []) or []],
+        ]
+        if not any(_normalize_output_column(alias) == term_norm for alias in aliases):
+            continue
+        alias_norms = [_normalize_output_column(alias) for alias in aliases if _normalize_output_column(alias)]
+        for token in _formula_tokens(str(entry.get("formula") or "")):
+            token_norm = _normalize_output_column(token)
+            if not token_norm:
+                continue
+            if any(alias_norm in token_norm or token_norm in alias_norm for alias_norm in alias_norms):
+                candidates.append(token_norm)
+                continue
+            if any(ch.isdigit() for ch in token_norm):
+                candidates.append(token_norm)
+    return _dedupe([candidate for candidate in candidates if candidate])
+
+
+def _missing_output_schema_column_problem(
+    missing_columns: list[str],
+    output_aliases: list[str],
+) -> SemanticCheckProblem:
+    missing = "、".join(missing_columns)
+    actual = "、".join(output_aliases) if output_aliases else "无输出别名"
+    return SemanticCheckProblem(
+        code="MISSING_OUTPUT_SCHEMA_COLUMN",
+        title="SQL 缺少计划声明的输出列",
+        severity="high",
+        message=f"SQL 没有输出当前步骤 output_schema 要求的列：{missing}。",
+        why="复杂计划的每个 SQL step 必须履行自己的输出契约，否则最终展示会把缺列渲染成无数据，掩盖 SQL 没有计算该指标。",
+        expected=f"SELECT 中应使用 output_schema.column 作为稳定别名输出：{missing}。",
+        actual=f"当前 SQL 输出别名：{actual}。",
+        repair_hint=f"按当前步骤 output_schema 补齐 SELECT 别名：{missing}；无法计算的指标应从该步骤 output_schema 中移除。",
+    )
+
+
+def _fabricated_metric_problem(
+    metric,
+    *,
+    evidence_text: str,
+    problem_code: str = "MISSING_METRIC_EXPRESSION",
+) -> SemanticCheckProblem:
+    if problem_code == "REVERSED_METRIC_EXPRESSION":
+        return _metric_expression_problem(
+            metric,
+            requires_loss_amount=False,
+            evidence_text=evidence_text,
+            problem_code=problem_code,
+        )
+    return SemanticCheckProblem(
+        code="FABRICATED_BUSINESS_METRIC",
+        title=f"输出指标未满足治理公式: {metric.metric_id}",
+        severity="high",
+        message="SQL 输出了受治理指标别名，但表达式没有满足该指标定义。",
+        why="SQL step 不能用常量、单边金额或其他业务表金额伪造受治理指标，否则最终展示会把无关口径当成业务结论。",
+        expected=f"输出 {metric.metric_id} 时必须按 MetricDefinition 的受治理表达式计算；否则不要输出该指标别名。",
+        actual="当前 SQL 的输出别名命中了受治理指标，但 AST 中没有匹配到对应指标表达式。",
+        evidence=evidence_text,
+        repair_hint="删除当前步骤无法计算的指标列，或补齐支撑该指标的表、字段、JOIN 和公式。",
+    )
+
+
+def _metric_expression_problem(
+    metric,
+    *,
+    requires_loss_amount: bool,
+    evidence_text: str,
+    problem_code: str = "MISSING_METRIC_EXPRESSION",
+) -> SemanticCheckProblem:
+    if problem_code == "REVERSED_METRIC_EXPRESSION":
+        return SemanticCheckProblem(
+            code="REVERSED_METRIC_EXPRESSION",
+            title=f"指标表达式方向不一致: {metric.metric_id}",
+            severity="high",
+            message="SQL 在同一个指标聚合中同时出现正向差额和反向差额。",
+            why="方向型指标不能把 left-right 和 right-left 分支相加，否则成本或扣减项可能被算成正向贡献。",
+            expected="同一个指标聚合应保持受治理公式方向一致。",
+            actual="当前 SQL 在同一聚合表达式里混用了左右字段的反向相减。",
+            evidence=evidence_text,
+            repair_hint="不要把同一指标的左右字段反向相减后再加回；按治理公式保持统一方向，扣减项应使用负号或统一的差额表达式。",
+        )
+
     if metric.metric_id == "net_profit":
         return SemanticCheckProblem(
             code="MISSING_PROFIT_LOSS_FORMULA",

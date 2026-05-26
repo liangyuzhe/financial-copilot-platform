@@ -679,6 +679,7 @@ async def test_package_runner_prompts_with_toolkit_function_names_for_data_analy
     assert all(len(schema["function"].get("description", "")) < 180 for schema in schemas)
     assert "finance_relation_analysis" in seen["sys_prompt"]
     assert "merge_keys" in seen["sys_prompt"]
+    assert "display_schema" in seen["sys_prompt"]
     assert "business_knowledge_search" not in seen["sys_prompt"]
     assert "sql_examples_search" not in seen["sys_prompt"]
     assert "finance_relation_analysis" in seen["message_text"]
@@ -739,6 +740,7 @@ async def test_package_runner_exposes_finance_relation_skill_instead_of_primitiv
     assert len(seen["sys_prompt"]) < 900
     assert "finance_relation_analysis" in seen["sys_prompt"]
     assert "merge_keys" in seen["sys_prompt"]
+    assert "display_schema" in seen["sys_prompt"]
     assert "schema_select_candidates" not in seen["sys_prompt"]
     assert "finance_relation_analysis" in seen["message_text"]
 
@@ -1967,15 +1969,18 @@ async def test_local_runner_submits_data_analysis_plan_to_harness_without_sqlrea
 
     trace_names = [trace["tool_name"] for trace in result.tool_trace]
 
-    assert trace_names == [
+    assert trace_names[:2] == [
         "current_time.now",
         "business_knowledge.search",
+    ]
+    assert trace_names[-5:] == [
         "schema.select_candidates",
         "schema.related_tables",
         "semantic_model.search",
         "plan.assess_feasibility",
         "analysis_plan.submit",
     ]
+    assert trace_names.count("business_knowledge.search") > 1
     assert result.sql_drafts == []
     assert result.state_patch["analysis_plan"]["mode"] == "analysis_plan"
     assert result.state_patch["analysis_plan"]["execution_mode"] == "plan_execute"
@@ -2108,13 +2113,13 @@ async def test_local_runner_prefers_workflow_state_selected_tables_without_busin
         },
     )
 
-    assert result.state_patch["candidate_tables"] == ["t_journal_item", "t_budget"]
+    assert set(result.state_patch["candidate_tables"]) == {"t_journal_item", "t_budget"}
     assert "t_user_role" not in result.state_patch["candidate_tables"]
     assert result.state_patch["presentation"]["coverage"]["missing_topics"] == []
     assert "SQL Harness" in result.answer
     assert result.sql_drafts == []
     assert result.state_patch["analysis_plan"]["execution_mode"] == "single_sql"
-    assert result.state_patch["analysis_plan"]["steps"][0]["tables"] == ["t_journal_item", "t_budget"]
+    assert set(result.state_patch["analysis_plan"]["steps"][0]["tables"]) == {"t_journal_item", "t_budget"}
 
 
 @pytest.mark.asyncio

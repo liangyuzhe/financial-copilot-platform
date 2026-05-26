@@ -896,6 +896,12 @@ async def test_analysis_plan_submit_validates_structure_and_authorized_tables():
     plan = {
         "mode": "analysis_plan",
         "reason": "单 SQL 可回答订单数量",
+        "display_schema": [
+            {"role": "measure", "label": "订单数量", "column": "order_count", "type": "integer"},
+        ],
+        "evidence": [
+            "术语: 订单数量\n公式: COUNT(*)\n关联表: t_orders",
+        ],
         "steps": [
             {
                 "step": 1,
@@ -905,6 +911,9 @@ async def test_analysis_plan_submit_validates_structure_and_authorized_tables():
                 "sql": "select count(*) as order_count from t_orders",
                 "depends_on": [],
                 "merge_keys": [],
+                "output_schema": [
+                    {"role": "measure", "label": "订单数量", "column": "order_count", "type": "integer"},
+                ],
             }
         ],
         "requires_user_confirmation": True,
@@ -924,7 +933,24 @@ async def test_analysis_plan_submit_validates_structure_and_authorized_tables():
 
     assert result.ok is True
     assert result.output["plan_id"].startswith("plan-")
-    assert result.output["plan"] == plan
+    expected_plan = {
+        **plan,
+        "display_schema": [
+            {"role": "measure", "label": "订单数量", "column": "order_count", "type": "count"},
+        ],
+        "evidence": [
+            "术语: 订单数量\n公式: COUNT(*)\n关联表: t_orders",
+        ],
+        "steps": [
+            {
+                **plan["steps"][0],
+                "output_schema": [
+                    {"role": "measure", "label": "订单数量", "column": "order_count", "type": "count"},
+                ],
+            }
+        ],
+    }
+    assert result.output["plan"] == expected_plan
     assert result.output["execution_mode"] == "plan_only"
     assert result.output["requires_harness"] is True
     assert result.output["harness_steps"] == [

@@ -1316,6 +1316,11 @@ class TestComplexRoute:
                 "query": "分析收入预算关系",
                 "complex_plan": {
                     "mode": "complex_plan",
+                    "display_schema": [
+                        {"role": "period", "label": "期间", "column": "period", "type": "dimension"},
+                        {"role": "revenue", "label": "收入", "column": "revenue", "type": "amount"},
+                        {"role": "budget", "label": "预算", "column": "budget", "type": "amount"},
+                    ],
                     "steps": [
                         {"step": 1, "type": "sql", "goal": "查询收入", "tables": ["a"], "depends_on": [], "merge_keys": ["period"]},
                         {"step": 2, "type": "sql", "goal": "查询预算", "tables": ["b"], "depends_on": [], "merge_keys": ["period"]},
@@ -1333,13 +1338,13 @@ class TestComplexRoute:
 
         assert result["is_sql"] is False
         assert result["error"] is None
-        assert "关系分析结果" in result["answer"]
+        assert "分析结果" in result["answer"]
         assert result["plan_current_step"] == 3
         assert result["plan_execution_results"]["1"]["sql"] == "SELECT period, revenue FROM a"
         assert result["plan_execution_results"]["2"]["sql"] == "SELECT period, budget FROM b"
         assert result["plan_execution_results"]["3"]["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
-        assert "收入合计：100.00" in result["answer"]
-        assert "预算合计：80.00" in result["answer"]
+        assert "| 期间 | 收入 | 预算 |" in result["answer"]
+        assert "| 2025-01 | 100.00 | 80.00 |" in result["answer"]
         assert "SQL:" not in result["answer"]
 
     @pytest.mark.asyncio
@@ -2094,10 +2099,48 @@ GROUP BY period"""
         assert reason == ""
         assert rows == [{"department_id": 1, "income_amount": 100, "budget_amount": 80}]
 
-    def test_complex_execution_answer_surfaces_business_summary_for_merge_result(self):
+    def test_merge_dependency_rows_does_not_mark_nonempty_rows_unaligned_when_other_dependency_empty(self):
+        from agents.flow.sql_react import _merge_dependency_rows
+
+        step = {
+            "type": "python_merge",
+            "depends_on": [1, 2],
+            "merge_keys": ["department_id", "cost_center_id", "account_code"],
+        }
+        rows, reason = _merge_dependency_rows(step, {
+            "1": {
+                "result": (
+                    '[{"department_id":4,"department_name":"市场部",'
+                    '"cost_center_id":4,"cost_center_name":"销售部","account_code":"6001",'
+                    '"net_profit":"1316000.00"}]'
+                ),
+                "error": None,
+            },
+            "2": {"result": "[]", "error": None},
+        })
+
+        assert reason == ""
+        assert rows == [{
+            "department_id": 4,
+            "department_name": "市场部",
+            "cost_center_id": 4,
+            "cost_center_name": "销售部",
+            "account_code": "6001",
+            "net_profit": "1316000.00",
+        }]
+
+    def test_complex_execution_answer_renders_display_schema_for_merge_result(self):
         from agents.flow.sql_react import _format_complex_execution_answer
 
         plan = {
+            "display_schema": [
+                {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+                {"role": "income", "label": "收入", "column": "income_amount", "type": "amount"},
+                {"role": "cost", "label": "成本", "column": "cost_amount", "type": "amount"},
+                {"role": "expense", "label": "费用", "column": "expense_amount", "type": "amount"},
+                {"role": "budget", "label": "预算", "column": "budget_amount", "type": "amount"},
+                {"role": "collection", "label": "回款", "column": "collection_amount", "type": "amount"},
+            ],
             "steps": [
                 {"step": 1, "type": "sql", "goal": "提取实际收入成本费用"},
                 {"step": 2, "type": "sql", "goal": "提取预算"},
@@ -2115,6 +2158,7 @@ GROUP BY period"""
                 "result": [
                     {
                         "department_id": 1,
+                        "department_name": "销售部",
                         "income_amount": "100.00",
                         "cost_amount": "30.00",
                         "expense_amount": "10.00",
@@ -2125,22 +2169,20 @@ GROUP BY period"""
                         "merge_status": "未对齐",
                         "source_step": 1,
                         "income_amount": "50.00",
+                        "missing_merge_keys": "department_name",
                     },
                 ],
                 "error": None,
             },
         })
 
-        assert "关系分析结果" in answer
-        assert "收入合计：150.00" in answer
-        assert "成本合计：30.00" in answer
-        assert "费用合计：10.00" in answer
-        assert "预算合计：80.00" in answer
-        assert "回款合计：60.00" in answer
-        assert "粗略盈余：110.00" in answer
-        assert "另有 1 条记录缺少合并维度" in answer
+        assert answer.startswith("分析结果：")
+        assert "| 部门 | 收入 | 成本 | 费用 | 预算 | 回款 |" in answer
+        assert "| 销售部 | 100.00 | 30.00 | 10.00 | 80.00 | 60.00 |" in answer
+        assert "数据诊断：" in answer
+        assert "缺少字段：department_name" in answer
 
-    def test_complex_execution_answer_is_user_readable_relationship_result(self):
+    def test_complex_execution_answer_uses_generic_preview_without_display_schema(self):
         from agents.flow.sql_react import _format_complex_execution_answer
 
         plan = {
@@ -2193,20 +2235,33 @@ GROUP BY period"""
         answer = _format_complex_execution_answer(plan, execution_results)
 
         assert "关系分析结果" in answer
-        assert "实际发生合计：617000.00" in answer
-        assert "预算合计：6171131.67" in answer
-        assert "预算差异：-5554131.67" in answer
-        assert "预算执行率：10.00%" in answer
-        assert "未查询到可对齐的回款数据" in answer
+        assert "结果明细：" in answer
+        assert "actual_amount：520000.00" in answer
+        assert "budget_amount：1200000.00" in answer
+        assert "实际发生合计" not in answer
+        assert "预算合计" not in answer
+        assert "预算差异" not in answer
+        assert "预算执行率" not in answer
+        assert "未查询到可对齐的回款数据" not in answer
+        assert "department_id" not in answer
+        assert "cost_center_id" not in answer
         assert "成本合计：12.00" not in answer
         assert "SQL:" not in answer
         assert "SELECT" not in answer
         assert "合并结果预览" not in answer
 
-    def test_complex_execution_answer_renders_budget_expense_table_before_diagnostics(self):
+    def test_complex_execution_answer_renders_requested_display_schema_before_diagnostics(self):
         from agents.flow.sql_react import _format_complex_execution_answer
 
         plan = {
+            "display_schema": [
+                {"role": "year", "label": "年度", "column": "year", "type": "dimension"},
+                {"role": "department", "label": "部门", "column": "cost_center_name", "type": "dimension"},
+                {"role": "execution_rate", "label": "预算执行率", "column": "execution_rate", "type": "percent"},
+                {"role": "approved_expense", "label": "已审批报销费用", "column": "total_approved_amount", "type": "amount"},
+                {"role": "budget", "label": "预算", "column": "total_budget", "type": "amount"},
+                {"role": "approved_budget_variance", "label": "已审批报销费用与预算差异", "column": "approved_budget_variance", "type": "amount"},
+            ],
             "steps": [
                 {"step": 1, "type": "sql", "goal": "查询2025年各部门预算执行率"},
                 {"step": 2, "type": "sql", "goal": "查询2025年各部门已审批报销费用"},
@@ -2226,24 +2281,30 @@ GROUP BY period"""
                         "cost_center_id": 2,
                         "department_name": "技术部",
                         "cost_center_name": "财务部",
+                        "year": "2025",
                         "total_budget": "373754.83",
                         "total_actual": "365975.71",
                         "execution_rate": "97.92",
                         "budget_variance": "7779.12",
                         "total_approved_amount": "26238.19",
+                        "approved_budget_variance": "-347516.64",
                     },
                     {
                         "department_id": 3,
                         "cost_center_id": 3,
                         "cost_center_name": "研发部",
+                        "year": "2025",
                         "total_budget": "462095.66",
                         "total_actual": "448502.36",
                         "execution_rate": "97.06",
+                        "total_approved_amount": "0.00",
+                        "approved_budget_variance": "-462095.66",
                     },
                     {
                         "department_id": 5,
                         "cost_center_id": 5,
                         "cost_center_name": "人力资源部",
+                        "year": "2025",
                         "total_budget": "536478.20",
                         "total_actual": "444966.38",
                         "execution_rate": "82.94",
@@ -2258,21 +2319,30 @@ GROUP BY period"""
 
         answer = _format_complex_execution_answer(plan, execution_results)
 
-        assert answer.startswith("预算执行率与已审批报销费用对比：")
+        assert answer.startswith("分析结果：")
         assert "| 年度 | 部门 | 预算执行率 | 已审批报销费用 | 预算 | 已审批报销费用与预算差异 |" in answer
         assert "| 2025 | 财务部 | 97.92% | 26238.19 | 373754.83 | -347516.64 |" in answer
         assert "| 2025 | 研发部 | 97.06% | 0.00 | 462095.66 | -462095.66 |" in answer
         assert "数据诊断：" in answer
         assert answer.index("数据诊断：") > answer.index("| 年度 |")
         assert "缺少字段：department_id, cost_center_id" in answer
-        assert "建议在预算和报销费用查询结果中同时输出 department_id、cost_center_id" in answer
+        assert "建议在各步骤查询结果中同时输出 department_id、cost_center_id" in answer
         assert "merge_status" not in answer
         assert "未对齐" not in answer
 
-    def test_complex_execution_answer_renders_profitability_expense_table_without_internal_fields(self):
+    def test_complex_execution_answer_renders_metric_display_schema_without_internal_fields(self):
         from agents.flow.sql_react import _format_complex_execution_answer
 
         plan = {
+            "display_schema": [
+                {"role": "year", "label": "年度", "column": "year", "type": "dimension"},
+                {"role": "department", "label": "部门", "column": "cost_center_name", "type": "dimension"},
+                {"role": "net_profit", "label": "净利润", "column": "net_profit", "type": "amount"},
+                {"role": "profit_rate", "label": "盈利率", "column": "net_margin", "type": "percent"},
+                {"role": "loss_amount", "label": "亏损金额", "column": "loss_amount", "type": "amount"},
+                {"role": "total_expenses", "label": "费用合计", "column": "total_expenses", "type": "amount"},
+                {"role": "expense_count", "label": "费用笔数", "column": "expense_count", "type": "count"},
+            ],
             "steps": [
                 {"step": 1, "type": "sql", "goal": "统计2025年净利润、净利率、毛利率"},
                 {"step": 2, "type": "sql", "goal": "统计2025年部门费用"},
@@ -2297,18 +2367,22 @@ GROUP BY period"""
                         "cost_center_id": 2,
                         "department_name": "技术部",
                         "cost_center_name": "财务部",
+                        "year": "2025",
                         "net_profit": "-1239964.99",
                         "net_margin": "-238.454806",
                         "gross_margin": "0",
+                        "loss_amount": "1239964.99",
                         "total_expenses": "63452.18",
                         "expense_count": 3,
                     },
                     {
                         "department_id": 6,
                         "cost_center_id": 6,
+                        "year": "2025",
                         "net_profit": "893791.56",
                         "net_margin": "32.740737",
                         "gross_margin": "0",
+                        "loss_amount": "0.00",
                         "merge_status": "未对齐",
                         "source_step": 1,
                         "missing_merge_keys": "department_name, cost_center_name",
@@ -2320,9 +2394,9 @@ GROUP BY period"""
 
         answer = _format_complex_execution_answer(plan, execution_results)
 
-        assert answer.startswith("盈利能力与费用对比：")
-        assert "| 年度 | 部门 | 净利润 | 净利率 | 毛利率 | 费用合计 | 费用笔数 |" in answer
-        assert "| 2025 | 财务部 | -1239964.99 | -238.45% | 0.00% | 63452.18 | 3 |" in answer
+        assert answer.startswith("分析结果：")
+        assert "| 年度 | 部门 | 净利润 | 盈利率 | 亏损金额 | 费用合计 | 费用笔数 |" in answer
+        assert "| 2025 | 财务部 | -1239964.99 | -238.45% | 1239964.99 | 63452.18 | 3 |" in answer
         assert "数据诊断：" in answer
         assert "建议在各步骤查询结果中同时输出" in answer
         assert "department_id" not in answer
@@ -2330,6 +2404,368 @@ GROUP BY period"""
         assert "merge_status" not in answer
         assert "source_step" not in answer
         assert "未对齐" not in answer
+
+    def test_complex_execution_answer_renders_requested_profitability_loss_and_cost_metrics(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "source_query": "2025年按部门分析盈利率，亏损，成本",
+            "display_schema": [
+                {"role": "year", "label": "年度", "column": "year", "type": "dimension"},
+                {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+                {"role": "net_profit", "label": "净利润", "column": "net_profit", "type": "amount"},
+                {"role": "profit_rate", "label": "盈利率", "column": "profit_rate", "type": "percent"},
+                {"role": "loss_amount", "label": "亏损金额", "column": "loss_amount", "type": "amount"},
+                {"role": "cost", "label": "成本", "column": "cost", "type": "amount"},
+            ],
+            "steps": [
+                {"step": 1, "type": "sql", "goal": "按部门统计盈利率、亏损、成本"},
+                {"step": 2, "type": "report", "goal": "生成业务可读报告", "depends_on": [1]},
+            ],
+        }
+        execution_results = {
+            "2": {
+                "step": 2,
+                "type": "report",
+                "goal": "生成业务可读报告",
+                "answer": "报告步骤已完成本地汇总，共 3 行。",
+                "result": [
+                    {
+                        "department_id": 2,
+                        "department_name": "技术部",
+                        "account_code": "6001",
+                        "year": "2025",
+                        "income": "1000.00",
+                        "cost": "0.00",
+                        "net_profit": "1000.00",
+                        "profit_rate": "100.00",
+                        "loss_amount": "0.00",
+                    },
+                    {
+                        "department_id": 2,
+                        "department_name": "技术部",
+                        "account_code": "6401",
+                        "year": "2025",
+                        "income": "0.00",
+                        "cost": "300.00",
+                        "net_profit": "-300.00",
+                        "profit_rate": "0.00",
+                        "loss_amount": "300.00",
+                    },
+                    {
+                        "department_id": 3,
+                        "department_name": "研发部",
+                        "year": "2025",
+                        "income": "200.00",
+                        "cost": "250.00",
+                        "net_profit": "-50.00",
+                        "profit_rate": "-25.00",
+                        "loss_amount": "50.00",
+                    },
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert answer.startswith("分析结果：")
+        assert "| 年度 | 部门 | 净利润 | 盈利率 | 亏损金额 | 成本 |" in answer
+        assert "| 2025 | 技术部 | 700.00 | 无法汇总 | 300.00 | 300.00 |" in answer
+        assert "| 2025 | 研发部 | -50.00 | -25.00% | 50.00 | 250.00 |" in answer
+        assert "account_code" not in answer
+        assert "department_id" not in answer
+
+    def test_complex_execution_answer_requires_display_schema_for_business_metric_table(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "source_query": "2025年按部门分析盈利率，亏损，成本",
+            "steps": [
+                {"step": 1, "type": "sql", "goal": "按部门统计盈利率、亏损、成本"},
+                {"step": 2, "type": "report", "goal": "生成业务可读报告", "depends_on": [1]},
+            ],
+        }
+        execution_results = {
+            "2": {
+                "step": 2,
+                "type": "report",
+                "goal": "生成业务可读报告",
+                "answer": "报告步骤已完成本地汇总，共 1 行。",
+                "result": [
+                    {
+                        "department_name": "技术部",
+                        "net_profit": "-100.00",
+                        "profit_rate": "-10.00",
+                        "loss_amount": "100.00",
+                        "cost": "200.00",
+                    },
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert not answer.startswith("分析结果：")
+        assert "结果明细：" in answer
+
+    def test_complex_answer_formatter_has_no_business_specific_branches(self):
+        import inspect
+        import agents.flow.sql_react as sql_react
+
+        source = inspect.getsource(sql_react)
+
+        forbidden_tokens = [
+            "_format_budget_expense_comparison_answer",
+            "_format_profitability_expense_answer",
+            "_format_complex_business_summary",
+            "budget_expense",
+            "profitability_expense",
+        ]
+        for token in forbidden_tokens:
+            assert token not in source
+
+    def test_complex_execution_answer_normalizes_llm_display_schema_types(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "display_schema": [
+                {"role": "dimension", "label": "部门", "column": "department", "type": "string"},
+                {"role": "measure", "label": "收入", "column": "revenue", "type": "decimal"},
+                {"role": "measure", "label": "盈利率", "column": "profit_margin", "type": "percentage"},
+            ],
+            "steps": [
+                {"step": 1, "type": "report", "goal": "生成报告"},
+            ],
+        }
+        execution_results = {
+            "1": {
+                "step": 1,
+                "type": "report",
+                "goal": "生成报告",
+                "result": [
+                    {"department": "技术部", "revenue": "100.00", "profit_margin": "12.5"},
+                    {"department": "技术部", "revenue": "50.00", "profit_margin": "12.5"},
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert "| 部门 | 收入 | 盈利率 |" in answer
+        assert "| 技术部 | 150.00 | 12.50% |" in answer
+        assert answer.count("| 技术部 |") == 1
+
+    def test_complex_execution_answer_uses_readable_dimension_sibling_when_display_alias_missing(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "display_schema": [
+                {"role": "dimension", "label": "部门", "column": "department", "type": "dimension"},
+                {"role": "metric", "label": "成本", "column": "cost", "type": "amount"},
+            ],
+            "steps": [
+                {"step": 1, "type": "python_merge", "goal": "按部门合并", "merge_keys": ["department_id"]},
+            ],
+        }
+        execution_results = {
+            "1": {
+                "step": 1,
+                "type": "python_merge",
+                "goal": "按部门合并",
+                "result": [
+                    {"department_id": 1, "department_name": "总裁办", "cost": "0.00"},
+                    {"department_id": 2, "department": "技术部", "cost": "100.00"},
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert "| 总裁办 | 0.00 |" in answer
+        assert "| 技术部 | 100.00 |" in answer
+        assert "|  | 0.00 |" not in answer
+
+    def test_complex_execution_answer_renders_missing_display_schema_metrics_as_no_data(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "display_schema": [
+                {"role": "dimension", "label": "部门", "column": "department", "type": "dimension"},
+                {"role": "metric", "label": "收入", "column": "revenue", "type": "amount"},
+                {"role": "metric", "label": "成本", "column": "cost", "type": "amount"},
+                {"role": "metric", "label": "利润", "column": "profit", "type": "amount"},
+                {"role": "metric", "label": "盈利率", "column": "profit_margin", "type": "percent"},
+            ],
+            "steps": [
+                {"step": 1, "type": "report", "goal": "按部门生成报告"},
+            ],
+        }
+        execution_results = {
+            "1": {
+                "step": 1,
+                "type": "report",
+                "goal": "按部门生成报告",
+                "result": [
+                    {
+                        "department": "技术部",
+                        "revenue": "100.00",
+                        "cost": "20.00",
+                        "profit": "80.00",
+                        "profit_margin": "80.00",
+                    },
+                    {
+                        "department": "测试组",
+                        "cost": "0.00",
+                    },
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert "| 技术部 | 100.00 | 20.00 | 80.00 | 80.00% |" in answer
+        assert "| 测试组 | 无数据 | 0.00 | 无数据 | 无数据 |" in answer
+        assert "| 测试组 |  | 0.00 |  |  |" not in answer
+
+    def test_complex_execution_answer_renders_zero_with_empty_source_count_as_no_data(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        plan = {
+            "display_schema": [
+                {"role": "dimension", "label": "部门", "column": "department", "type": "dimension"},
+                {"role": "metric", "label": "收入", "column": "revenue", "type": "amount"},
+                {"role": "metric", "label": "成本", "column": "cost", "type": "amount"},
+            ],
+            "steps": [
+                {"step": 1, "type": "report", "goal": "按部门生成报告"},
+            ],
+        }
+        execution_results = {
+            "1": {
+                "step": 1,
+                "type": "report",
+                "goal": "按部门生成报告",
+                "result": [
+                    {"department": "技术部", "source_row_count": 12, "revenue": "0.00", "cost": "520000.00"},
+                    {"department": "测试组", "source_row_count": 0, "revenue": "0.00", "cost": "0.00"},
+                ],
+                "error": None,
+            },
+        }
+
+        answer = _format_complex_execution_answer(plan, execution_results)
+
+        assert "| 技术部 | 0.00 | 520000.00 |" in answer
+        assert "| 测试组 | 无数据 | 无数据 |" in answer
+        assert "| 测试组 | 0.00 | 0.00 |" not in answer
+
+    def test_complex_step_query_uses_display_schema_contract_and_readable_dimension_guidance(self):
+        from agents.flow.sql_react import _build_complex_step_query
+
+        query = _build_complex_step_query(
+            {
+                "query": "2025年按部门分析盈利率，亏损，成本",
+                "enhanced_query": "2025年按部门分析盈利率，亏损，成本",
+                "complex_plan": {
+                    "display_schema": [
+                        {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+                        {"role": "net_profit", "label": "净利润", "column": "net_profit", "type": "amount"},
+                    ]
+                },
+            },
+            {
+                "step": 1,
+                "type": "sql",
+                "goal": "按department维度统计净利润、净利率、毛利率",
+                "tables": ["t_journal_entry", "t_journal_item", "t_account", "t_department"],
+                "merge_keys": ["department_id"],
+            },
+            {},
+        )
+
+        assert "展示输出契约" in query
+        assert "department_name" in query
+        assert "net_profit" in query
+        assert "*_name" in query
+        assert "合并键列别名必须与 merge_keys 完全一致" in query
+        assert "不要用展示字段别名代替合并键别名" in query
+        assert "不要按非合并维度" in query
+        assert "同一合并粒度全集" in query
+        assert "source_row_count" in query
+
+    def test_complex_step_query_prefers_step_output_schema_over_global_display_schema(self):
+        from agents.flow.sql_react import _build_complex_step_query
+
+        query = _build_complex_step_query(
+            {
+                "query": "2025年按部门分析盈利率，亏损，成本，并对比报销费用",
+                "enhanced_query": "2025年按部门分析盈利率，亏损，成本，并对比报销费用",
+                "complex_plan": {
+                    "display_schema": [
+                        {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+                        {"role": "profit", "label": "利润", "column": "profit", "type": "amount"},
+                        {"role": "profit_rate", "label": "盈利率", "column": "profit_margin", "type": "percent"},
+                        {"role": "expense", "label": "已审批报销费用", "column": "approved_expense", "type": "amount"},
+                    ]
+                },
+            },
+            {
+                "step": 2,
+                "type": "sql",
+                "goal": "按部门统计已审批报销费用",
+                "tables": ["t_expense_claim", "t_cost_center", "t_department"],
+                "merge_keys": ["department_id"],
+                "output_schema": [
+                    {"role": "department", "label": "部门", "column": "department_name", "type": "dimension"},
+                    {"role": "expense", "label": "已审批报销费用", "column": "approved_expense", "type": "amount"},
+                ],
+            },
+            {},
+        )
+
+        assert "当前步骤输出契约" in query
+        assert "approved_expense" in query
+        assert "department_name" in query
+        assert "profit_margin" not in query
+        assert '"column": "profit"' not in query
+        assert "不要输出 output_schema/merge_keys 之外的额外维度列" in query
+
+    def test_governed_account_metric_step_sql_uses_output_schema_and_business_formula_literals(self):
+        from agents.flow.sql_react import _governed_account_metric_step_sql
+
+        sql = _governed_account_metric_step_sql(
+            {
+                "query": "2026年按部门分析盈利率，亏损，成本",
+                "evidence": [
+                    "术语: 收入\n公式: 主营业务收入；例如 t_account.account_code='6001'\n同义词: 营收\n关联表: t_journal_entry,t_journal_item,t_account",
+                    "术语: 成本\n公式: 主营业务成本；例如 t_account.account_code='6401'\n同义词: 营业成本\n关联表: t_journal_entry,t_journal_item,t_account",
+                ],
+            },
+            {
+                "goal": "按部门维度统计盈利率、成本、净利润、净利率",
+                "tables": ["t_journal_entry", "t_journal_item", "t_account", "t_cost_center"],
+                "output_schema": [
+                    {"role": "department", "label": "部门", "column": "部门", "type": "dimension"},
+                    {"role": "revenue", "label": "收入", "column": "收入", "type": "amount"},
+                    {"role": "cost", "label": "成本", "column": "成本", "type": "amount"},
+                    {"role": "net_profit", "label": "净利润", "column": "净利润", "type": "amount"},
+                    {"role": "profitability", "label": "盈利率", "column": "盈利率", "type": "percent"},
+                ],
+            },
+        )
+
+        assert "AS 收入" in sql
+        assert "AS 成本" in sql
+        assert "AS 净利润" in sql
+        assert "AS 盈利率" in sql
+        assert "a.account_code = '6001'" in sql
+        assert "a.account_code = '6401'" in sql
+        assert "je.period LIKE '2026-%'" in sql
 
     def test_complex_execution_generic_preview_hides_internal_columns(self):
         from agents.flow.sql_react import _format_complex_execution_answer
@@ -2405,8 +2841,12 @@ GROUP BY period"""
 
         assert entry["result"] == [{"period": "2025-01", "revenue": 100, "budget": 80}]
         assert "关系分析结果" in answer
-        assert "收入合计：100.00" in answer
-        assert "预算合计：80.00" in answer
+        assert "结果明细：" in answer
+        assert "period：2025-01" in answer
+        assert "revenue：100" in answer
+        assert "budget：80" in answer
+        assert "收入合计" not in answer
+        assert "预算合计" not in answer
 
     def test_report_step_without_merge_keys_summarizes_single_metric_row(self):
         from agents.flow.sql_react import _format_complex_execution_answer, _run_local_complex_step
@@ -2443,9 +2883,13 @@ GROUP BY period"""
             }
         ]
         assert "关系分析结果" in answer
-        assert "实际发生合计：138821.81" in answer
-        assert "预算合计：15588682.45" in answer
-        assert "回款合计：2996637.78" in answer
+        assert "结果明细：" in answer
+        assert "actual_expense：138821.81" in answer
+        assert "budget_cost：15588682.45" in answer
+        assert "receivable_amount：2996637.78" in answer
+        assert "实际发生合计" not in answer
+        assert "预算合计" not in answer
+        assert "回款合计" not in answer
         assert "SQL:" not in answer
 
     @pytest.mark.asyncio
@@ -2613,6 +3057,76 @@ GROUP BY period"""
         assert generated_sql == ["SELECT missing_amount FROM a", "SELECT amount FROM a"]
         assert result["plan_execution_results"]["1"]["sql"] == "SELECT amount FROM a"
         assert result["plan_execution_results"]["1"]["result"] == '[{"amount":100}]'
+
+    @pytest.mark.asyncio
+    async def test_execute_complex_plan_step_repairs_semantic_check_failure(self):
+        from agents.flow.sql_react import execute_complex_plan_step
+
+        generated_sql = []
+
+        async def fake_sql_retrieve(step_state, config=None):
+            return {"docs": [Document(page_content="表名: a\nid int\namount int")], "semantic_model": {"a": {}}}
+
+        async def fake_sql_generate(step_state, config=None):
+            sql = "SELECT bad_alias.amount FROM a" if not step_state.get("refine_feedback") else "SELECT amount FROM a"
+            generated_sql.append(sql)
+            return {"sql": sql, "answer": sql, "is_sql": True, "error": None}
+
+        async def fake_semantic_check(step_state):
+            if "bad_alias" in step_state["sql"]:
+                return {
+                    "is_sql": False,
+                    "answer": "SQL 语义一致性校验未通过: SQL 引用了未声明的表别名。",
+                    "error": "semantic_check_failed",
+                    "semantic_report": {
+                        "decision": "revise_sql",
+                        "problems": [{"code": "UNKNOWN_TABLE_ALIAS", "repair_hint": "补齐缺失 JOIN 或修正别名。"}],
+                    },
+                }
+            return {"is_sql": True, "semantic_report": {"decision": "safe_to_execute", "problems": []}}
+
+        async def fake_execute_sql(step_state):
+            return {
+                "result": '[{"amount":100}]',
+                "answer": "查询已执行完成。\namount：100",
+                "error": None,
+                "execution_history": [{"sql": step_state["sql"], "result": '[{"amount":100}]', "error": None}],
+            }
+
+        async def fake_dry_run_sql(step_state):
+            return {"is_sql": True, "dry_run_report": {"passed": True}}
+
+        async def fake_error_analysis(step_state, config=None):
+            assert step_state["semantic_report"]["problems"][0]["code"] == "UNKNOWN_TABLE_ALIAS"
+            return {"refine_feedback": "bad_alias 未声明，直接使用表 a 的 amount 字段", "retry_count": step_state.get("retry_count", 0) + 1}
+
+        with patch("agents.flow.sql_react.sql_retrieve", side_effect=fake_sql_retrieve), \
+             patch("agents.flow.sql_react.sql_generate", side_effect=fake_sql_generate), \
+             patch("agents.flow.sql_react.semantic_check", side_effect=fake_semantic_check), \
+             patch("agents.flow.sql_react.dry_run_sql", side_effect=fake_dry_run_sql), \
+             patch("agents.flow.sql_react.execute_sql", side_effect=fake_execute_sql), \
+             patch("agents.flow.sql_react.error_analysis", side_effect=fake_error_analysis):
+            result = await execute_complex_plan_step({
+                "query": "复杂计划语义校验修复测试",
+                "complex_plan": {
+                    "mode": "complex_plan",
+                    "steps": [
+                        {"step": 1, "type": "sql", "goal": "查询金额", "tables": ["a"], "depends_on": [], "merge_keys": []},
+                    ],
+                },
+                "plan_approved": True,
+                "security_context": {"allowed_tables": ["a"]},
+                "table_relationships": [],
+                "evidence": [],
+                "few_shot_examples": [],
+                "chat_history": [],
+                "execution_history": [],
+                "retry_count": 0,
+            })
+
+        assert result["error"] is None
+        assert generated_sql == ["SELECT bad_alias.amount FROM a", "SELECT amount FROM a"]
+        assert result["plan_execution_results"]["1"]["sql"] == "SELECT amount FROM a"
 
 
 # ---------------------------------------------------------------------------
@@ -3555,6 +4069,31 @@ FROM t_journal_item ji;"""
 
         assert "错误: repair_failed" in answer
         assert "错误: SELECT amount" not in answer
+
+    def test_complex_plan_failure_does_not_show_sql_like_error_message(self):
+        from agents.flow.sql_react import _format_complex_execution_answer
+
+        answer = _format_complex_execution_answer(
+            {
+                "steps": [
+                    {"step": 1, "goal": "查询费用", "type": "sql"},
+                    {"step": 2, "goal": "生成报告", "type": "report"},
+                ]
+            },
+            {
+                "1": {
+                    "step": 1,
+                    "goal": "查询费用",
+                    "answer": "SELECT department_id, SUM(total_amount) FROM t_expense_claim GROUP BY department_id",
+                    "error": "SELECT department_id, SUM(total_amount) FROM t_expense_claim GROUP BY department_id",
+                }
+            },
+            failed=True,
+        )
+
+        assert "错误: SQL 步骤执行失败" in answer
+        assert "错误: SELECT" not in answer
+        assert "FROM t_expense_claim" not in answer
 
     @pytest.mark.asyncio
     @patch("agents.flow.sql_react.create_format_tool")
@@ -4517,6 +5056,40 @@ class TestBusinessKnowledgeRecall:
         assert "术语: 净利润" in docs[0].page_content
         assert docs[0].metadata["retriever_source"] == "mysql_lexical"
         assert "亏损" in docs[0].metadata["matched_terms"]
+
+    @patch("agents.rag.retriever._load_business_knowledge_from_mysql")
+    @patch("agents.rag.retriever._es_bm25_search")
+    @patch("agents.rag.retriever._milvus_vector_search")
+    def test_exact_lexical_business_terms_are_not_crowded_out_by_vector_topk(self, mock_vector, mock_es, mock_load_bk):
+        """Governed terms explicitly present in query should survive vector/BM25 ranking noise."""
+        from langchain_core.documents import Document
+        from agents.rag.retriever import recall_business_knowledge
+
+        mock_vector.return_value = [
+            Document(page_content=f"术语: 噪声{i}\n公式: SUM(x)", metadata={"doc_id": f"bk_noise_{i}"})
+            for i in range(5)
+        ]
+        mock_es.return_value = []
+        mock_load_bk.return_value = [
+            {
+                "term": "盈利率",
+                "formula": "净利润 / 收入 * 100",
+                "synonyms": "净利率,利润率",
+                "related_tables": "t_journal_entry,t_journal_item,t_account",
+            },
+            {
+                "term": "成本",
+                "formula": "主营业务成本和费用类借方发生额",
+                "synonyms": "营业成本",
+                "related_tables": "t_journal_entry,t_journal_item,t_account",
+            },
+        ]
+
+        docs = recall_business_knowledge("2026年按部门分析盈利率，亏损，成本", top_k=5)
+
+        contents = "\n".join(doc.page_content for doc in docs)
+        assert "术语: 盈利率" in contents
+        assert "术语: 成本" in contents
 
 
 # ---------------------------------------------------------------------------

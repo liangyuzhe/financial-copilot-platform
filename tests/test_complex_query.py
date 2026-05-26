@@ -90,6 +90,36 @@ async def test_multi_metric_finance_query_routes_to_complex_plan_by_recall_conte
     assert result["feasibility_decision"]["task_type"] == "analysis"
 
 
+@pytest.mark.asyncio
+async def test_multi_metric_recall_routes_without_query_action_words(monkeypatch):
+    from agents.flow import sql_react
+
+    async def no_route_rule(query):
+        return None
+
+    monkeypatch.setattr(sql_react, "evaluate_query_route_rules", no_route_rule)
+
+    result = await sql_react.assess_feasibility({
+        "query": "收入 成本 预算 回款 费用",
+        "selected_tables": ["t_journal_item", "t_account", "t_budget", "t_receivable_payable", "t_expense_claim"],
+        "table_relationships": [{"from_table": "t_journal_item", "to_table": "t_account"}],
+        "recall_context": {
+            "query_key": "收入 成本 预算 回款 费用",
+            "matched_terms": ["收入", "成本", "预算", "回款", "费用"],
+            "business_related_tables": [
+                "t_journal_item",
+                "t_account",
+                "t_budget",
+                "t_receivable_payable",
+                "t_expense_claim",
+            ],
+        },
+    })
+
+    assert result["route_mode"] == "complex_plan"
+    assert result["feasibility_decision"]["decision_source"] == "recall_context"
+
+
 def test_analysis_task_routes_to_complex_plan_even_when_schema_is_disconnected():
     result = assess_query_feasibility(
         query="今年收入成本预算回款费用之间的关系",

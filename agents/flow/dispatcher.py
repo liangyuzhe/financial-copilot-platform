@@ -17,6 +17,7 @@ from agents.flow.state import FinalGraphState
 from agents.flow.rag_chat import build_rag_chat_graph
 from agents.flow.sql_react import execute_complex_plan_step
 from agents.model.chat_model import get_chat_model
+from agents.rag.retriever import get_table_relationships
 from agents.runtime.agentscope_adapter import create_agentscope_runner
 from agents.runtime.agentscope_adapter import LocalAgentScopeCompatibleRunner
 from agents.runtime.agentscope_runtime import AgentScopeRuntime
@@ -621,12 +622,15 @@ async def execute_analysis_plan(state: FinalGraphState, config=None) -> dict:
 
     async def _execute() -> dict:
         selected_tables = state.get("selected_tables") or _tables_from_analysis_plan(state.get("complex_plan") or state.get("analysis_plan") or {})
+        table_relationships = state.get("table_relationships", [])
+        if not table_relationships and selected_tables:
+            table_relationships = get_table_relationships(selected_tables)
         complex_state = {
             **state,
             "complex_plan": state.get("complex_plan") or _analysis_plan_to_complex_plan(state.get("analysis_plan") or {}),
             "plan_approved": bool(state.get("plan_approved")),
             "selected_tables": selected_tables,
-            "table_relationships": state.get("table_relationships", []),
+            "table_relationships": table_relationships,
             "table_metadata": state.get("table_metadata", {}),
             "semantic_model": state.get("semantic_model", {}),
             "evidence": state.get("evidence", []),
