@@ -37,6 +37,11 @@ htmlcov/
 data/eval/
 data/
 outputs/
+docs/**
+!docs/
+!docs/.gitkeep
+.codex/
+.claude-review/
 docs/assets/demos/raw/
 docs/superpowers/
 scripts/

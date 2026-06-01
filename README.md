@@ -782,16 +782,6 @@ docker-compose ps
 docker-compose logs -f milvus
 ```
 
-## 技术文档
-
-- [设计文档](python_langchain_design.md)
-- [评测体系设计](docs/evaluation_design.md)
-- [评测使用手册](docs/evaluation_user_guide.md)
-- [迭代优化记录](docs/iterations.md)
-- [熔断降级与 Fallback 设计](docs/resilience_design.md)
-- [财务 NL2SQL 微调方案](docs/sql_finetuning_plan.md)
-- [新手教学文档](TUTORIAL.md)
-
 ## 依赖说明
 
 | 库 | 用途 |
